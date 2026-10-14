@@ -1,0 +1,623 @@
+#!/usr/bin/env bash
+# foldrender: publish an HTML file and get a link you can share.
+#
+# Needs only bash, curl and coreutils, so it runs on macOS's bash 3.2 and on
+# Linux. `publish` writes nothing to stdout but the page URL, so an agent can
+# capture it; notes and warnings go to stderr. Other commands print to stdout.
+#
+#   FOLDRENDER_TOKEN       API token; takes precedence over the saved login.
+#   FOLDRENDER_API         API base URL (default https://a.foldrender.dev).
+#   FOLDRENDER_NO_BROWSER  Set to 1 to print the sign-in link, not open it.
+#
+# Exit codes: 0 ok, 1 failed, 2 bad usage, 3 not signed in or token rejected,
+# 4 free-plan limit reached, 5 page too large, 6 network failure.
+
+export LC_ALL=C
+
+API="${FOLDRENDER_API:-https://a.foldrender.dev}"
+API="${API%/}"
+PAGE_BASE="https://a.foldrender.dev"
+MAX_BYTES=5242880
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/foldrender"
+TOKEN_FILE="$CONFIG_DIR/token"
+SLUG_MAP="$CONFIG_DIR/slugs"
+
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/foldrender.XXXXXX")" || exit 1
+trap 'rm -rf "$TMP"' EXIT
+trap 'exit 130' INT TERM
+
+STATUS=""
+
+die() {
+  local code="$1"
+  shift
+  printf 'foldrender: %s\n' "$*" >&2
+  exit "$code"
+}
+
+note() {
+  printf 'foldrender: %s\n' "$*" >&2
+}
+
+# need COUNT FLAG: a flag that takes a value must not be the last argument.
+need() {
+  [ "$1" -ge 2 ] || die 2 "$2 needs a value"
+}
+
+read_token() {
+  if [ -n "${FOLDRENDER_TOKEN:-}" ]; then
+    printf '%s' "$FOLDRENDER_TOKEN"
+  elif [ -f "$TOKEN_FILE" ]; then
+    head -n 1 "$TOKEN_FILE" | tr -d ' \t\r\n'
+  fi
+}
+
+require_token() {
+  [ -n "$TOKEN" ] || die 3 "not signed in. Run: foldrender login"
+}
+
+# api METHOD PATH [curl args...]: sets STATUS and leaves the body in $TMP/body.
+# A failed connection exits here. HTTP errors are reported by the caller.
+api() {
+  local method="$1" path="$2" rc
+  shift 2
+  STATUS="$(curl -sS -X "$method" --connect-timeout 15 --max-time 300 \
+    -H "Accept: text/plain" -o "$TMP/body" -w '%{http_code}' "$@" \
+    "$API$path" 2>"$TMP/err")"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    die 6 "cannot reach $API. Check your network connection and try again. ($(sed 's/^curl: ([0-9]*) //' "$TMP/err" | head -n 1))"
+  fi
+}
+
+api_auth() {
+  require_token
+  api "$@" -H "Authorization: Bearer $TOKEN"
+}
+
+# The server's message for either "error: text" or {"error":"text"} bodies.
+error_text() {
+  local t
+  t="$(head -n 1 "$TMP/body" | tr -d '\r')"
+  case "$t" in
+    error:*) t="${t#error:}" ;;
+    *'"error"'*) t="$(printf '%s' "$t" | sed -n 's/.*"error" *: *"\([^"]*\)".*/\1/p')" ;;
+  esac
+  t="${t# }"
+  printf '%s' "${t:-no message}"
+}
+
+fail_http() {
+  local msg
+  msg="$(error_text)"
+  case "$STATUS" in
+    401) die 3 "not signed in, or the token was rejected ($msg). Run: foldrender login" ;;
+    403)
+      if grep -q quota_exceeded "$TMP/body"; then
+        die 4 "free plan limit reached: 10 pages, each kept for 30 days. See your pages with: foldrender list"
+      fi
+      die 1 "not allowed ($msg)" ;;
+    404) die 1 "not found ($msg)" ;;
+    413) die 5 "the page is larger than 5 MB" ;;
+    *) die 1 "the server returned HTTP $STATUS ($msg)" ;;
+  esac
+}
+
+expect_2xx() {
+  case "$STATUS" in
+    2??) return 0 ;;
+  esac
+  fail_http
+}
+
+# A page slug is letters, digits, hyphens and underscores. Checking it here
+# keeps a typo like "a/b" from becoming a different API path.
+check_slug() {
+  case "$1" in
+    ''|*[!A-Za-z0-9_-]*) die 2 "not a page slug: $1" ;;
+  esac
+}
+
+# GitHub logins: letters, digits and single hyphens, comma-separated.
+check_logins() {
+  case "$1" in
+    ''|-*|*[!A-Za-z0-9,-]*|,*|*,|*,,*) die 2 "not a comma-separated list of GitHub logins: $1" ;;
+  esac
+}
+
+# json_array a,b: the JSON array ["a","b"]. The API wants arrays for share_add
+# and share_remove, not strings. Logins were checked by check_logins first.
+json_array() {
+  printf '['
+  printf '%s' "$1" | awk -F, '{ for (i = 1; i <= NF; i++) printf "%s\"%s\"", (i > 1 ? "," : ""), $i }'
+  printf ']'
+}
+
+# A slug, or a page URL, to the slug.
+slug_from() {
+  local s="${1%%[?#]*}"
+  s="${s%/}"
+  printf '%s' "${s##*/}"
+}
+
+# Percent-encodes every byte except unreserved characters.
+urlencode() {
+  local s="$1" out="" i=0 c
+  while [ "$i" -lt "${#s}" ]; do
+    c="${s:$i:1}"
+    case "$c" in
+      [A-Za-z0-9._~-]) out="$out$c" ;;
+      # bash 3.2 sign-extends bytes above 0x7F, so mask down to one byte.
+      *) out="$out$(printf '%%%02X' $(( $(printf '%d' "'$c") & 255 )))" ;;
+    esac
+    i=$((i + 1))
+  done
+  printf '%s' "$out"
+}
+
+# The absolute path of FILE, with symlinks in its directory resolved.
+abs_path() {
+  local dir
+  dir="$(cd "$(dirname "$1")" && pwd -P)" || return 1
+  printf '%s/%s\n' "$dir" "$(basename "$1")"
+}
+
+title_from() {
+  tr '\n' ' ' < "$1" | sed -n 's/.*<title[^>]*>\([^<]*\)<\/title>.*/\1/p' | head -n 1 | sed 's/^ *//; s/ *$//'
+}
+
+# The slug named by <meta name="foldrender-slug" content="...">, if any.
+meta_slug() {
+  local tag
+  tag="$(grep -o '<meta[^>]*foldrender-slug[^>]*>' "$1" | head -n 1)"
+  printf '%s' "$tag" | sed -n 's/.*content="\([^"]*\)".*/\1/p'
+}
+
+warn_if_secrets() {
+  if grep -Eq '(^|[^A-Za-z0-9])(sk-|ghp_|frat_)[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|-----BEGIN ' "$1"; then
+    note "warning: this page looks like it contains a secret (an API key, token or private key). Anyone with the link can read it."
+  fi
+}
+
+# The slug map: one "absolute-path<TAB>slug" line per published file.
+map_lookup() {
+  [ -f "$SLUG_MAP" ] || return 0
+  awk -F'\t' -v k="$1" '($1 "") == (k "") { s = $2 } END { if (s != "") print s }' "$SLUG_MAP"
+}
+
+# map_without COLUMN VALUE: the map minus the rows whose COLUMN is VALUE.
+# COLUMN 1 is the path, COLUMN 2 is the slug.
+map_without() {
+  awk -F'\t' -v c="$1" -v v="$2" '((c == 1 ? $1 : $2) "") != (v "")' "$SLUG_MAP"
+}
+
+map_forget() {
+  [ -f "$SLUG_MAP" ] || return 0
+  map_without "$1" "$2" > "$SLUG_MAP.tmp" && mv -f "$SLUG_MAP.tmp" "$SLUG_MAP"
+}
+
+map_set() {
+  mkdir -p "$CONFIG_DIR"
+  {
+    [ -f "$SLUG_MAP" ] && map_without 1 "$1"
+    printf '%s\t%s\n' "$1" "$2"
+  } > "$SLUG_MAP.tmp" && mv -f "$SLUG_MAP.tmp" "$SLUG_MAP"
+}
+
+# upload METHOD PATH FILE QUERY
+upload() {
+  api_auth "$1" "$2${4:+?$4}" -H "Content-Type: text/html" --data-binary "@$3"
+}
+
+# Sets PAGE_URL from the body of a successful write. Not run in a subshell,
+# because a die inside $(...) would only end the subshell.
+read_page_url() {
+  PAGE_URL="$(head -n 1 "$TMP/body" | tr -d '\r')"
+  case "$PAGE_URL" in
+    http*) ;;
+    *) die 1 "the server did not return a page URL ($(error_text))" ;;
+  esac
+}
+
+open_url() {
+  [ "${FOLDRENDER_NO_BROWSER:-}" = 1 ] && return 0
+  case "$(uname -s)" in
+    Darwin) open "$1" >/dev/null 2>&1 ;;
+    *) xdg-open "$1" >/dev/null 2>&1 ;;
+  esac
+  return 0
+}
+
+save_token() {
+  mkdir -p "$CONFIG_DIR"
+  rm -f "$TOKEN_FILE.tmp"
+  ( umask 077 && printf '%s\n' "$1" > "$TOKEN_FILE.tmp" )
+  chmod 600 "$TOKEN_FILE.tmp"
+  mv -f "$TOKEN_FILE.tmp" "$TOKEN_FILE"
+}
+
+warn_env_token() {
+  [ -z "${FOLDRENDER_TOKEN:-}" ] || note "FOLDRENDER_TOKEN is set, so it is used instead of the saved token"
+}
+
+# field KEY: the value of a key=value line in the body.
+field() {
+  sed -n "s/^$1=//p" "$TMP/body" | head -n 1 | tr -d '\r'
+}
+
+cmd_login() {
+  local token=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --token) need $# "$1"; token="$2"; shift 2 ;;
+      *) die 2 "unknown option: $1" ;;
+    esac
+  done
+  if [ -n "$token" ]; then
+    TOKEN="$token"
+    cmd_whoami
+    save_token "$token"
+    printf 'Token saved to %s\n' "$TOKEN_FILE"
+  else
+    device_login
+  fi
+  warn_env_token
+}
+
+device_login() {
+  local device_code user_code link interval expires pause waited=0 token login
+  api POST /api/cli/start -H "Content-Type: application/json" --data '{}'
+  expect_2xx
+  device_code="$(field device_code)"
+  user_code="$(field user_code)"
+  link="$(field verification_uri_complete)"
+  [ -n "$link" ] || link="$(field verification_uri)"
+  interval="$(field interval)"
+  expires="$(field expires_in)"
+  case "$device_code" in
+    ''|*[!A-Za-z0-9_-]*) die 1 "the server did not start a sign-in" ;;
+  esac
+  pause="${interval:-5}"
+  expires="${expires:-900}"
+
+  printf '\nTo sign in, open this page:\n  %s\nand enter this code: %s\n\n' "$link" "$user_code"
+  printf 'Waiting for approval...\n'
+  open_url "$link"
+
+  while :; do
+    [ "$waited" -lt "$expires" ] || die 1 "the code expired before it was approved. Run: foldrender login"
+    sleep "$pause"
+    waited=$((waited + pause))
+    api POST /api/cli/poll -H "Content-Type: application/json" --data "{\"device_code\":\"$device_code\"}"
+    if grep -q '^token=' "$TMP/body"; then
+      token="$(field token)"
+      login="$(field login)"
+      [ -n "$token" ] || die 1 "the server returned no token"
+      save_token "$token"
+      printf 'Signed in as %s. Token saved to %s\n' "${login:-your account}" "$TOKEN_FILE"
+      return 0
+    fi
+    grep -q 'authorization_pending' "$TMP/body" && continue
+    if grep -q 'slow_down' "$TMP/body"; then
+      pause=$((pause + 5))
+      continue
+    fi
+    grep -q 'expired_token' "$TMP/body" && die 1 "the code expired before it was approved. Run: foldrender login"
+    grep -q 'access_denied' "$TMP/body" && die 1 "the sign-in was denied"
+    die 1 "unexpected answer from the sign-in server ($(error_text))"
+  done
+}
+
+cmd_whoami() {
+  api_auth GET /api/me
+  expect_2xx
+  if grep -q '^login=' "$TMP/body"; then
+    awk -F= '
+      $1 == "login" { l = $2 }
+      $1 == "plan" { p = $2 }
+      $1 == "used" { u = $2 }
+      $1 == "limit" { m = $2 }
+      END { printf "signed in as %s (%s plan), %s of %s pages used\n", l, p, u, m }' "$TMP/body"
+  else
+    cat "$TMP/body"
+  fi
+}
+
+cmd_logout() {
+  rm -f "$TOKEN_FILE"
+  printf 'Removed the saved token.\n'
+  [ -z "${FOLDRENDER_TOKEN:-}" ] || note "FOLDRENDER_TOKEN is still set in this shell. Unset it to sign out completely."
+}
+
+# json_number KEY: the number under KEY in a JSON body.
+json_number() {
+  sed -n "s/.*\"$1\" *: *\([0-9][0-9]*\).*/\1/p" "$TMP/body" | head -n 1
+}
+
+# export [FILE.zip]: every page and a manifest in one zip. The default name is
+# foldrender-artifacts-<login>-<date>.zip. Refuses to overwrite.
+cmd_export() {
+  [ $# -le 1 ] || die 2 "usage: foldrender export [FILE.zip]"
+  local target="${1:-}" login=""
+  require_token
+  if [ -z "$target" ]; then
+    api_auth GET /api/me
+    expect_2xx
+    login="$(field login)"
+    [ -n "$login" ] || die 1 "could not read the account login"
+    target="foldrender-artifacts-$login-$(date +%Y-%m-%d).zip"
+  fi
+  [ ! -e "$target" ] || die 1 "$target already exists; choose another name"
+  api_auth GET /api/me/export
+  expect_2xx
+  [ "$(head -c 2 "$TMP/body")" = "PK" ] || die 1 "the server did not return a zip file"
+  mkdir -p "$(dirname "$target")"
+  cp "$TMP/body" "$target.part" || die 1 "could not write $target"
+  mv -f "$target.part" "$target" || die 1 "could not write $target"
+  printf '%s\n' "$target"
+}
+
+# account delete [--confirm LOGIN]: deletes the account with its pages and API
+# tokens, then the saved token and slug map on this machine. Without a terminal
+# it needs --confirm LOGIN; at a terminal the user types the login.
+cmd_account() {
+  [ "${1:-}" = delete ] || die 2 "usage: foldrender account delete [--confirm LOGIN]"
+  shift
+  local confirm="" typed="" login="" pages="" tokens=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --confirm) need $# "$1"; confirm="$2"; shift 2 ;;
+      *) die 2 "unknown option: $1" ;;
+    esac
+  done
+  if [ -n "$confirm" ]; then
+    case "$confirm" in
+      ''|*[!A-Za-z0-9-]*) die 2 "not a GitHub login: $confirm" ;;
+    esac
+  else
+    [ -t 0 ] || die 2 "refusing to delete the account without a terminal. Re-run with --confirm <your login> if you mean it."
+  fi
+  require_token
+  api_auth GET /api/me
+  expect_2xx
+  login="$(field login)"
+  pages="$(field used)"
+  [ -n "$login" ] || die 1 "could not read the account login"
+  printf 'Account %s has %s page(s).\nDeleting it removes every page, every API token and the account. It cannot be undone.\nTo keep a copy of your pages first, run: foldrender export\n' "$login" "${pages:-?}" >&2
+  if [ -z "$confirm" ]; then
+    printf 'Type %s to confirm: ' "$login" >&2
+    read -r typed || die 1 "no answer; nothing was deleted"
+    confirm="$typed"
+  fi
+  confirm="$(printf '%s' "$confirm" | tr -d ' \r\t' | tr '[:upper:]' '[:lower:]')"
+  [ "$confirm" = "$login" ] || die 1 "the login given does not match $login; nothing was deleted"
+  api_auth DELETE "/api/me?confirm=$login"
+  if [ "$STATUS" = 403 ]; then
+    die 1 "this account cannot be deleted from here: it is the operator's account, or the token is an admin token ($(error_text)). Nothing was deleted."
+  fi
+  expect_2xx
+  pages="$(json_number pages)"
+  tokens="$(json_number tokens)"
+  rm -f "$TOKEN_FILE" "$SLUG_MAP" "$SLUG_MAP.tmp"
+  printf 'Deleted the account %s: %s page(s) and %s API token(s).\n' "$login" "${pages:-?}" "${tokens:-?}"
+  printf 'Removed the saved token and the slug map from this machine.\n'
+  [ -z "${FOLDRENDER_TOKEN:-}" ] || note "FOLDRENDER_TOKEN is still set in this shell. Unset it to sign out completely."
+}
+
+cmd_publish() {
+  local file="" title="" slug="" vis="" share="" mode="" rp="" src="" bytes query url
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --title) need $# "$1"; title="$2"; shift 2 ;;
+      --slug) need $# "$1"; slug="$2"; shift 2 ;;
+      --share) need $# "$1"; share="${2// /}"; shift 2 ;;
+      --private) vis=private; shift ;;
+      --public) vis=public; shift ;;
+      -) file="-"; shift ;;
+      -*) die 2 "unknown option: $1" ;;
+      *) [ -z "$file" ] || die 2 "publish takes one file"; file="$1"; shift ;;
+    esac
+  done
+  [ -n "$file" ] || die 2 "usage: foldrender publish <file.html|-> [--title T] [--slug S] [--private|--public|--share a,b]"
+  if [ -n "$share" ]; then
+    [ -z "$vis" ] || die 2 "--share makes the page shared, so drop --private or --public"
+    check_logins "$share"
+    vis=shared
+  fi
+  require_token
+
+  if [ "$file" = "-" ]; then
+    src="$TMP/stdin.html"
+    cat > "$src"
+  else
+    [ -f "$file" ] || die 2 "no such file: $file"
+    [ -r "$file" ] || die 2 "cannot read: $file"
+    src="$file"
+    rp="$(abs_path "$file")" || die 1 "cannot resolve the path of $file"
+  fi
+  bytes="$(wc -c < "$src" | tr -d ' ')"
+  [ "$bytes" -gt 0 ] || die 2 "the page is empty"
+  [ "$bytes" -le "$MAX_BYTES" ] || die 5 "the page is $bytes bytes; the limit is 5 MB"
+  warn_if_secrets "$src"
+
+  # Which page is this? --slug, then a foldrender-slug meta tag, then the
+  # slug this file was published under before.
+  if [ -n "$slug" ]; then
+    slug="$(slug_from "$slug")"
+    mode=explicit
+  else
+    slug="$(meta_slug "$src")"
+    if [ -n "$slug" ]; then
+      mode=meta
+    elif [ -n "$rp" ]; then
+      slug="$(map_lookup "$rp")"
+      [ -z "$slug" ] || mode=map
+    fi
+  fi
+  [ -z "$slug" ] || check_slug "$slug"
+
+  [ -n "$title" ] || title="$(title_from "$src")"
+  # A new page is private unless told otherwise. A re-publish sends only the
+  # flags it was given, so the page keeps the visibility and sharing it has.
+  if [ -z "$slug" ] && [ -z "$vis" ]; then
+    vis=private
+  fi
+  query=""
+  [ -z "$title" ] || query="title=$(urlencode "$title")"
+  [ -z "$vis" ] || query="${query:+$query&}visibility=$vis"
+  [ -z "$share" ] || query="${query:+$query&}share=$share"
+
+  if [ -n "$slug" ]; then
+    upload PUT "/api/artifacts/$slug" "$src" "$query"
+  else
+    upload POST /api/artifacts "$src" "$query"
+  fi
+  if [ "$STATUS" = 404 ] && [ "$mode" = map ]; then
+    note "the page $slug was deleted, so this publish made a new one"
+    map_forget 1 "$rp"
+    upload POST /api/artifacts "$src" "$query"
+  fi
+  if [ "$STATUS" = 404 ] && [ "$mode" = explicit ]; then
+    die 1 "there is no page named $slug"
+  fi
+  if [ "$STATUS" = 404 ] && [ "$mode" = meta ]; then
+    die 1 "there is no page named $slug (from the foldrender-slug meta tag). Change or remove the tag."
+  fi
+  expect_2xx
+  read_page_url
+  if [ -n "$rp" ]; then
+    map_set "$rp" "$(slug_from "$PAGE_URL")"
+  fi
+  printf '%s\n' "$PAGE_URL"
+}
+
+cmd_share() {
+  local target="" vis="" adds="" removes="" arg slug json url
+  [ $# -ge 1 ] || die 2 "usage: foldrender share <slug-or-url> [+login ...] [-login ...] [--public|--private]"
+  target="$1"
+  shift
+  for arg in "$@"; do
+    case "$arg" in
+      --public) vis=public ;;
+      --private) vis=private ;;
+      --*) die 2 "unknown option: $arg" ;;
+      +?*) check_logins "${arg#+}"; adds="${adds:+$adds,}${arg#+}" ;;
+      -?*) check_logins "${arg#-}"; removes="${removes:+$removes,}${arg#-}" ;;
+      *) die 2 "expected +login, -login, --public or --private, got: $arg" ;;
+    esac
+  done
+  [ -n "$adds$removes$vis" ] || die 2 "nothing to change: give +login, -login, --public or --private"
+  slug="$(slug_from "$target")"
+  check_slug "$slug"
+
+  json=""
+  [ -z "$vis" ] || json="\"visibility\":\"$vis\""
+  [ -z "$adds" ] || json="${json:+$json,}\"share_add\":$(json_array "$adds")"
+  [ -z "$removes" ] || json="${json:+$json,}\"share_remove\":$(json_array "$removes")"
+  api_auth PATCH "/api/artifacts/$slug" -H "Content-Type: application/json" --data "{$json}"
+  expect_2xx
+  read_page_url
+  printf '%s\n' "$PAGE_URL"
+}
+
+cmd_list() {
+  api_auth GET /api/artifacts
+  expect_2xx
+  if [ ! -s "$TMP/body" ]; then
+    printf 'No pages yet.\n'
+    return 0
+  fi
+  printf '%-12s  %-8s  %-20s  %-20s  %s\n' SLUG VISIBILITY UPDATED EXPIRES TITLE
+  awk -F'\t' '{ printf "%-12s  %-8s  %-20s  %-20s  %s\n", $1, $2, $3, $4, $5 }' "$TMP/body"
+}
+
+cmd_rm() {
+  [ $# -eq 1 ] || die 2 "usage: foldrender rm <slug-or-url>"
+  local slug
+  slug="$(slug_from "$1")"
+  check_slug "$slug"
+  api_auth DELETE "/api/artifacts/$slug"
+  [ "$STATUS" != 404 ] || map_forget 2 "$slug"
+  expect_2xx
+  map_forget 2 "$slug"
+  printf 'removed %s\n' "$slug"
+}
+
+cmd_open() {
+  [ $# -eq 1 ] || die 2 "usage: foldrender open <slug-or-url>"
+  local url slug
+  case "$1" in
+    http://*|https://*) url="$1" ;;
+    *)
+      slug="$(slug_from "$1")"
+      check_slug "$slug"
+      url="$PAGE_BASE/$slug"
+      ;;
+  esac
+  printf '%s\n' "$url"
+  open_url "$url"
+}
+
+cmd_help() {
+  cat <<'EOF'
+foldrender publishes an HTML file and prints a link you can share.
+
+Usage:
+  foldrender login [--token TOKEN]      sign in with a device code, or save a token
+  foldrender whoami                     show the account and its page usage
+  foldrender logout                     remove the saved token from this machine
+  foldrender export [FILE.zip]          save all your pages and a manifest as one zip
+  foldrender account delete [--confirm LOGIN]
+                                        delete your account, pages and tokens. At a
+                                        terminal you type your login; without one,
+                                        --confirm LOGIN is required
+  foldrender publish FILE|- [options]   publish a page; prints only its URL
+      --title TEXT                      page title (default: the file's <title>)
+      --slug SLUG                       update that page
+      --private                         only you can see it (default for new pages)
+      --public                          anyone with the link can see it
+      --share LOGIN[,LOGIN...]          only these GitHub logins can see it
+  foldrender share SLUG|URL [+LOGIN ...] [-LOGIN ...] [--public|--private]
+  foldrender list                       list your pages
+  foldrender rm SLUG|URL                delete a page
+  foldrender open SLUG|URL              open a page in the browser
+  foldrender help                       show this text
+
+Examples:
+  foldrender login
+  foldrender publish report.html
+  foldrender publish report.html --share alice,bob
+  foldrender publish - < diagram.html
+  foldrender share https://a.foldrender.dev/abc123 +carol -bob
+  foldrender rm abc123
+
+Publishing the same file again updates the same link. Environment:
+  FOLDRENDER_TOKEN       token to use instead of the saved login
+  FOLDRENDER_API         API base URL, for testing
+  FOLDRENDER_NO_BROWSER  set to 1 to print the sign-in link instead of opening it
+
+Free plan: 10 pages, each kept for 30 days, up to 5 MB per page.
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"
+  [ $# -eq 0 ] || shift
+  case "$cmd" in
+    login) cmd_login "$@" ;;
+    logout) cmd_logout ;;
+    account) cmd_account "$@" ;;
+    export) cmd_export "$@" ;;
+    whoami) cmd_whoami ;;
+    publish) cmd_publish "$@" ;;
+    share) cmd_share "$@" ;;
+    list|ls) cmd_list ;;
+    rm|delete) cmd_rm "$@" ;;
+    open) cmd_open "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *) die 2 "unknown command: $cmd (try: foldrender help)" ;;
+  esac
+}
+
+TOKEN="$(read_token)"
+main "$@"
