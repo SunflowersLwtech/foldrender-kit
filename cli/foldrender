@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# foldrender: publish an HTML file and get a link you can share.
+# foldrender: publish an HTML file and get a link you can share, and read a
+# published page back as text.
 #
-# Needs only bash, curl and coreutils, so it runs on macOS's bash 3.2 and on
-# Linux. `publish` writes nothing to stdout but the page URL, so an agent can
-# capture it; notes and warnings go to stderr. Other commands print to stdout.
+# Needs only bash, curl (7.55 or later, for -H @file) and coreutils, so it runs
+# on macOS's bash 3.2 and on Linux. `publish` writes nothing to stdout but the
+# page URL, so an agent can capture it; notes and warnings go to stderr. Other
+# commands print to stdout.
 #
 #   FOLDRENDER_TOKEN       API token; takes precedence over the saved login.
 #   FOLDRENDER_API         API base URL (default https://a.foldrender.dev).
 #   FOLDRENDER_NO_BROWSER  Set to 1 to print the sign-in link, not open it.
 #
 # Exit codes: 0 ok, 1 failed, 2 bad usage, 3 not signed in or token rejected,
-# 4 free-plan limit reached, 5 page too large, 6 network failure.
+# 4 free-plan limit reached, 5 page too large, 6 network failure,
+# 7 no such page, or not visible to this account (read), 8 page expired (read).
 
 export LC_ALL=C
 
@@ -27,6 +30,7 @@ trap 'rm -rf "$TMP"' EXIT
 trap 'exit 130' INT TERM
 
 STATUS=""
+ACCEPT="text/plain"
 
 die() {
   local code="$1"
@@ -62,7 +66,7 @@ api() {
   local method="$1" path="$2" rc
   shift 2
   STATUS="$(curl -sS -X "$method" --connect-timeout 15 --max-time 300 \
-    -H "Accept: text/plain" -o "$TMP/body" -w '%{http_code}' "$@" \
+    -H "Accept: $ACCEPT" -o "$TMP/body" -w '%{http_code}' "$@" \
     "$API$path" 2>"$TMP/err")"
   rc=$?
   if [ "$rc" -ne 0 ]; then
@@ -70,9 +74,20 @@ api() {
   fi
 }
 
+# auth_header: prints a curl -H argument that names a file holding the
+# Authorization header, so the token is never in curl's argument list, which
+# any user of the machine can read (ps). The file is in this run's private
+# temporary directory, written with the shell's builtin printf, so no program
+# is started with the token among its arguments, and rewritten each time,
+# since login changes the token mid-run.
+auth_header() {
+  ( umask 077 && printf 'Authorization: Bearer %s\n' "$TOKEN" > "$TMP/auth" ) || die 1 "cannot write $TMP/auth"
+  printf '@%s' "$TMP/auth"
+}
+
 api_auth() {
   require_token
-  api "$@" -H "Authorization: Bearer $TOKEN"
+  api "$@" -H "$(auth_header)"
 }
 
 # The server's message for either "error: text" or {"error":"text"} bodies.
@@ -162,8 +177,12 @@ abs_path() {
   printf '%s/%s\n' "$dir" "$(basename "$1")"
 }
 
+# The page's own <title>: the first one. An inline SVG can carry <title>s of its
+# own further down, and a greedy match would pick the last of them.
 title_from() {
-  tr '\n' ' ' < "$1" | sed -n 's/.*<title[^>]*>\([^<]*\)<\/title>.*/\1/p' | head -n 1 | sed 's/^ *//; s/ *$//'
+  tr '\n' ' ' < "$1" | grep -o '<title[^>]*>[^<]*</title>' | head -n 1 \
+    | sed 's/<title[^>]*>//; s/<\/title>//; s/^ *//; s/ *$//' \
+    | sed 's/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g; s/&#39;/'"'"'/g; s/&apos;/'"'"'/g; s/&nbsp;/ /g; s/&amp;/\&/g'
 }
 
 # The slug named by <meta name="foldrender-slug" content="...">, if any.
@@ -558,9 +577,137 @@ cmd_open() {
   open_url "$url"
 }
 
+#   ------------------------------------------------------------------ read
+
+# A page slug from a slug, a page URL (its link, or its address on a content host,
+# query and all), or a library link (.../artifacts?open=SLUG). read never requests
+# the URL itself: a private page's link redirects to the content host, where a
+# client without a cookie jar loses the token and is sent back, round and round.
+page_slug() {
+  local s
+  case "$1" in
+    *[?\&]open=*)
+      s="${1#*open=}"
+      printf '%s' "${s%%[&#]*}"
+      ;;
+    *) slug_from "$1" ;;
+  esac
+}
+
+# read_get PATH: a GET on the read API, with the token when there is one.
+# Public pages need none, so a missing token is not an error here.
+read_get() {
+  if [ -n "$TOKEN" ]; then
+    api GET "$1" -H "$(auth_header)"
+  else
+    api GET "$1"
+  fi
+}
+
+# read_fail SLUG: the error for a read that did not answer 200.
+read_fail() {
+  local msg
+  msg="$(error_text)"
+  case "$STATUS" in
+    401)
+      [ -z "$TOKEN" ] || die 3 "the token was rejected ($msg). Run: foldrender login"
+      die 3 "$1 is not public. Sign in to read it: foldrender login" ;;
+    404)
+      [ -z "$TOKEN" ] || die 7 "no page named $1, or it is not shared with the account you are signed in as (see: foldrender whoami)"
+      die 7 "no page named $1. If it is private or shared, sign in first: foldrender login" ;;
+    410) die 8 "$msg" ;;
+    413) die 9 "$1 is too large to read as text ($msg). Read its HTML instead: foldrender read $1 --html" ;;
+    400) die 2 "$msg" ;;
+  esac
+  fail_http
+}
+
+# Escapes a string for the replacement side of a sed s|||.
+sed_escape() {
+  printf '%s' "$1" | sed 's/[\\&|]/\\&/g'
+}
+
+# save_assets SLUG DIR MODE: saves the page's embedded images and inline SVG
+# into DIR, reports each path on stderr and, for the text output, points the
+# asset:N references at the saved files.
+save_assets() {
+  local slug="$1" dir="$2" mode="$3" n name type size label path count=0
+  read_get "/api/artifacts/$slug/assets"
+  [ "$STATUS" = 200 ] || read_fail "$slug"
+  cp "$TMP/body" "$TMP/assets"
+  if [ ! -s "$TMP/assets" ]; then
+    note "the page has no embedded images or SVG to save"
+    return 0
+  fi
+  mkdir -p "$dir" || die 1 "cannot create $dir"
+  : > "$TMP/rewrite.sed"
+  while IFS="$(printf '\t')" read -r n name type size label <&3; do
+    case "$n" in ''|*[!0-9]*) continue ;; esac
+    case "$name" in ''|*/*|.*) continue ;; esac
+    read_get "/api/artifacts/$slug/assets/$n"
+    [ "$STATUS" = 200 ] || read_fail "$slug"
+    path="${dir%/}/$name"
+    cp "$TMP/body" "$path" || die 1 "could not write $path"
+    note "saved $path ($type, $size bytes)${label:+: $label}"
+    printf 's|(asset:%s)|(%s)|g\ns|\\[SVG asset:%s\\([]:]\\)|[SVG %s\\1|g\n' \
+      "$n" "$(sed_escape "$path")" "$n" "$(sed_escape "$path")" >> "$TMP/rewrite.sed"
+    count=$((count + 1))
+  done 3< "$TMP/assets"
+  if [ "$mode" = text ] && [ "$count" -gt 0 ]; then
+    sed -f "$TMP/rewrite.sed" "$TMP/page" > "$TMP/page.new" && mv -f "$TMP/page.new" "$TMP/page"
+  fi
+}
+
+# read SLUG|URL: the page as Markdown after a block of facts about it. --html
+# prints the stored HTML, --json the API's JSON, --save FILE writes the stored
+# HTML to a file, --assets DIR also saves embedded images and SVG. A PDF
+# published from the app reads as its text, page by page; its page images are
+# the assets.
+cmd_read() {
+  local target="" mode=text assets="" save="" slug query
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --html) mode=html; shift ;;
+      --json) mode=json; shift ;;
+      --assets) need $# "$1"; assets="$2"; shift 2 ;;
+      --save|-o) need $# "$1"; save="$2"; shift 2 ;;
+      -*) die 2 "unknown option: $1" ;;
+      *) [ -z "$target" ] || die 2 "read takes one page"; target="$1"; shift ;;
+    esac
+  done
+  [ -n "$target" ] || die 2 "usage: foldrender read <slug-or-url> [--html|--json] [--assets DIR] [--save FILE]"
+  [ -z "$save" ] || [ "$mode" = text ] || die 2 "--save writes the stored file; drop --html or --json"
+  [ -z "$save" ] || [ -z "$assets" ] || die 2 "--save and --assets do not go together"
+  slug="$(page_slug "$target")"
+  check_slug "$slug"
+  case "$slug" in
+    a|api|artifacts|auth|cli) die 2 "$target is not a link to a page" ;;
+  esac
+
+  if [ -n "$save" ]; then
+    [ ! -e "$save" ] || die 1 "$save already exists; choose another name"
+    read_get "/api/artifacts/$slug?format=raw"
+    [ "$STATUS" = 200 ] || read_fail "$slug"
+    cp "$TMP/body" "$save.part" 2>/dev/null && mv -f "$save.part" "$save" || die 1 "could not write $save"
+    printf '%s\n' "$save"
+    return 0
+  fi
+
+  query=""
+  [ "$mode" != html ] || query="?format=html"
+  [ "$mode" != json ] || ACCEPT="application/json"
+  read_get "/api/artifacts/$slug$query"
+  ACCEPT="text/plain"
+  [ "$STATUS" = 200 ] || read_fail "$slug"
+  cp "$TMP/body" "$TMP/page"
+  [ -z "$assets" ] || save_assets "$slug" "$assets" "$mode"
+  cat "$TMP/page"
+}
+
 cmd_help() {
   cat <<'EOF'
-foldrender publishes an HTML file and prints a link you can share.
+foldrender publishes an HTML file and prints a link you can share, and reads
+published pages back as text.
 
 Usage:
   foldrender login [--token TOKEN]      sign in with a device code, or save a token
@@ -579,6 +726,12 @@ Usage:
       --share LOGIN[,LOGIN...]          only these GitHub logins can see it
   foldrender share SLUG|URL [+LOGIN ...] [-LOGIN ...] [--public|--private]
   foldrender list                       list your pages
+  foldrender read SLUG|URL [options]    print a page as text: its facts, then
+                                        Markdown. Public pages need no sign-in
+      --html                            the page's HTML instead
+      --json                            the API's JSON instead
+      --assets DIR                      also save embedded images and SVG into DIR
+      --save FILE                       save the page's HTML as FILE
   foldrender rm SLUG|URL                delete a page
   foldrender open SLUG|URL              open a page in the browser
   foldrender help                       show this text
@@ -588,8 +741,15 @@ Examples:
   foldrender publish report.html
   foldrender publish report.html --share alice,bob
   foldrender publish - < diagram.html
+  foldrender read https://a.foldrender.dev/abc123
+  foldrender read abc123 --assets ./abc123-assets
   foldrender share https://a.foldrender.dev/abc123 +carol -bob
   foldrender rm abc123
+
+Exit codes: 0 ok, 1 failed, 2 bad usage, 3 not signed in or token rejected,
+4 free-plan limit reached, 5 page too large, 6 network failure,
+7 no such page or not visible to this account, 8 page expired,
+9 too large to read as text (use --html).
 
 Publishing the same file again updates the same link. Environment:
   FOLDRENDER_TOKEN       token to use instead of the saved login
@@ -612,6 +772,7 @@ main() {
     publish) cmd_publish "$@" ;;
     share) cmd_share "$@" ;;
     list|ls) cmd_list ;;
+    read|cat) cmd_read "$@" ;;
     rm|delete) cmd_rm "$@" ;;
     open) cmd_open "$@" ;;
     help|-h|--help) cmd_help ;;
