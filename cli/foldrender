@@ -478,6 +478,25 @@ cmd_publish() {
   [ -n "$title" ] || title="$(title_from "$src")"
   # A new page is private unless told otherwise. A re-publish sends only the
   # flags it was given, so the page keeps the visibility and sharing it has.
+  # A slug alone does not say which of the two this is: the server makes a new
+  # page for a PUT to a slug nobody has, and gives it the server's default,
+  # which is public. So with no flag, ask first whether the page is one of
+  # yours (its version list answers 404 otherwise).
+  if [ -n "$slug" ] && [ -z "$vis" ]; then
+    api_auth GET "/api/artifacts/$slug/versions"
+    case "$STATUS" in
+      200) ;;
+      404)
+        vis=private
+        if [ "$mode" = map ]; then
+          note "the page $slug was deleted, so this publish made a new one"
+          map_forget 1 "$rp"
+          slug=""
+        fi
+        ;;
+      *) fail_http ;;
+    esac
+  fi
   if [ -z "$slug" ] && [ -z "$vis" ]; then
     vis=private
   fi
@@ -720,8 +739,10 @@ Usage:
                                         --confirm LOGIN is required
   foldrender publish FILE|- [options]   publish a page; prints only its URL
       --title TEXT                      page title (default: the file's <title>)
-      --slug SLUG                       update that page
-      --private                         only you can see it (default for new pages)
+      --slug SLUG                       publish to that page: update it, or make it
+                                        if you have no page by that name
+      --private                         only you can see it (default for new pages,
+                                        with or without --slug)
       --public                          anyone with the link can see it
       --share LOGIN[,LOGIN...]          only these GitHub logins can see it
   foldrender share SLUG|URL [+LOGIN ...] [-LOGIN ...] [--public|--private]
