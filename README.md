@@ -1,6 +1,6 @@
 # FoldRender Kit
 
-Tools for [FoldRender Artifacts](https://foldrender.dev/artifacts): publish a
+Tools for [FoldRender Artifacts](https://foldrender.dev/share): publish a
 self-contained HTML page and get a link that opens on any device, then manage
 who can see it.
 
@@ -49,7 +49,7 @@ foldrender publish report.html   # prints the page's link
 foldrender help                  # every command
 ```
 
-The guide is at https://foldrender.dev/artifacts. What the service stores is in
+The guide is at https://foldrender.dev/share. What the service stores is in
 the privacy policy: https://foldrender.dev/privacy.
 
 ## How this repository is updated
