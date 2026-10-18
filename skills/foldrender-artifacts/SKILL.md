@@ -1,6 +1,6 @@
 ---
 name: foldrender-artifacts
-description: Publish an HTML page (a report, diagram, explainer or dashboard) as a link the user can open on any device, and read FoldRender pages back as clean text, with the foldrender command. Use when the user asks to share this page or report, publish this HTML, give me a link, or make it viewable on my phone (发个链接, 分享给别人看, 手机上看). Also use whenever the user pastes an a.foldrender.dev link or asks to look at, read, summarize or discuss a page or artifact there (看看这个页面, 读一下这个 artifact, 这个链接里写了什么), including private pages that ask for a GitHub sign-in in a browser. Read those with foldrender read, not with a browser or a web fetch.
+description: Publish an HTML page (a report, diagram, explainer or dashboard) as a link the user can open on any device, and read FoldRender pages back as clean text, with the foldrender command. Use when the user asks to share this page or report, publish this HTML, give me a link, or make it viewable on my phone (发个链接, 分享给别人看, 手机上看). Also use whenever the user pastes a foldrender.dev/artifacts/… or a.foldrender.dev link or asks to look at, read, summarize or discuss a page or artifact there (看看这个页面, 读一下这个 artifact, 这个链接里写了什么), including private pages that ask for a GitHub sign-in in a browser. Read those with foldrender read, not with a browser or a web fetch.
 ---
 
 # FoldRender Artifacts
@@ -31,13 +31,14 @@ foldrender whoami
 foldrender publish /path/to/page.html
 ```
 
-stdout is the URL and nothing else. Capture it and show it to the user.
+stdout is the URL and nothing else. Capture it and show it to the user. The URL is the page's address, `…/artifacts/<login>/<name>`; the name comes from the page's title. `--name NAME` chooses it, and `--folder FOLDER` puts the page in a folder: `…/artifacts/<login>/<folder>/<name>`. When another of the user's pages already has that name in that folder, the new page gets `NAME-2` (the command says so on stderr).
 
 Pick the visibility:
 
 - Default for a new page: private. Only the owner can see it.
 - `--share alice,bob`: only those GitHub logins can see it. Use this when the user names people.
-- `--public`: anyone with the link. Use it only when the user asks for public.
+- `--link`: anyone who has the link. The link ends in `?k=…`, a key; without the key the address opens nothing, and the page is listed nowhere. Use it when the user wants a link to send.
+- `--public`: anyone, and the page is listed on the user's page, `…/artifacts/<login>/`. Use it only when the user asks for public.
 
 Use `-` to publish from stdin: `foldrender publish - < page.html`.
 
@@ -45,7 +46,7 @@ Use `-` to publish from stdin: `foldrender publish - < page.html`.
 
 Publish the same file path again and the command updates the same URL. Keep the file path stable while you work.
 
-To update a specific page instead, pass its slug: `foldrender publish page.html --slug abc123`.
+To update a specific page instead, pass its id or its address: `foldrender publish page.html --slug https://foldrender.dev/artifacts/alice/report`. An update keeps the page's address.
 
 A re-publish with no visibility or share flags keeps what the page already has.
 
@@ -53,8 +54,10 @@ A re-publish with no visibility or share flags keeps what the page already has.
 
 ```
 foldrender share <slug-or-url> +alice -bob     add or remove logins
-foldrender share <slug-or-url> --public        anyone with the link
+foldrender share <slug-or-url> --link          anyone with the link (and its key)
+foldrender share <slug-or-url> --public        anyone, listed on the user's page
 foldrender share <slug-or-url> --private       owner only
+foldrender share <slug-or-url> --reset-link    a new key: the link handed out before stops working
 foldrender list                                all of the user's pages, with expiry dates
 foldrender open <slug-or-url>                  open a page in the browser
 foldrender rm <slug-or-url>                    delete a page
@@ -64,13 +67,13 @@ Delete a page only when the user asks.
 
 ## 6. Read a page
 
-When the user gives you an `a.foldrender.dev` link or a page slug, read it with the command:
+When the user gives you a page's address (`…/artifacts/<login>/…`), an `a.foldrender.dev` link or a page slug, read it with the command, passing the address whole, key included:
 
 ```
-foldrender read https://a.foldrender.dev/abc123
+foldrender read 'https://foldrender.dev/artifacts/alice/q3/report?k=…'
 ```
 
-Do not open the link in a browser, fetch it with a web tool, or ask the user to sign in on the web page. A private or shared page sends browsers and fetchers to a GitHub sign-in page, and a fetcher that sends a token is redirected to the page's own address (ending in `--u.foldrender.dev`), where it loses the token and is sent back, round and round. The command reads the page through the API with the saved token. It takes the link, the page's own address, or the slug.
+Do not open the link in a browser, fetch it with a web tool, or ask the user to sign in on the web page. A private or shared page sends browsers and fetchers to a GitHub sign-in page, and a fetcher that sends a token is redirected to the page's own address (ending in `--u.foldrender.dev`), where it loses the token and is sent back, round and round. The command reads the page through the API with the saved token. It takes the address, the link, the page's address on its content host, or the slug.
 
 stdout is a block of facts between `---` lines (title, url, owner (when the command is signed in), visibility, updated, expires, size, type, and `note:` lines when something could not be read), then the page as Markdown. An image embedded in the page shows as `![alt](asset:N)`. An inline diagram shows as `[SVG asset:N: title]`, followed by the text labels inside it.
 

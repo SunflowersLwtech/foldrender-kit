@@ -66,7 +66,7 @@ api() {
   local method="$1" path="$2" rc
   shift 2
   STATUS="$(curl -sS -X "$method" --connect-timeout 15 --max-time 300 \
-    -H "Accept: $ACCEPT" -o "$TMP/body" -w '%{http_code}' "$@" \
+    -H "Accept: $ACCEPT" -H "FoldRender-API: 2" -o "$TMP/body" -w '%{http_code}' "$@" \
     "$API$path" 2>"$TMP/err")"
   rc=$?
   if [ "$rc" -ne 0 ]; then
@@ -125,6 +125,15 @@ expect_2xx() {
   fail_http
 }
 
+# A page's name or folder in its address: lowercase letters, digits and
+# hyphens, starting with a letter or digit, up to 63.
+check_name() {
+  case "$1" in
+    ''|[!a-z0-9]*|*[!a-z0-9-]*) die 2 "$2 takes lowercase letters, digits and hyphens, starting with a letter or digit: $1" ;;
+  esac
+  [ "${#1}" -le 63 ] || die 2 "$2 is at most 63 characters: $1"
+}
+
 # A page slug is letters, digits, hyphens and underscores. Checking it here
 # keeps a typo like "a/b" from becoming a different API path.
 check_slug() {
@@ -153,6 +162,45 @@ slug_from() {
   local s="${1%%[?#]*}"
   s="${s%/}"
   printf '%s' "${s##*/}"
+}
+
+# The link token in a page address (?k=...), if any.
+token_from() {
+  case "$1" in
+    *[?\&]k=*) local k="${1#*[?&]k=}"; printf '%s' "${k%%[&#]*}" ;;
+  esac
+}
+
+# page_id TARGET: sets PAGE_ID to the id of the page TARGET names, and PAGE_K to
+# its link token when TARGET carries one. TARGET is an id, a link by id
+# (https://a.foldrender.dev/<id>, or .../artifacts/-/<id>), a library link
+# (...?open=<id>), or a page's address (https://foldrender.dev/artifacts/<owner>/
+# [<folder>/]<name>), which the API resolves to its id. Not run in a subshell,
+# because a die inside $(...) would only end the subshell.
+page_id() {
+  local path
+  PAGE_ID="" PAGE_K="$(token_from "$1")"
+  case "$1" in
+    *[?\&]open=*) PAGE_ID="${1#*open=}"; PAGE_ID="${PAGE_ID%%[&#]*}" ;;
+    http://*/artifacts/-/*|https://*/artifacts/-/*) PAGE_ID="$(slug_from "$1")" ;;
+    http://*/artifacts/*|https://*/artifacts/*)
+      path="/artifacts/${1#*/artifacts/}"
+      path="${path%%[?#]*}"
+      if [ -n "$TOKEN" ]; then
+        api GET "/api/resolve?path=$(urlencode "$path")${PAGE_K:+&k=$PAGE_K}" -H "$(auth_header)"
+      else
+        api GET "/api/resolve?path=$(urlencode "$path")${PAGE_K:+&k=$PAGE_K}"
+      fi
+      case "$STATUS" in
+        200) PAGE_ID="$(sed -n 's/.*"id" *: *"\([^"]*\)".*/\1/p' "$TMP/body" | head -n 1)" ;;
+        401) die 3 "$1 is not public. Sign in to use it: foldrender login" ;;
+        404) die 7 "no page at $1, or it is not visible to this account" ;;
+        *) fail_http ;;
+      esac
+      [ -n "$PAGE_ID" ] || die 1 "the server did not say which page $1 is"
+      ;;
+    *) PAGE_ID="$(slug_from "$1")" ;;
+  esac
 }
 
 # Percent-encodes every byte except unreserved characters.
@@ -228,14 +276,18 @@ upload() {
   api_auth "$1" "$2${4:+?$4}" -H "Content-Type: text/html" --data-binary "@$3"
 }
 
-# Sets PAGE_URL from the body of a successful write. Not run in a subshell,
-# because a die inside $(...) would only end the subshell.
+# Sets PAGE_URL, and PAGE_ID, from the body of a successful write: the URL on
+# the first line, then `id=<id>` from a server that has page addresses (an
+# older one sends the link by id alone, whose last part is the id). Not run in a
+# subshell, because a die inside $(...) would only end the subshell.
 read_page_url() {
   PAGE_URL="$(head -n 1 "$TMP/body" | tr -d '\r')"
   case "$PAGE_URL" in
     http*) ;;
     *) die 1 "the server did not return a page URL ($(error_text))" ;;
   esac
+  PAGE_ID="$(field id)"
+  [ -n "$PAGE_ID" ] || PAGE_ID="$(slug_from "$PAGE_URL")"
 }
 
 open_url() {
@@ -424,22 +476,27 @@ cmd_account() {
 }
 
 cmd_publish() {
-  local file="" title="" slug="" vis="" share="" mode="" rp="" src="" bytes query url
+  local file="" title="" slug="" vis="" share="" mode="" rp="" src="" bytes query url name="" folder="" folder_set=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --title) need $# "$1"; title="$2"; shift 2 ;;
-      --slug) need $# "$1"; slug="$2"; shift 2 ;;
+      --slug|--id) need $# "$1"; slug="$2"; shift 2 ;;
+      --name) need $# "$1"; name="$2"; shift 2 ;;
+      --folder) need $# "$1"; folder="$2"; folder_set=1; shift 2 ;;
       --share) need $# "$1"; share="${2// /}"; shift 2 ;;
       --private) vis=private; shift ;;
+      --link) vis=link; shift ;;
       --public) vis=public; shift ;;
       -) file="-"; shift ;;
       -*) die 2 "unknown option: $1" ;;
       *) [ -z "$file" ] || die 2 "publish takes one file"; file="$1"; shift ;;
     esac
   done
-  [ -n "$file" ] || die 2 "usage: foldrender publish <file.html|-> [--title T] [--slug S] [--private|--public|--share a,b]"
+  [ -n "$file" ] || die 2 "usage: foldrender publish <file.html|-> [--title T] [--name N] [--folder F] [--slug ID] [--private|--link|--public|--share a,b]"
+  [ -z "$name" ] || check_name "$name" --name
+  [ -z "$folder" ] || check_name "$folder" --folder
   if [ -n "$share" ]; then
-    [ -z "$vis" ] || die 2 "--share makes the page shared, so drop --private or --public"
+    [ -z "$vis" ] || die 2 "--share makes the page shared, so drop --private, --link or --public"
     check_logins "$share"
     vis=shared
   fi
@@ -462,7 +519,8 @@ cmd_publish() {
   # Which page is this? --slug, then a foldrender-slug meta tag, then the
   # slug this file was published under before.
   if [ -n "$slug" ]; then
-    slug="$(slug_from "$slug")"
+    page_id "$slug"
+    slug="$PAGE_ID"
     mode=explicit
   else
     slug="$(meta_slug "$src")"
@@ -504,6 +562,8 @@ cmd_publish() {
   [ -z "$title" ] || query="title=$(urlencode "$title")"
   [ -z "$vis" ] || query="${query:+$query&}visibility=$vis"
   [ -z "$share" ] || query="${query:+$query&}share=$share"
+  [ -z "$name" ] || query="${query:+$query&}name=$name"
+  [ -z "$folder_set" ] || query="${query:+$query&}folder=$folder"
 
   if [ -n "$slug" ]; then
     upload PUT "/api/artifacts/$slug" "$src" "$query"
@@ -521,35 +581,50 @@ cmd_publish() {
   if [ "$STATUS" = 404 ] && [ "$mode" = meta ]; then
     die 1 "there is no page named $slug (from the foldrender-slug meta tag). Change or remove the tag."
   fi
+  if [ "$STATUS" = 409 ]; then
+    die 1 "another of your pages is already at that address (${name:+name $name}${folder:+, folder $folder}). Choose another with --name or --folder"
+  fi
   expect_2xx
   read_page_url
   if [ -n "$rp" ]; then
-    map_set "$rp" "$(slug_from "$PAGE_URL")"
+    map_set "$rp" "$PAGE_ID"
+  fi
+  # A new page whose name another of the owner's pages holds is given name-2.
+  if [ -n "$name" ]; then
+    case "$(slug_from "$PAGE_URL")" in
+      "$name"|"$PAGE_ID") ;;
+      *) note "the name $name is taken by another of your pages, so this one is at $(slug_from "$PAGE_URL"). Choose another with --name" ;;
+    esac
   fi
   printf '%s\n' "$PAGE_URL"
 }
 
 cmd_share() {
   local target="" vis="" adds="" removes="" arg slug json url
-  [ $# -ge 1 ] || die 2 "usage: foldrender share <slug-or-url> [+login ...] [-login ...] [--public|--private]"
+  [ $# -ge 1 ] || die 2 "usage: foldrender share <slug-or-url> [+login ...] [-login ...] [--public|--link|--private] [--reset-link]"
   target="$1"
   shift
+  local reset=""
   for arg in "$@"; do
     case "$arg" in
       --public) vis=public ;;
+      --link) vis=link ;;
       --private) vis=private ;;
+      --reset-link) reset=1 ;;
       --*) die 2 "unknown option: $arg" ;;
       +?*) check_logins "${arg#+}"; adds="${adds:+$adds,}${arg#+}" ;;
       -?*) check_logins "${arg#-}"; removes="${removes:+$removes,}${arg#-}" ;;
-      *) die 2 "expected +login, -login, --public or --private, got: $arg" ;;
+      *) die 2 "expected +login, -login, --public, --link, --private or --reset-link, got: $arg" ;;
     esac
   done
-  [ -n "$adds$removes$vis" ] || die 2 "nothing to change: give +login, -login, --public or --private"
-  slug="$(slug_from "$target")"
+  [ -n "$adds$removes$vis$reset" ] || die 2 "nothing to change: give +login, -login, --public, --link, --private or --reset-link"
+  page_id "$target"
+  slug="$PAGE_ID"
   check_slug "$slug"
 
   json=""
   [ -z "$vis" ] || json="\"visibility\":\"$vis\""
+  [ -z "$reset" ] || json="${json:+$json,}\"reset_link\":true"
   [ -z "$adds" ] || json="${json:+$json,}\"share_add\":$(json_array "$adds")"
   [ -z "$removes" ] || json="${json:+$json,}\"share_remove\":$(json_array "$removes")"
   api_auth PATCH "/api/artifacts/$slug" -H "Content-Type: application/json" --data "{$json}"
@@ -566,13 +641,14 @@ cmd_list() {
     return 0
   fi
   printf '%-12s  %-8s  %-20s  %-20s  %s\n' SLUG VISIBILITY UPDATED EXPIRES TITLE
-  awk -F'\t' '{ printf "%-12s  %-8s  %-20s  %-20s  %s\n", $1, $2, $3, $4, $5 }' "$TMP/body"
+  awk -F'\t' '{ printf "%-12s  %-8s  %-20s  %-20s  %s%s\n", $1, $2, $3, $4, $5, ($6 != "" && $6 != "-") ? "  " $6 : "" }' "$TMP/body"
 }
 
 cmd_rm() {
   [ $# -eq 1 ] || die 2 "usage: foldrender rm <slug-or-url>"
   local slug
-  slug="$(slug_from "$1")"
+  page_id "$1"
+  slug="$PAGE_ID"
   check_slug "$slug"
   api_auth DELETE "/api/artifacts/$slug"
   [ "$STATUS" != 404 ] || map_forget 2 "$slug"
@@ -598,28 +674,22 @@ cmd_open() {
 
 #   ------------------------------------------------------------------ read
 
-# A page slug from a slug, a page URL (its link, or its address on a content host,
-# query and all), or a library link (.../artifacts?open=SLUG). read never requests
-# the URL itself: a private page's link redirects to the content host, where a
-# client without a cookie jar loses the token and is sent back, round and round.
-page_slug() {
-  local s
-  case "$1" in
-    *[?\&]open=*)
-      s="${1#*open=}"
-      printf '%s' "${s%%[&#]*}"
-      ;;
-    *) slug_from "$1" ;;
-  esac
-}
 
-# read_get PATH: a GET on the read API, with the token when there is one.
-# Public pages need none, so a missing token is not an error here.
+# read_get PATH: a GET on the read API, with the token when there is one, and
+# the page's link token when its address carried one (PAGE_K). Public pages
+# need neither, so a missing token is not an error here.
 read_get() {
+  local path="$1"
+  if [ -n "${PAGE_K:-}" ]; then
+    case "$path" in
+      *\?*) path="$path&k=$PAGE_K" ;;
+      *) path="$path?k=$PAGE_K" ;;
+    esac
+  fi
   if [ -n "$TOKEN" ]; then
-    api GET "$1" -H "$(auth_header)"
+    api GET "$path" -H "$(auth_header)"
   else
-    api GET "$1"
+    api GET "$path"
   fi
 }
 
@@ -697,7 +767,11 @@ cmd_read() {
   [ -n "$target" ] || die 2 "usage: foldrender read <slug-or-url> [--html|--json] [--assets DIR] [--save FILE]"
   [ -z "$save" ] || [ "$mode" = text ] || die 2 "--save writes the stored file; drop --html or --json"
   [ -z "$save" ] || [ -z "$assets" ] || die 2 "--save and --assets do not go together"
-  slug="$(page_slug "$target")"
+  # read never requests the URL itself: a private page's link redirects to the
+  # content host, where a client without a cookie jar loses the token and is
+  # sent back, round and round. An address is resolved to its id instead.
+  page_id "$target"
+  slug="$PAGE_ID"
   check_slug "$slug"
   case "$slug" in
     a|api|artifacts|auth|cli) die 2 "$target is not a link to a page" ;;
@@ -737,15 +811,24 @@ Usage:
                                         delete your account, pages and tokens. At a
                                         terminal you type your login; without one,
                                         --confirm LOGIN is required
-  foldrender publish FILE|- [options]   publish a page; prints only its URL
+  foldrender publish FILE|- [options]   publish a page; prints only its address
       --title TEXT                      page title (default: the file's <title>)
-      --slug SLUG                       publish to that page: update it, or make it
-                                        if you have no page by that name
+      --name NAME                       the last part of its address (default: from
+                                        the title); a name another of your pages has
+                                        becomes NAME-2
+      --folder FOLDER                   put it in a folder: .../artifacts/LOGIN/FOLDER/NAME
+      --slug ID                         publish to that page (its id or address):
+                                        update it, or make it if you have none by that id
       --private                         only you can see it (default for new pages,
                                         with or without --slug)
-      --public                          anyone with the link can see it
+      --link                            anyone with the link can see it; the link
+                                        carries a key, and the page is listed nowhere
+      --public                          anyone can see it, and it is listed on your
+                                        page, .../artifacts/LOGIN/
       --share LOGIN[,LOGIN...]          only these GitHub logins can see it
-  foldrender share SLUG|URL [+LOGIN ...] [-LOGIN ...] [--public|--private]
+  foldrender share ID|URL [+LOGIN ...] [-LOGIN ...] [--public|--link|--private]
+                                        [--reset-link]: a new key for a --link page;
+                                        the link handed out before stops working
   foldrender list                       list your pages
   foldrender read SLUG|URL [options]    print a page as text: its facts, then
                                         Markdown. Public pages need no sign-in
@@ -762,9 +845,10 @@ Examples:
   foldrender publish report.html
   foldrender publish report.html --share alice,bob
   foldrender publish - < diagram.html
-  foldrender read https://a.foldrender.dev/abc123
+  foldrender publish report.html --folder q3 --link
+  foldrender read https://foldrender.dev/artifacts/alice/q3/report
   foldrender read abc123 --assets ./abc123-assets
-  foldrender share https://a.foldrender.dev/abc123 +carol -bob
+  foldrender share https://foldrender.dev/artifacts/alice/q3/report +carol -bob
   foldrender rm abc123
 
 Exit codes: 0 ok, 1 failed, 2 bad usage, 3 not signed in or token rejected,

@@ -65,11 +65,11 @@ fetch() {
 
 # Fetch everything before writing anything, so a failed download leaves the
 # machine as it was.
-fetch "artifacts/foldrender" "$tmp/foldrender"
-head -n 1 "$tmp/foldrender" | grep -q '^#!/' || fail "$BASE/artifacts/foldrender did not return the command"
+fetch "install/foldrender" "$tmp/foldrender"
+head -n 1 "$tmp/foldrender" | grep -q '^#!/' || fail "$BASE/install/foldrender did not return the command"
 if [ "$INSTALL_SKILL" = 1 ]; then
-  fetch "artifacts/SKILL.md" "$tmp/SKILL.md"
-  head -n 1 "$tmp/SKILL.md" | grep -q '^---' || fail "$BASE/artifacts/SKILL.md did not return the skill"
+  fetch "install/SKILL.md" "$tmp/SKILL.md"
+  head -n 1 "$tmp/SKILL.md" | grep -q '^---' || fail "$BASE/install/SKILL.md did not return the skill"
 fi
 
 mkdir -p "$BIN_DIR"
