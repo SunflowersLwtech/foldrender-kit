@@ -1145,22 +1145,30 @@ cmd_read() {
   cat "$TMP/page"
 }
 
-# canvas [FILE|PAGE ...] [--title T] [--json]: a new canvas with these pages on
-# it as cards, up to 12. A file is published first (to its own page, as
-# publish would); a page (an id or an address) is put on as it is. Prints the
-# canvas's address. With nothing named, a blank canvas.
+# canvas [FILE|PAGE ...] [--title T] [--owner LOGIN] [--json]: a new canvas
+# with these pages on it as cards, up to 12. A file is published first (to its
+# own page, as publish would); a page (an id or an address) is put on as it is.
+# Prints the canvas's address. With nothing named, a blank canvas. --owner is
+# for the admin token: the canvas is made for that account (by default the
+# operator's), from that account's pages only, so it takes pages, not files.
 cmd_canvas() {
-  local items=() ids="" it as_json="" ctitle=""
+  local items=() ids="" it as_json="" ctitle="" cowner=""
   local title="" slug="" vis="" share="" name="" folder="" folder_set=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --title) need $# "$1"; ctitle="$2"; shift 2 ;;
+      --owner) need $# "$1"; check_logins "$2"; case "$2" in *,*) die 2 "--owner takes one GitHub login" ;; esac; cowner="$2"; shift 2 ;;
       --json) as_json=1; shift ;;
       -*) die 2 "unknown option: $1" ;;
       *) items+=("$1"); shift ;;
     esac
   done
   [ ${#items[@]} -le 12 ] || die 2 "a canvas starts with up to 12 pages; add more on the canvas itself"
+  if [ -n "$cowner" ]; then
+    for it in "${items[@]}"; do
+      [ ! -f "$it" ] || die 2 "--owner takes pages that account already has, not files: publish $it as that account first"
+    done
+  fi
   require_token
   for it in "${items[@]}"; do
     if [ -f "$it" ]; then
@@ -1173,6 +1181,7 @@ cmd_canvas() {
   done
   {
     printf '{"from":[%s]' "$ids"
+    [ -z "$cowner" ] || printf ',"owner":"%s"' "$cowner"
     if [ -n "$ctitle" ]; then
       printf '%s' "$ctitle" > "$TMP/ctitle"
       printf ',"title":'
@@ -1183,7 +1192,10 @@ cmd_canvas() {
   ACCEPT="application/json"
   api_auth POST /api/canvas -H "Content-Type: application/json" --data-binary "@$TMP/canvas.json"
   ACCEPT="text/plain"
-  [ "$STATUS" != 404 ] || die 1 "this server has no canvases yet"
+  if [ "$STATUS" = 404 ]; then
+    [ -z "$(json_field error)" ] || die 7 "$(json_field error)"
+    die 1 "this server has no canvases yet"
+  fi
   expect_2xx
   if [ -n "$as_json" ]; then
     cat "$TMP/body"
@@ -1273,6 +1285,14 @@ EOF
 foldrender share PAGE... [+LOGIN ...] [-LOGIN ...] [--public|--link|--private] [--reset-link]
   Changes who can read the pages, without publishing them again; prints each
   address. --reset-link gives a --link page a new key: the old link stops working.
+EOF
+    ;;
+    canvas) cat <<'EOF'
+foldrender canvas FILE|PAGE... [--title T] [--owner LOGIN] [--json]
+  A new canvas with these pages on it as cards, up to 12: files are published
+  first, pages (ids or addresses) used as they are. Prints its address.
+  --owner LOGIN        with the admin token: make it for that account (by
+                       default the operator's), from that account's pages
 EOF
     ;;
     versions|restore|undo) cat <<'EOF'
