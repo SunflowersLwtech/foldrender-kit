@@ -1,6 +1,6 @@
 ---
 name: foldrender-artifacts
-description: Publish an HTML page (a report, diagram, explainer or dashboard) as a link the user can open on any device, and read FoldRender pages back as clean text, with the foldrender command. Use when the user asks to share this page or report, publish this HTML, give me a link, or make it viewable on my phone (发个链接, 分享给别人看, 手机上看). Also use whenever the user pastes a foldrender.dev/artifacts/… or a.foldrender.dev link or asks to look at, read, summarize or discuss a page or artifact there (看看这个页面, 读一下这个 artifact, 这个链接里写了什么), including private pages that ask for a GitHub sign-in in a browser. Read those with foldrender read, not with a browser or a web fetch.
+description: Publish an HTML page (a report, diagram, explainer or dashboard) as a link the user can open on any device, put several pages on one canvas (a board of cards with notes and connectors), and read FoldRender pages and canvases back as clean text, with the foldrender command. Use when the user asks to share this page or report, publish this HTML, give me a link, make it viewable on my phone, or put these pages on one board or canvas (发个链接, 分享给别人看, 手机上看, 放到一块画布上). Also use whenever the user pastes a foldrender.dev/artifacts/… or a.foldrender.dev link or asks to look at, read, summarize or discuss a page or artifact there (看看这个页面, 读一下这个 artifact, 这个链接里写了什么), including private pages that ask for a GitHub sign-in in a browser. Read those with foldrender read, not with a browser or a web fetch.
 ---
 
 # FoldRender Artifacts
@@ -92,7 +92,33 @@ If the read fails:
 - Exit 7: no such page, or it is not shared with the signed-in account. Tell the user, and suggest that the page's owner share it with the login shown by `foldrender whoami`. Do not guess other slugs.
 - Exit 8: the page expired and was removed. Tell the user the date from the message. Only the owner can publish it again.
 
-## 7. Free plan limits
+## 7. Canvases
+
+A canvas is a board: several pages as cards, with notes, boxes and connectors. Its link reads like a page's, with `foldrender read`, but prints a map first: each card's short id, title and size, the notes, what each box holds, and the connectors as `A [id] → B [id]: label`; then each card's text in reading order. A long canvas stops near 6,000 tokens and lists its cards.
+
+```
+foldrender read <canvas link>                 the map, then the cards
+foldrender read <canvas link> --card RfvO     one card (4 characters of its id, its number or its title)
+foldrender read <canvas link> --outline       the map alone
+foldrender read <canvas link> --json          the structure, with coordinates
+```
+
+To make one, from HTML files (they become cards, not pages of their own) or the user's pages:
+
+```
+foldrender canvas a.html b.html --title "Q4" --note "read a first" --link 1:2:"numbers from"
+foldrender canvas plan.canvas                 a JSON Canvas file; coordinates are optional
+```
+
+`--name NAME` makes the same command update that canvas instead of making another. To change a canvas, in one step that applies all of it or nothing:
+
+```
+foldrender canvas edit <canvas> --add risks.html --link RfvO:risks.html:"risks from" --rm hN42 --base 7
+```
+
+`--base` is the `rev:` the read showed; if the canvas changed since, the edit is refused (exit 10) with the current map, so read it again and redo it. The command prints the canvas's address and then its new map.
+
+## 8. Free plan limits
 
 - 10 pages.
 - Each page expires 30 days after it was published.
@@ -100,7 +126,7 @@ If the read fails:
 
 If a publish fails with "free plan limit reached", tell the user the limit. Run `foldrender list` and offer to delete a page they no longer need. Do not delete anything without asking.
 
-## 8. Export or delete the account
+## 9. Export or delete the account
 
 Run these only when the user asks for them in this conversation.
 
@@ -134,6 +160,7 @@ If the user gives you a token, run `foldrender login --token <token>` and do not
 | 7 | `read`: no such page, or not shared with this account | Tell the user (section 6) |
 | 8 | `read`: the page expired and was removed | Tell the user the date |
 | 9 | `read`: the page is too large to turn into text | Read it with `--html` instead |
+| 10 | `edit` or `canvas edit` did not apply (old text missing, or the page or canvas moved on from `--base`) | Read it again and redo the change |
 
 ## Rules
 

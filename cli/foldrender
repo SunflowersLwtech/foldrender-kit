@@ -15,16 +15,21 @@
 #   FOLDRENDER_READ_MAX_TOKENS  How much `read` prints before it stops, says how
 #                          to go on and lists the sections (default 6000,
 #                          about; 0 for no limit).
+#   FOLDRENDER_NO_UPDATE_NOTE  Set to 1 to never say that a newer CLI is out.
 #
 # Exit codes: 0 ok, 1 failed, 2 bad usage, 3 not signed in or token rejected,
 # 4 free-plan limit reached, 5 page too large, 6 network failure,
-# 7 no such page, or not visible to this account (read), 8 page expired (read).
+# 7 no such page, or not visible to this account (read), 8 page expired (read),
+# 9 too large to read as text, 10 an edit did not apply.
 
 export LC_ALL=C
 
+FR_CLI_VERSION=0.12.0
 API="${FOLDRENDER_API:-https://a.foldrender.dev}"
 API="${API%/}"
 MAX_BYTES=5242880
+CARD_MAX_BYTES=2097152
+CANVAS_MAX_CARDS=24
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/foldrender"
 TOKEN_FILE="$CONFIG_DIR/token"
 SLUG_MAP="$CONFIG_DIR/slugs"
@@ -64,18 +69,59 @@ require_token() {
   [ -n "$TOKEN" ] || die 3 "not signed in. Run: foldrender login"
 }
 
-# api METHOD PATH [curl args...]: sets STATUS and leaves the body in $TMP/body.
-# A failed connection exits here. HTTP errors are reported by the caller.
+# api METHOD PATH [curl args...]: sets STATUS and leaves the body in $TMP/body
+# and the headers in $TMP/headers. A failed connection exits here. HTTP errors
+# are reported by the caller.
 api() {
   local method="$1" path="$2" rc
   shift 2
   STATUS="$(curl -sS -X "$method" --connect-timeout 15 --max-time 300 \
-    -H "Accept: $ACCEPT" -H "FoldRender-API: 2" -o "$TMP/body" -w '%{http_code}' "$@" \
+    -H "Accept: $ACCEPT" -H "FoldRender-API: 2" -D "$TMP/headers" -o "$TMP/body" -w '%{http_code}' "$@" \
     "$API$path" 2>"$TMP/err")"
   rc=$?
   if [ "$rc" -ne 0 ]; then
     die 6 "cannot reach $API. Check your network connection and try again. ($(sed 's/^curl: ([0-9]*) //' "$TMP/err" | head -n 1))"
   fi
+  update_note
+}
+
+# header_value NAME: the value of the header NAME (lowercase) in the last
+# answer.
+header_value() {
+  awk -v h="$1" '
+    { sub(/\r$/, "") }
+    tolower(substr($0, 1, length(h) + 1)) == h ":" { v = substr($0, length(h) + 2); sub(/^[ \t]+/, "", v); sub(/[ \t]+$/, "", v) }
+    END { printf "%s", v }' "$TMP/headers" 2>/dev/null
+}
+
+# newer A B: whether version A is above version B, number by number (0.12.0
+# is above 0.9.3, which comparing them as strings gets wrong).
+newer() {
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    na = split(a, x, "."); nb = split(b, y, ".")
+    for (i = 1; i <= na || i <= nb; i++) if (x[i] + 0 != y[i] + 0) exit (x[i] + 0 > y[i] + 0) ? 0 : 1
+    exit 1
+  }'
+}
+
+# Every API answer names the newest CLI in an X-FR-CLI header. When that is
+# newer than this one, say so on stderr, at most once a day: update-noted keeps
+# the day it was said, and the version. Only the run's first answer is looked
+# at, and no request is ever made for it.
+update_note() {
+  local latest today
+  [ -z "${NOTE_SEEN:-}" ] || return 0
+  NOTE_SEEN=1
+  [ "${FOLDRENDER_NO_UPDATE_NOTE:-}" != 1 ] || return 0
+  latest="$(header_value x-fr-cli)"
+  case "$latest" in ''|*[!0-9.]*|.*|*.|*..*) return 0 ;; esac
+  newer "$latest" "$FR_CLI_VERSION" || return 0
+  today="$(date +%Y-%m-%d)"
+  [ "$(head -n 1 "$CONFIG_DIR/update-noted" 2>/dev/null | cut -d ' ' -f 1)" != "$today" ] || return 0
+  # Said only once it is written down, so a home that cannot be written to
+  # does not get it on every command.
+  { mkdir -p "$CONFIG_DIR" && printf '%s %s\n' "$today" "$latest" > "$CONFIG_DIR/update-noted"; } 2>/dev/null || return 0
+  note "CLI $latest is out (you have $FR_CLI_VERSION); what is new: https://foldrender.dev/install/CHANGES.md; update: curl -fsSL https://foldrender.dev/install.sh | sh"
 }
 
 # auth_header: prints a curl -H argument that names a file holding the
@@ -244,9 +290,10 @@ meta_slug() {
   printf '%s' "$tag" | sed -n 's/.*content="\([^"]*\)".*/\1/p'
 }
 
+# warn_if_secrets FILE [LABEL]
 warn_if_secrets() {
   if grep -Eq '(^|[^A-Za-z0-9])(sk-|ghp_|frat_)[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|-----BEGIN ' "$1"; then
-    note "warning: this page looks like it contains a secret (an API key, token or private key). Anyone with the link can read it."
+    note "${2:-}warning: this page looks like it contains a secret (an API key, token or private key). Anyone with the link can read it."
   fi
 }
 
@@ -345,6 +392,132 @@ json_str() {
     NR > 1 { emit(prev); printf "\\n" }
     { prev = $0 }
     END { sub(/X$/, "", prev); emit(prev); printf "\"" }'
+}
+
+# json_arg VALUE: VALUE as a JSON string literal.
+json_arg() {
+  printf '%s' "$1" > "$TMP/arg"
+  json_str "$TMP/arg"
+}
+
+# json_file FILE: as json_str, for a whole page. json_str's awk copies the rest
+# of a line for every character it escapes, which on a minified page (one long
+# line, many quotes) takes minutes; sed escapes each line in one pass. Its
+# replacements are written so that BSD and GNU sed read them alike.
+json_file() {
+  local i
+  if [ ! -f "$TMP/json.sed" ]; then
+    {
+      printf 's/\\\\/\\\\\\\\/g\ns/"/\\\\"/g\ns/\t/\\\\t/g\ns/\r/\\\\r/g\n'
+      for i in 1 2 3 4 5 6 7 8 11 12 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31; do
+        printf 's/%b/\\\\u%04x/g\n' "\\0$(printf '%03o' "$i")" "$i"
+      done
+    } > "$TMP/json.sed"
+  fi
+  { cat "$1"; printf 'X'; } | sed -f "$TMP/json.sed" | awk '
+    BEGIN { printf "\"" }
+    NR > 1 { printf "%s\\n", prev }
+    { prev = $0 }
+    END { sub(/X$/, "", prev); printf "%s\"", prev }'
+}
+
+# json_get MODE KEY [FILE]: a member of the JSON object in FILE (the body by
+# default), found by walking the text, so a key inside a nested object or a
+# string never matches. MODE raw prints the value as written, str a string
+# decoded, len how many items an array or object has, pairs one "key<TAB>
+# value" line for each string member of an object. Fails when KEY is absent.
+json_get() {
+  awk -v mode="$1" -v want="$2" '
+    function hex(h,   i, v) {
+      h = tolower(h)
+      for (i = 1; i <= 4; i++) v = v * 16 + index("0123456789abcdef", substr(h, i, 1)) - 1
+      return v
+    }
+    function utf8(cp) {
+      if (cp < 1) return ""
+      if (cp < 128) return sprintf("%c", cp)
+      if (cp < 2048) return sprintf("%c%c", 192 + int(cp / 64), 128 + cp % 64)
+      if (cp < 65536) return sprintf("%c%c%c", 224 + int(cp / 4096), 128 + int(cp / 64) % 64, 128 + cp % 64)
+      return sprintf("%c%c%c%c", 240 + int(cp / 262144), 128 + int(cp / 4096) % 64, 128 + int(cp / 64) % 64, 128 + cp % 64)
+    }
+    # A string literal decoded. Runs between escapes are copied whole: adding
+    # one character at a time copies the whole result each time.
+    function unstr(v,   c, n, i, j, out, x, cp, lo) {
+      n = split(v, c, "")
+      for (i = 2; i < n; i++) {
+        for (j = i; j < n && c[j] != "\\"; j++) ;
+        if (j > i) out = out substr(v, i, j - i)
+        if (j >= n) break
+        x = c[j + 1]
+        i = j + 1
+        if (x == "n") out = out "\n"
+        else if (x == "t") out = out "\t"
+        else if (x == "r") out = out "\r"
+        else if (x == "b") out = out "\b"
+        else if (x == "f") out = out "\f"
+        else if (x == "u") {
+          cp = hex(substr(v, i + 1, 4)); i += 4
+          if (cp >= 55296 && cp < 56320 && c[i + 1] == "\\" && c[i + 2] == "u") {
+            lo = hex(substr(v, i + 3, 4))
+            if (lo >= 56320 && lo < 57344) { cp = 65536 + (cp - 55296) * 1024 + lo - 56320; i += 6 }
+          }
+          if (cp >= 55296 && cp < 57344) cp = 65533
+          out = out utf8(cp)
+        } else out = out x
+      }
+      return out
+    }
+    function trim(t) { sub(/^[ \t\r\n]+/, "", t); sub(/[ \t\r\n]+$/, "", t); return t }
+    # The members of object T (or the items of array T): K[i] the key decoded
+    # (an array item its number), V[i] the value as written. How many, or -1
+    # for anything else. It goes from one bracket, comma, colon or string to
+    # the next, and takes a string whole in one match: a request holds pages
+    # of HTML, and splitting those into characters takes seconds and 500 MB.
+    function parts(t, K, V,   d, obj, st, cnt, vs, x, rest, at, i) {
+      t = trim(t)
+      x = substr(t, 1, 1)
+      if (x != "{" && x != "[") return -1
+      obj = x == "{"
+      cnt = d = st = at = 0
+      rest = t
+      while (match(rest, /[]"{}[,:]/)) {
+        i = at + RSTART
+        x = substr(rest, RSTART, 1)
+        if (x == "\"") {
+          rest = substr(rest, RSTART)
+          if (!match(rest, /^"([^"\\]|\\.)*"/)) break
+          if (d == 1 && obj && st == 0) { K[cnt + 1] = unstr(substr(rest, 1, RLENGTH)); st = 1 }
+          at = i - 1 + RLENGTH
+          rest = substr(rest, RLENGTH + 1)
+          continue
+        }
+        at = i
+        rest = substr(rest, RSTART + 1)
+        if (x == "{" || x == "[") {
+          if (++d == 1) { st = obj ? 0 : 2; vs = i + 1 }
+        } else if (x == ":" && d == 1 && obj) {
+          st = 2; vs = i + 1
+        } else if (d == 1 && (x == "," || x == "}" || x == "]")) {
+          if (st == 2 && trim(substr(t, vs, i - vs)) != "") { V[++cnt] = trim(substr(t, vs, i - vs)); if (!obj) K[cnt] = cnt }
+          st = obj ? 0 : 2; vs = i + 1
+          if (x != ",") d--
+        } else if (x == "}" || x == "]") d--
+      }
+      return cnt
+    }
+    { s = s (NR > 1 ? "\n" : "") $0 }
+    END {
+      n = parts(s, K, V)
+      for (i = 1; i <= n; i++) if (K[i] == want) v = V[i]
+      if (v == "") exit 1
+      if (mode == "raw") printf "%s", v
+      else if (mode == "str") { if (substr(v, 1, 1) != "\"") exit 1; printf "%s", unstr(v) }
+      else if (mode == "len") { m = parts(v, K2, V2); if (m < 0) exit 1; print m }
+      else if (mode == "pairs") {
+        m = parts(v, K2, V2)
+        for (i = 1; i <= m; i++) if (substr(V2[i], 1, 1) == "\"") printf "%s\t%s\n", K2[i], unstr(V2[i])
+      }
+    }' "${3:-$TMP/body}"
 }
 
 # field KEY: the value of a key=value line in the body.
@@ -633,6 +806,9 @@ publish_one() {
   fi
   if [ "$STATUS" = 404 ] && [ "$mode" = meta ]; then
     die 1 "there is no page named $p_slug (from the foldrender-slug meta tag). Change or remove the tag."
+  fi
+  if [ "$STATUS" = 409 ] && [ "$(error_text)" = canvas ]; then
+    die 1 "$p_slug is a canvas, not a page: change it with foldrender canvas edit $p_slug (see: foldrender help canvas)"
   fi
   if [ "$STATUS" = 409 ]; then
     die 1 "another of your pages is already at that address (${name:+name $name}${folder:+, folder $folder}). Choose another with --name or --folder"
@@ -1071,9 +1247,11 @@ save_assets() {
 # fact. --html prints the stored HTML, --json the API's JSON, --save FILE writes
 # the stored HTML to a file, --assets DIR also saves embedded images and SVG. A
 # PDF published from the app reads as its text, page by page; its page images
-# are the assets.
+# are the assets. A canvas reads as its map, then its cards: --card ID is
+# --section for a card, --outline the map alone, --notes adds the annotations
+# (for the owner and collaborators).
 cmd_read() {
-  local target="" mode=text assets="" save="" slug query="" part="" outline="" cut=""
+  local target="" mode=text assets="" save="" slug query="" part="" outline="" cut="" sect="" notes=""
   local maxt="${FOLDRENDER_READ_MAX_TOKENS:-6000}" meta=short
   case "$maxt" in ''|*[!0-9]*) maxt=6000 ;; esac
   while [ $# -gt 0 ]; do
@@ -1083,7 +1261,11 @@ cmd_read() {
       --assets) need $# "$1"; assets="$2"; shift 2 ;;
       --save|-o) need $# "$1"; save="$2"; shift 2 ;;
       --outline) outline=1; cut=1; shift ;;
-      --section) need $# "$1"; part="$part&section=$(urlencode "$2")"; cut=1; shift 2 ;;
+      --section|--card)
+        need $# "$1"
+        [ -z "$sect" ] || die 2 "read takes one --section or --card"
+        sect=1; part="$part&section=$(urlencode "$2")"; cut=1; shift 2 ;;
+      --notes) [ -n "$notes" ] || part="$part&notes=1"; notes=1; shift ;;
       --from)
         need $# "$1"
         case "$2" in ''|*[!0-9]*) die 2 "--from takes a character offset, from the next: line of a read that stopped" ;; esac
@@ -1105,10 +1287,11 @@ cmd_read() {
       *) [ -z "$target" ] || die 2 "read takes one page"; target="$1"; shift ;;
     esac
   done
-  [ -n "$target" ] || die 2 "usage: foldrender read PAGE [--outline|--section N|--from N] [--max-tokens N|--max-chars N|--all] [--meta full] [--html|--json|--save FILE] [--assets DIR]"
+  [ -n "$target" ] || die 2 "usage: foldrender read PAGE [--outline|--section N|--card ID|--from N] [--max-tokens N|--max-chars N|--all] [--notes] [--meta full] [--html|--json|--save FILE] [--assets DIR]"
   [ -z "$save" ] || [ "$mode" = text ] || die 2 "--save writes the stored file; drop --html or --json"
   [ -z "$save" ] || [ -z "$assets" ] || die 2 "--save and --assets do not go together"
-  [ -z "$cut" ] || { [ "$mode" != html ] && [ -z "$save" ]; } || die 2 "--outline, --section, --from and --max-* cut the Markdown; drop --html or --save"
+  [ -z "$cut" ] || { [ "$mode" != html ] && [ -z "$save" ]; } || die 2 "--outline, --section, --card, --from and --max-* cut the Markdown; drop --html or --save"
+  [ -z "$notes" ] || { [ "$mode" != html ] && [ -z "$save" ]; } || die 2 "--notes adds the annotations to the Markdown; drop --html or --save"
   # read never requests the URL itself: a private page's link redirects to the
   # content host, where a client without a cookie jar loses the token and is
   # sent back, round and round. An address is resolved to its id instead.
@@ -1145,70 +1328,555 @@ cmd_read() {
   cat "$TMP/page"
 }
 
-# canvas [FILE|PAGE ...] [--title T] [--owner LOGIN] [--json]: a new canvas
-# with these pages on it as cards, up to 12. A file is published first (to its
-# own page, as publish would); a page (an id or an address) is put on as it is.
-# Prints the canvas's address. With nothing named, a blank canvas. --owner is
-# for the admin token: the canvas is made for that account (by default the
-# operator's), from that account's pages only, so it takes pages, not files.
+#   ------------------------------------------------------------------ canvas
+
+# attach KEY FILE: FILE goes along in the request's files under KEY, as a
+# card's HTML; it never becomes a page of its own. The limits are checked here,
+# before anything is sent. A key attached already is not sent twice.
+attach() {
+  local k bytes
+  for k in "${ATT_KEYS[@]}"; do
+    [ "$k" != "$1" ] || return 0
+  done
+  [ -f "$2" ] || die 2 "no such file: $2"
+  [ -r "$2" ] || die 2 "cannot read: $2"
+  bytes="$(wc -c < "$2" | tr -d ' ')"
+  [ "$bytes" -gt 0 ] || die 2 "the card is empty: $1"
+  [ "$bytes" -le "$CARD_MAX_BYTES" ] || die 5 "$1 is $bytes bytes; a card is at most 2 MB ($CARD_MAX_BYTES bytes)"
+  # sed and awk end a line at a NUL byte, and no HTML page holds one.
+  [ "$(tr -d '\000' < "$2" | wc -c | tr -d ' ')" = "$bytes" ] || die 2 "$1 holds NUL bytes, so it is not an HTML page"
+  ATT_BYTES=$((ATT_BYTES + bytes))
+  [ "$ATT_BYTES" -le "$MAX_BYTES" ] || die 5 "the files are $ATT_BYTES bytes together; a canvas request takes at most 5 MB ($MAX_BYTES bytes) of them"
+  warn_if_secrets "$2" "$1: "
+  ATT_KEYS+=("$1")
+  ATT_PATHS+=("$2")
+}
+
+# jkey NAME: the next member's name in the JSON object being written. JSEP is
+# the comma before it, empty for the first.
+jkey() {
+  printf '%s"%s":' "$JSEP" "$1"
+  JSEP=,
+}
+
+# files_json: the attached files, as the request's "files" member.
+files_json() {
+  local i=0
+  jkey files
+  printf '{'
+  while [ "$i" -lt "${#ATT_KEYS[@]}" ]; do
+    [ "$i" -eq 0 ] || printf ','
+    json_arg "${ATT_KEYS[$i]}"
+    printf ':'
+    json_file "${ATT_PATHS[$i]}"
+    i=$((i + 1))
+  done
+  printf '}'
+}
+
+# plan_files FILE DIR LABEL: attaches the local files a JSON Canvas plan, or a
+# canvas edit patch, names in its "file" fields, each under its name as written
+# there, which is relative to DIR. A name that is no file there must be a page's
+# id or address, which the server reads. The names are found by a pattern, not
+# a JSON parser, so a name written with an escape is refused.
+plan_files() {
+  local v p
+  tr '\r\n' '  ' < "$1" | grep -oE '"file"[[:space:]]*:[[:space:]]*"([^"\\]|\\.)*"' \
+    | sed 's/^"file"[[:space:]]*:[[:space:]]*"//; s/"$//' > "$TMP/plan-files"
+  while IFS= read -r v; do
+    case "$v" in
+      *\\*) die 2 "$3: the file name \"$v\" is written with an escape (a double quote, a backslash or \\u); rename the file so that it needs none" ;;
+      http://*|https://*) continue ;;
+      /*) p="$v" ;;
+      *) p="$2/$v" ;;
+    esac
+    if [ -f "$p" ]; then
+      attach "$v" "$p"
+    else
+      case "$v" in
+        ''|*[!A-Za-z0-9_-]*) die 2 "$3 names \"$v\": no such file in $2, and not a page's id or address" ;;
+      esac
+    fi
+  done < "$TMP/plan-files"
+}
+
+# link_end SPEC: the node a --link spec A:B[:LABEL], or what is left of one,
+# starts with. note:N is the Nth --note; a number the Nth card (canvas only);
+# then the longest of LINK_ITEMS it starts with, since a path or an address
+# may hold colons; then, in canvas edit, an id on the canvas, up to the colon.
+# Sets LINK_END (a node's id, or an edit's ref), LINK_REST (what follows the
+# colon after it) and LINK_MORE (1 when there was such a colon).
+link_end() {
+  local s="$1" head="${1%%:*}" it best="" bi=0 i=0
+  case "$s" in
+    note:*)
+      head="${s#note:}"
+      head="${head%%:*}"
+      case "$head" in ''|*[!0-9]*) die 2 "--link $LINK_SPEC: note: takes the number of a --note, as in note:1" ;; esac
+      [ "$head" -ge 1 ] && [ "$head" -le "$NOTES_N" ] || die 2 "--link $LINK_SPEC: there is no note:$head; give a --note TEXT for each (there are $NOTES_N)"
+      if [ "$LINK_MODE" = new ]; then LINK_END="n$head"; else LINK_END="note:$head"; fi
+      link_rest "$s" "note:$head"
+      return 0 ;;
+  esac
+  if [ "$LINK_MODE" = new ]; then
+    case "$head" in
+      ''|*[!0-9]*) ;;
+      *)
+        [ "$head" -ge 1 ] && [ "$head" -le "${#LINK_ITEMS[@]}" ] || die 2 "--link $LINK_SPEC: there is no card $head; the cards are 1 to ${#LINK_ITEMS[@]}"
+        LINK_END="c$head"
+        link_rest "$s" "$head"
+        return 0 ;;
+    esac
+  fi
+  for it in "${LINK_ITEMS[@]}"; do
+    i=$((i + 1))
+    case "$s" in
+      "$it"|"$it":*) [ "${#it}" -le "${#best}" ] || { best="$it"; bi="$i"; } ;;
+    esac
+  done
+  if [ -n "$best" ]; then
+    if [ "$LINK_MODE" = new ]; then LINK_END="c$bi"; else LINK_END="$best"; fi
+    link_rest "$s" "$best"
+    return 0
+  fi
+  if [ "$LINK_MODE" = edit ]; then
+    case "$head" in
+      ''|*[!A-Za-z0-9_-]*) ;;
+      *)
+        if [ "${#head}" -le 64 ]; then
+          LINK_END="$head"
+          link_rest "$s" "$head"
+          return 0
+        fi ;;
+    esac
+    die 2 "--link $LINK_SPEC: \"$head\" is not an id on the canvas, an --add argument or note:N"
+  fi
+  die 2 "--link $LINK_SPEC: \"$head\" is not a card's number, a file or page given here, or note:N"
+}
+
+# link_rest SPEC TAKEN: LINK_REST and LINK_MORE, from what follows TAKEN, the
+# start of SPEC.
+link_rest() {
+  LINK_REST="${1:${#2}}"
+  LINK_MORE=""
+  if [ -n "$LINK_REST" ]; then
+    LINK_MORE=1
+    LINK_REST="${LINK_REST#:}"
+  fi
+}
+
+# link_parse SPEC: LINK_A, LINK_B and LINK_LABEL from --link A:B[:LABEL]. The
+# label is the rest, colons and all.
+link_parse() {
+  LINK_SPEC="$1"
+  link_end "$1"
+  LINK_A="$LINK_END"
+  { [ -n "$LINK_MORE" ] && [ -n "$LINK_REST" ]; } || die 2 "--link takes A:B or A:B:LABEL, not $1"
+  link_end "$LINK_REST"
+  LINK_B="$LINK_END"
+  LINK_LABEL=""
+  [ -z "$LINK_MORE" ] || LINK_LABEL="$LINK_REST"
+}
+
+# check_request FILE: a canvas request is at most 5 MB and 64 KB, escapes and
+# all.
+check_request() {
+  local n
+  n="$(wc -c < "$1" | tr -d ' ')"
+  [ "$n" -le $((MAX_BYTES + 65536)) ] || die 5 "the request is $n bytes written as JSON; a canvas request is at most 5 MB and 64 KB ($((MAX_BYTES + 65536)) bytes)"
+}
+
+# canvas_url: PAGE_URL, the canvas's address, from the answer.
+canvas_url() {
+  PAGE_URL="$(json_get str page_url)"
+  [ -n "$PAGE_URL" ] || PAGE_URL="$(json_get str url)"
+  case "$PAGE_URL" in
+    http*) ;;
+    *) die 1 "the server did not say where the canvas is ($(error_text))" ;;
+  esac
+}
+
+# print_map: the canvas's map from the answer, if it has one, ending in a
+# newline.
+print_map() {
+  json_get str map > "$TMP/map" || return 0
+  cat "$TMP/map"
+  [ -z "$(tail -c 1 "$TMP/map")" ] || printf '\n'
+}
+
+# canvas_fail: the error for a canvas request the server refused, for what
+# canvas and canvas edit answer alike; the rest as for pages.
+canvas_fail() {
+  local msg retry
+  msg="$(json_get str message || json_get str error)"
+  case "$STATUS" in
+    413) die 5 "too large: ${msg:-the server refused the request}" ;;
+    429)
+      retry="$(header_value retry-after)"
+      case "$retry" in *[!0-9]*) retry="" ;; esac
+      die 4 "${msg:-too many canvas saves}${retry:+; try again in $retry seconds}" ;;
+  esac
+  fail_http
+}
+
+# canvas [FILE|PAGE ...|PLAN] [options]: a new canvas. A file goes along in the
+# request as a card's HTML and never becomes a page; a page (an id or an
+# address) is copied in as a card. Without a plan file the command writes the
+# plan: cards c1.. in the order given, notes n1.. (--note), connectors e1..
+# (--link), the same ids every time, so the same command again with --name
+# finds the canvas unchanged and writes nothing. PLAN, a *.canvas or *.json
+# file, is a JSON Canvas plan, sent as it is with the local files it names.
+# Prints the canvas's address; stderr says what it holds. --owner is for the
+# admin token: the canvas is made for that account.
 cmd_canvas() {
-  local items=() ids="" it as_json="" ctitle="" cowner=""
-  local title="" slug="" vis="" share="" name="" folder="" folder_set=""
+  if [ "${1:-}" = edit ]; then
+    shift
+    cmd_canvas_edit "$@"
+    return
+  fi
+  local items=() refs=() notes=() links=() plan="" it i n as_json="" ctitle="" cowner=""
+  local vis="" share="" name="" folder="" id rev cards boxes
+  ATT_KEYS=() ATT_PATHS=() ATT_BYTES=0 JSEP=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --title) need $# "$1"; ctitle="$2"; shift 2 ;;
+      --name) need $# "$1"; check_name "$2" --name; name="$2"; shift 2 ;;
+      --folder) need $# "$1"; check_name "$2" --folder; folder="$2"; shift 2 ;;
+      --note) need $# "$1"; [ -n "$2" ] || die 2 "--note needs some text"; notes+=("$2"); shift 2 ;;
+      --link) need $# "$1"; links+=("$2"); shift 2 ;;
+      --private) vis="private"; shift ;;
+      --link-access) vis="link"; shift ;;
+      --public) vis="public"; shift ;;
+      --share) need $# "$1"; share="${2// /}"; shift 2 ;;
       --owner) need $# "$1"; check_logins "$2"; case "$2" in *,*) die 2 "--owner takes one GitHub login" ;; esac; cowner="$2"; shift 2 ;;
       --json) as_json=1; shift ;;
       -*) die 2 "unknown option: $1" ;;
+      *.canvas|*.json) [ -z "$plan" ] || die 2 "a canvas takes one plan file"; plan="$1"; shift ;;
       *) items+=("$1"); shift ;;
     esac
   done
-  [ ${#items[@]} -le 12 ] || die 2 "a canvas starts with up to 12 pages; add more on the canvas itself"
-  if [ -n "$cowner" ]; then
-    for it in "${items[@]}"; do
-      [ ! -f "$it" ] || die 2 "--owner takes pages that account already has, not files: publish $it as that account first"
-    done
+  if [ -n "$share" ]; then
+    [ -z "$vis" ] || die 2 "--share makes the canvas shared, so drop --private, --link-access or --public"
+    check_logins "$share"
+    vis=shared
   fi
+  if [ -n "$plan" ]; then
+    [ ${#items[@]} -eq 0 ] || die 2 "a plan file holds the whole canvas: name the files and pages in it, not beside it"
+    { [ ${#notes[@]} -eq 0 ] && [ ${#links[@]} -eq 0 ]; } || die 2 "a plan file holds the whole canvas: put the notes and connectors in it"
+    [ -f "$plan" ] || die 2 "no such plan file: $plan"
+    [ "$(tr -d ' \t\r\n' < "$plan" | head -c 1)" = "{" ] || die 2 "$plan is not a JSON Canvas plan (a JSON object with nodes and edges)"
+    n="$(tr '\r\n' '  ' < "$plan" | grep -oE '"type"[[:space:]]*:[[:space:]]*"file"' | wc -l | tr -d ' ')"
+    [ "$n" -le "$CANVAS_MAX_CARDS" ] || die 2 "$plan has $n cards; a canvas holds at most $CANVAS_MAX_CARDS"
+    plan_files "$plan" "$(dirname "$plan")" "$plan"
+  fi
+  [ ${#items[@]} -le "$CANVAS_MAX_CARDS" ] || die 2 "a canvas holds at most $CANVAS_MAX_CARDS cards"
+  # Everything that needs no network first: the files, then the connectors.
+  for it in "${items[@]}"; do
+    if [ -f "$it" ]; then
+      attach "$it" "$it"
+    else
+      case "$it" in
+        http://*|https://*) ;;
+        ''|*[!A-Za-z0-9_-]*) die 2 "no such file: $it" ;;
+      esac
+    fi
+  done
+  LINK_MODE=new NOTES_N=${#notes[@]}
+  LINK_ITEMS=("${items[@]}")
+  : > "$TMP/edges"
+  i=0
+  for it in "${links[@]}"; do
+    link_parse "$it"
+    i=$((i + 1))
+    {
+      [ "$i" -eq 1 ] || printf ','
+      printf '{"id":"e%d","fromNode":"%s","toNode":"%s"' "$i" "$LINK_A" "$LINK_B"
+      [ -z "$LINK_LABEL" ] || { printf ',"label":'; json_arg "$LINK_LABEL"; }
+      printf '}'
+    } >> "$TMP/edges"
+  done
   require_token
   for it in "${items[@]}"; do
     if [ -f "$it" ]; then
-      publish_one "$it" "$it: " > /dev/null
+      refs+=("$it")
     else
       page_id "$it"
       check_slug "$PAGE_ID"
+      refs+=("$PAGE_ID")
     fi
-    ids="$ids${ids:+,}\"$PAGE_ID\""
   done
   {
-    printf '{"from":[%s]' "$ids"
-    [ -z "$cowner" ] || printf ',"owner":"%s"' "$cowner"
-    if [ -n "$ctitle" ]; then
-      printf '%s' "$ctitle" > "$TMP/ctitle"
-      printf ',"title":'
-      json_str "$TMP/ctitle"
+    printf '{'
+    [ -z "$ctitle" ] || { jkey title; json_arg "$ctitle"; }
+    [ -z "$name" ] || { jkey name; printf '"%s"' "$name"; }
+    [ -z "$folder" ] || { jkey folder; printf '"%s"' "$folder"; }
+    [ -z "$vis" ] || { jkey visibility; printf '"%s"' "$vis"; }
+    [ -z "$share" ] || { jkey share; json_array "$share"; }
+    [ -z "$cowner" ] || { jkey owner; printf '"%s"' "$cowner"; }
+    if [ -n "$plan" ]; then
+      jkey plan
+      cat "$plan"
+    elif [ ${#items[@]} -gt 0 ] || [ ${#notes[@]} -gt 0 ]; then
+      jkey plan
+      printf '{"nodes":['
+      i=0
+      for it in "${refs[@]}"; do
+        i=$((i + 1))
+        [ "$i" -eq 1 ] || printf ','
+        printf '{"id":"c%d","type":"file","file":' "$i"
+        json_arg "$it"
+        printf '}'
+      done
+      n=0
+      for it in "${notes[@]}"; do
+        n=$((n + 1))
+        [ $((i + n)) -eq 1 ] || printf ','
+        printf '{"id":"n%d","type":"text","text":' "$n"
+        json_arg "$it"
+        printf '}'
+      done
+      printf '],"edges":['
+      cat "$TMP/edges"
+      printf ']}'
     fi
+    [ ${#ATT_KEYS[@]} -eq 0 ] || files_json
     printf '}'
   } > "$TMP/canvas.json"
+  check_request "$TMP/canvas.json"
   ACCEPT="application/json"
   api_auth POST /api/canvas -H "Content-Type: application/json" --data-binary "@$TMP/canvas.json"
   ACCEPT="text/plain"
-  if [ "$STATUS" = 404 ]; then
-    [ -z "$(json_field error)" ] || die 7 "$(json_field error)"
-    die 1 "this server has no canvases yet"
-  fi
-  expect_2xx
+  case "$STATUS" in
+    2??) ;;
+    404)
+      [ -z "$(json_get str error)" ] || die 7 "$(json_get str error)"
+      die 1 "this server has no canvases yet" ;;
+    409) die 1 "$(json_get str error || error_text)" ;;
+    *) canvas_fail ;;
+  esac
   if [ -n "$as_json" ]; then
     cat "$TMP/body"
     printf '\n'
     return 0
   fi
-  PAGE_URL="$(json_field page_url)"
-  [ -n "$PAGE_URL" ] || PAGE_URL="$(json_field url)"
-  case "$PAGE_URL" in
-    http*) printf '%s\n' "$PAGE_URL" ;;
-    *) die 1 "the server did not say where the canvas is ($(error_text))" ;;
+  canvas_url
+  printf '%s\n' "$PAGE_URL"
+  id="$(json_get str id)"
+  rev="$(json_get raw rev)"
+  [ "$rev" != null ] || rev=""
+  cards="$(json_get raw cards)"
+  if [ "$(json_get raw changed)" = false ]; then
+    note "canvas $id unchanged${rev:+, rev $rev}"
+  elif [ -n "$cards" ]; then
+    boxes="$(json_get raw boxes)"
+    note "canvas $id with $cards card(s), $(json_get raw notes) note(s)$([ "${boxes:-0}" = 0 ] || printf ', %s box(es)' "$boxes"), $(json_get raw connectors) connector(s)${rev:+, rev $rev}"
+  else
+    note "canvas $id${rev:+, rev $rev}"
+    if [ -n "$plan" ] || [ $(( ${#items[@]} + ${#notes[@]} )) -gt 0 ]; then
+      note "warning: the server did not say what the canvas holds, so it may be older than this CLI and have left the cards out. Look: foldrender read $PAGE_URL --outline"
+    fi
+  fi
+}
+
+# canvas edit CANVAS [options]: changes a canvas in one request, all of it or
+# nothing. --add puts a file (its HTML goes along, as a card only) or a page on
+# as a card, --note a note, --link a connector (A and B: ids on the canvas,
+# --add arguments, note:N), --rm takes a node, with its connectors, or a
+# connector off. --patch sends a JSON patch as it is, with the local files its
+# add_nodes name. Prints the address, then the canvas's map as it now is;
+# stderr says the revision, what changed and the id each new node got.
+cmd_canvas_edit() {
+  local target="" base="" patch="" plabel="" pdir="" as_json="" adds=() refs=() notes=() links=() rms=()
+  local it i n cid rev added updated removed
+  ATT_KEYS=() ATT_PATHS=() ATT_BYTES=0 JSEP=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --base)
+        need $# "$1"
+        case "$2" in ''|*[!0-9]*) die 2 "--base takes a revision number (rev: in foldrender read CANVAS --outline)" ;; esac
+        base="$2"; shift 2 ;;
+      --add)
+        need $# "$1"
+        for it in "${adds[@]}"; do
+          [ "$it" != "$2" ] || die 2 "--add $2 twice: a card added is named by its argument, so each must differ"
+        done
+        adds+=("$2"); shift 2 ;;
+      --note) need $# "$1"; [ -n "$2" ] || die 2 "--note needs some text"; notes+=("$2"); shift 2 ;;
+      --link) need $# "$1"; links+=("$2"); shift 2 ;;
+      --rm)
+        need $# "$1"
+        case "$2" in ''|*[!A-Za-z0-9_-]*) die 2 "--rm takes the id of a card, note, box or connector on the canvas, or a unique start of it: $2" ;; esac
+        rms+=("$2"); shift 2 ;;
+      --patch) need $# "$1"; [ -z "$patch" ] || die 2 "canvas edit takes one --patch"; patch="$2"; shift 2 ;;
+      --json) as_json=1; shift ;;
+      -*) die 2 "unknown option: $1" ;;
+      *) [ -z "$target" ] || die 2 "canvas edit takes one canvas"; target="$1"; shift ;;
+    esac
+  done
+  [ -n "$target" ] || die 2 "usage: foldrender canvas edit CANVAS [--base REV] [--add FILE|PAGE]... [--note TEXT]... [--link A:B[:LABEL]]... [--rm ID]... | --patch FILE|-"
+  n=$(( ${#adds[@]} + ${#notes[@]} + ${#links[@]} + ${#rms[@]} ))
+  if [ -n "$patch" ]; then
+    [ "$n" -eq 0 ] || die 2 "--patch holds the whole change: give --base with it, but not --add, --note, --link or --rm"
+    if [ "$patch" = - ]; then
+      cat > "$TMP/patch.json"
+      pdir=. plabel="the patch"
+    else
+      [ -f "$patch" ] || die 2 "no such file: $patch"
+      cp "$patch" "$TMP/patch.json" || die 1 "cannot read $patch"
+      pdir="$(dirname "$patch")" plabel="$patch"
+    fi
+    case "$(tr -d ' \t\r\n' < "$TMP/patch.json" | head -c 2)" in
+      '{}') die 2 "$plabel changes nothing" ;;
+      '{'*) [ "$(tr -d ' \t\r\n' < "$TMP/patch.json" | tail -c 1)" = "}" ] || die 2 "$plabel is not a JSON object" ;;
+      *) die 2 "--patch takes a JSON object: {\"add_nodes\": [...], \"add_edges\": [...], \"remove_ids\": [...], ...}" ;;
+    esac
+    if [ -n "$base" ] && json_get raw base "$TMP/patch.json" > /dev/null; then
+      die 2 "$plabel has its own base; drop --base"
+    fi
+    # A patch that carries its own files is sent as it is.
+    json_get raw files "$TMP/patch.json" > /dev/null || plan_files "$TMP/patch.json" "$pdir" "$plabel"
+  elif [ "$n" -eq 0 ]; then
+    die 2 "nothing to change: give --add, --note, --link, --rm or --patch"
+  fi
+  [ ${#adds[@]} -le "$CANVAS_MAX_CARDS" ] || die 2 "a canvas holds at most $CANVAS_MAX_CARDS cards"
+  for it in "${adds[@]}"; do
+    if [ -f "$it" ]; then
+      attach "$it" "$it"
+    else
+      case "$it" in
+        http://*|https://*) ;;
+        ''|*[!A-Za-z0-9_-]*) die 2 "no such file: $it" ;;
+      esac
+    fi
+  done
+  LINK_MODE=edit NOTES_N=${#notes[@]}
+  LINK_ITEMS=("${adds[@]}")
+  : > "$TMP/edges"
+  i=0
+  for it in "${links[@]}"; do
+    link_parse "$it"
+    i=$((i + 1))
+    {
+      [ "$i" -eq 1 ] || printf ','
+      printf '{"ref":"link:%d","from":' "$i"
+      json_arg "$LINK_A"
+      printf ',"to":'
+      json_arg "$LINK_B"
+      [ -z "$LINK_LABEL" ] || { printf ',"label":'; json_arg "$LINK_LABEL"; }
+      printf '}'
+    } >> "$TMP/edges"
+  done
+  require_token
+  page_id "$target"
+  check_slug "$PAGE_ID"
+  cid="$PAGE_ID"
+  for it in "${adds[@]}"; do
+    if [ -f "$it" ]; then
+      refs+=("$it")
+    else
+      page_id "$it"
+      check_slug "$PAGE_ID"
+      refs+=("$PAGE_ID")
+    fi
+  done
+  if [ -n "$patch" ]; then
+    {
+      # The patch as it is, with the base and the files put in before its
+      # closing brace.
+      awk '{ s = s (NR > 1 ? "\n" : "") $0 } END { i = length(s); while (i > 0 && substr(s, i, 1) != "}") i--; printf "%s", substr(s, 1, i - 1) }' "$TMP/patch.json"
+      JSEP=,
+      [ -z "$base" ] || { jkey base; printf '%s' "$base"; }
+      [ ${#ATT_KEYS[@]} -eq 0 ] || files_json
+      printf '}'
+    } > "$TMP/edit.json"
+  else
+    {
+      printf '{'
+      [ -z "$base" ] || { jkey base; printf '%s' "$base"; }
+      if [ $(( ${#adds[@]} + ${#notes[@]} )) -gt 0 ]; then
+        jkey add_nodes
+        printf '['
+        i=0
+        while [ "$i" -lt "${#adds[@]}" ]; do
+          [ "$i" -eq 0 ] || printf ','
+          printf '{"ref":'
+          json_arg "${adds[$i]}"
+          printf ',"type":"file","file":'
+          json_arg "${refs[$i]}"
+          printf '}'
+          i=$((i + 1))
+        done
+        n=0
+        for it in "${notes[@]}"; do
+          n=$((n + 1))
+          [ $((i + n)) -eq 1 ] || printf ','
+          printf '{"ref":"note:%d","type":"text","text":' "$n"
+          json_arg "$it"
+          printf '}'
+        done
+        printf ']'
+      fi
+      if [ ${#rms[@]} -gt 0 ]; then
+        jkey remove_ids
+        printf '['
+        i=0
+        for it in "${rms[@]}"; do
+          [ "$i" -eq 0 ] || printf ','
+          printf '"%s"' "$it"
+          i=$((i + 1))
+        done
+        printf ']'
+      fi
+      if [ ${#links[@]} -gt 0 ]; then
+        jkey add_edges
+        printf '['
+        cat "$TMP/edges"
+        printf ']'
+      fi
+      [ ${#ATT_KEYS[@]} -eq 0 ] || files_json
+      printf '}'
+    } > "$TMP/edit.json"
+  fi
+  check_request "$TMP/edit.json"
+  ACCEPT="application/json"
+  api_auth POST "/api/canvas/$cid/edit" -H "Content-Type: application/json" --data-binary "@$TMP/edit.json"
+  ACCEPT="text/plain"
+  case "$STATUS" in
+    2??) ;;
+    404) die 7 "no canvas named $cid among yours" ;;
+    409)
+      # Stale: the server's message, then the canvas's map as it now is.
+      note "$(json_get str message || printf 'the edit did not apply (%s)' "$(error_text)")"
+      print_map >&2
+      exit 10 ;;
+    400) die 10 "the edit did not apply ($(json_get str message || json_get str error || error_text))" ;;
+    *) canvas_fail ;;
   esac
-  note "canvas $(json_field id) with ${#items[@]} card(s)"
+  if [ -n "$as_json" ]; then
+    cat "$TMP/body"
+    printf '\n'
+    return 0
+  fi
+  canvas_url
+  printf '%s\n' "$PAGE_URL"
+  print_map
+  rev="$(json_get raw rev)"
+  [ "$rev" != null ] || rev="?"
+  if [ "$(json_get raw changed)" = false ]; then
+    note "unchanged, rev $rev"
+  else
+    if [ -n "$patch" ]; then
+      added=$(( $(json_get len add_nodes "$TMP/patch.json" || echo 0) + $(json_get len add_edges "$TMP/patch.json" || echo 0) ))
+      updated=$(( $(json_get len update_nodes "$TMP/patch.json" || echo 0) + $(json_get len update_edges "$TMP/patch.json" || echo 0) ))
+    else
+      added=$(( ${#adds[@]} + ${#notes[@]} + ${#links[@]} )) updated=0
+    fi
+    removed="$(json_get len removed || echo 0)"
+    note "rev $rev: added $added, removed $removed$([ "$updated" -eq 0 ] || printf ', updated %s' "$updated")"
+  fi
+  json_get pairs ids | while IFS="$(printf '\t')" read -r it n; do
+    note "$it -> $n"
+  done
 }
 
 cmd_help() {
@@ -1223,10 +1891,11 @@ foldrender publishes HTML pages as links and reads pages back as text.
   ls [WORDS]           your newest 20 pages (--all, --access A, --folder F)
   share PAGE...        +login -login --public --link --private --reset-link
   versions PAGE        kept versions; restore PAGE VERSION; undo PAGE
-  canvas FILE|PAGE...  a canvas with these pages on it as cards (up to 12)
+  canvas FILE|PAGE...  a canvas with these as cards (up to 24), --note, --link
+  canvas edit CANVAS   add or remove cards, notes and connectors in one step
   rm PAGE...           delete pages
   open PAGE            print the page's address and open it
-  login / logout / whoami / export [FILE] / account delete
+  login / logout / whoami / export [FILE] / account delete / version
 
 PAGE is a page's address, its id, or an old a.foldrender.dev link.
 --json prints the API's answer. More: foldrender help COMMAND, help exit.
@@ -1265,8 +1934,15 @@ foldrender read PAGE [options]
   A few facts (title, address, id, updated, size), then the page as Markdown.
   A long page stops near 6k tokens (FOLDRENDER_READ_MAX_TOKENS) and ends with
   how much is left, the command that goes on, and its sections by number.
-  --outline            the headings, numbered, each with its size
+  A canvas reads as its map first (its cards with their ids, its notes, boxes
+  and connectors), then its cards' text in reading order.
+  --outline            the headings, numbered, each with its size; on a
+                       canvas, the map alone
   --section N|TEXT     one section (its number in the outline, or its heading)
+  --card ID            one card of a canvas: its id (or a unique start of it),
+                       its number in reading order, or its title
+  --notes              a canvas's annotations in its map too (for its owner
+                       and collaborators)
   --from N             go on from character N (the next: line says which)
   --max-tokens N       stop near N tokens; --max-chars N near N characters
   --all                no stop
@@ -1288,11 +1964,29 @@ foldrender share PAGE... [+LOGIN ...] [-LOGIN ...] [--public|--link|--private] [
 EOF
     ;;
     canvas) cat <<'EOF'
-foldrender canvas FILE|PAGE... [--title T] [--owner LOGIN] [--json]
-  A new canvas with these pages on it as cards, up to 12: files are published
-  first, pages (ids or addresses) used as they are. Prints its address.
-  --owner LOGIN        with the admin token: make it for that account (by
-                       default the operator's), from that account's pages
+foldrender canvas FILE|PAGE...|PLAN.canvas [options]
+  A new canvas: each file or page becomes a card (up to 24; a card 2 MB at
+  most, the files 5 MB together). Files go up as cards only, never as pages.
+  Prints its address; stderr says what it holds and its revision.
+  --note TEXT          a note, which --link calls note:1, note:2, ...
+  --link A:B[:LABEL]   a connector from A to B: a card's number, a file or
+                       page as given, or note:N
+  --name NAME          its address's last part; the same command again
+                       replaces that canvas, or writes nothing if unchanged
+  --folder F  --title T  --private (default)  --link-access  --public
+  --share a,b  --owner LOGIN (admin token)  --json
+  PLAN.canvas          a JSON Canvas file (or .json), sent as it is, with the
+                       local files its "file" fields name (next to it)
+foldrender canvas edit CANVAS [--base REV] [--add FILE|PAGE]... [--note TEXT]...
+       [--link A:B[:LABEL]]... [--rm ID]... | --patch FILE|-
+  Changes the canvas in one step, all of it or nothing (exit 10). A and B: an
+  id on the canvas (or a unique start of it), an --add argument, or note:N.
+  Prints the address, then the new map; stderr: the revision and new ids.
+Examples:
+  url=$(foldrender canvas plan.html risks.html --name q4 \
+        --note 'Risks first' --link note:1:2 --link 2:1:feeds)
+  foldrender canvas roadmap.canvas --name roadmap
+  foldrender canvas edit "$url" --add costs.html --link RfvO:costs.html:funds
 EOF
     ;;
     versions|restore|undo) cat <<'EOF'
@@ -1303,13 +1997,14 @@ EOF
     ;;
     exit) cat <<'EOF'
 Exit codes: 0 ok, 1 failed, 2 bad usage, 3 not signed in or token rejected,
-4 plan limit reached, 5 page too large, 6 network failure, 7 no such page or
-not visible to this account, 8 page expired, 9 too large to read as text
-(use --html), 10 an edit did not apply (old text missing or not unique, or
-the page moved on from --base).
+4 plan limit reached (or a canvas save limit), 5 page too large, 6 network
+failure, 7 no such page or not visible to this account, 8 page expired, 9 too
+large to read as text (use --html), 10 an edit did not apply (old text missing
+or not unique, the page moved on from --base, or a canvas edit was refused).
 Environment: FOLDRENDER_TOKEN (a token instead of the saved login),
 FOLDRENDER_API (the API, for testing), FOLDRENDER_NO_BROWSER=1,
-FOLDRENDER_READ_MAX_TOKENS. Free plan: 10 pages, 30 days each, 5 MB a page.
+FOLDRENDER_READ_MAX_TOKENS, FOLDRENDER_NO_UPDATE_NOTE=1 (never say that a
+newer CLI is out). Free plan: 10 pages, 30 days each, 5 MB a page.
 EOF
     ;;
     *) die 2 "no help for $1; try: foldrender help" ;;
@@ -1336,6 +2031,7 @@ main() {
     canvas) cmd_canvas "$@" ;;
     rm|delete) cmd_rm "$@" ;;
     open) cmd_open "$@" ;;
+    version|--version) printf 'foldrender %s\n' "$FR_CLI_VERSION" ;;
     help|-h|--help) cmd_help "$@" ;;
     *) die 2 "unknown command: $cmd (try: foldrender help)" ;;
   esac
