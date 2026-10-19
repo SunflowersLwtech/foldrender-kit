@@ -8,7 +8,8 @@
 # commands print to stdout.
 #
 #   FOLDRENDER_TOKEN       API token; takes precedence over the saved login.
-#   FOLDRENDER_API         API base URL (default https://a.foldrender.dev).
+#   FOLDRENDER_API         API base URL (default https://a.foldrender.dev, the API
+#                          host; the links it hands out are on foldrender.dev).
 #   FOLDRENDER_NO_BROWSER  Set to 1 to print the sign-in link, not open it.
 #
 # Exit codes: 0 ok, 1 failed, 2 bad usage, 3 not signed in or token rejected,
@@ -19,7 +20,6 @@ export LC_ALL=C
 
 API="${FOLDRENDER_API:-https://a.foldrender.dev}"
 API="${API%/}"
-PAGE_BASE="https://a.foldrender.dev"
 MAX_BYTES=5242880
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/foldrender"
 TOKEN_FILE="$CONFIG_DIR/token"
@@ -173,7 +173,7 @@ token_from() {
 
 # page_id TARGET: sets PAGE_ID to the id of the page TARGET names, and PAGE_K to
 # its link token when TARGET carries one. TARGET is an id, a link by id
-# (https://a.foldrender.dev/<id>, or .../artifacts/-/<id>), a library link
+# (https://foldrender.dev/artifacts/-/<id>, or an old a.foldrender.dev/<id>), a library link
 # (...?open=<id>), or a page's address (https://foldrender.dev/artifacts/<owner>/
 # [<folder>/]<name>), which the API resolves to its id. Not run in a subshell,
 # because a die inside $(...) would only end the subshell.
@@ -657,17 +657,27 @@ cmd_rm() {
   printf 'removed %s\n' "$slug"
 }
 
+# open ID|URL: prints the page's address and opens it. An id, or a link by id,
+# is looked up (format=meta, the facts without the page) for its address; an
+# address is used as it is.
 cmd_open() {
   [ $# -eq 1 ] || die 2 "usage: foldrender open <slug-or-url>"
-  local url slug
+  local url=""
   case "$1" in
-    http://*|https://*) url="$1" ;;
-    *)
-      slug="$(slug_from "$1")"
-      check_slug "$slug"
-      url="$PAGE_BASE/$slug"
-      ;;
+    http://*/artifacts/-/*|https://*/artifacts/-/*) ;;
+    http://*/artifacts/*|https://*/artifacts/*) url="$1" ;;
   esac
+  if [ -z "$url" ]; then
+    page_id "$1"
+    check_slug "$PAGE_ID"
+    read_get "/api/artifacts/$PAGE_ID?format=meta"
+    [ "$STATUS" = 200 ] || read_fail "$PAGE_ID"
+    url="$(sed -n 's/^url: *//p' "$TMP/body" | head -n 1 | tr -d '\r"')"
+    case "$url" in
+      http*) ;;
+      *) die 1 "the server did not say where $PAGE_ID is" ;;
+    esac
+  fi
   printf '%s\n' "$url"
   open_url "$url"
 }

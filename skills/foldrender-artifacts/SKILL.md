@@ -67,7 +67,7 @@ Delete a page only when the user asks.
 
 ## 6. Read a page
 
-When the user gives you a page's address (`…/artifacts/<login>/…`), an `a.foldrender.dev` link or a page slug, read it with the command, passing the address whole, key included:
+When the user gives you a page's address (`…/artifacts/<login>/…`), an old `a.foldrender.dev` link or a page slug, read it with the command, passing the address whole, key included:
 
 ```
 foldrender read 'https://foldrender.dev/artifacts/alice/q3/report?k=…'
