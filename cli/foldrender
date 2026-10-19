@@ -3,14 +3,18 @@
 # published page back as text.
 #
 # Needs only bash, curl (7.55 or later, for -H @file) and coreutils, so it runs
-# on macOS's bash 3.2 and on Linux. `publish` writes nothing to stdout but the
-# page URL, so an agent can capture it; notes and warnings go to stderr. Other
-# commands print to stdout.
+# on macOS's bash 3.2 and on Linux. `publish` and `edit` write nothing to stdout
+# but the page's address, one line a page, so an agent can capture it; the
+# revision, notes and warnings go to stderr, one line each. Other commands print
+# to stdout, briefly by default; --json prints the API's answer as it is.
 #
 #   FOLDRENDER_TOKEN       API token; takes precedence over the saved login.
 #   FOLDRENDER_API         API base URL (default https://a.foldrender.dev, the API
 #                          host; the links it hands out are on foldrender.dev).
 #   FOLDRENDER_NO_BROWSER  Set to 1 to print the sign-in link, not open it.
+#   FOLDRENDER_READ_MAX_TOKENS  How much `read` prints before it stops, says how
+#                          to go on and lists the sections (default 6000,
+#                          about; 0 for no limit).
 #
 # Exit codes: 0 ok, 1 failed, 2 bad usage, 3 not signed in or token rejected,
 # 4 free-plan limit reached, 5 page too large, 6 network failure,
@@ -311,6 +315,38 @@ warn_env_token() {
   [ -z "${FOLDRENDER_TOKEN:-}" ] || note "FOLDRENDER_TOKEN is set, so it is used instead of the saved token"
 }
 
+# json_field KEY: the string under KEY in a JSON body (no quotes inside), or
+# in a text error's "KEY: value" line.
+json_field() {
+  { sed -n "s/.*\"$1\" *: *\"\([^\"]*\)\".*/\1/p" "$TMP/body"; sed -n "s/^$1: //p" "$TMP/body"; } | head -n 1 | tr -d '\r'
+}
+
+# json_str FILE: FILE's bytes as a JSON string literal. A sentinel byte after
+# the content keeps a trailing newline (awk would drop it); control bytes other
+# than tab, CR and LF become \u00XX. Bytes above 0x7F pass as they are, so UTF-8
+# stays UTF-8.
+json_str() {
+  # Byte by byte through printf, not gsub: awks (BSD, gawk, busybox) differ on
+  # backslashes in a gsub replacement, and agree on string literals.
+  { cat "$1"; printf 'X'; } | awk '
+    function emit(s,   c) {
+      while (match(s, /[\001-\037\\"]/)) {
+        c = substr(s, RSTART, 1)
+        printf "%s%s", substr(s, 1, RSTART - 1), esc[c]
+        s = substr(s, RSTART + 1)
+      }
+      printf "%s", s
+    }
+    BEGIN {
+      for (i = 1; i < 32; i++) esc[sprintf("%c", i)] = sprintf("\\u%04x", i)
+      esc["\t"] = "\\t"; esc["\r"] = "\\r"; esc["\\"] = "\\\\"; esc["\""] = "\\\""
+      printf "\""
+    }
+    NR > 1 { emit(prev); printf "\\n" }
+    { prev = $0 }
+    END { sub(/X$/, "", prev); emit(prev); printf "\"" }'
+}
+
 # field KEY: the value of a key=value line in the body.
 field() {
   sed -n "s/^$1=//p" "$TMP/body" | head -n 1 | tr -d '\r'
@@ -475,8 +511,10 @@ cmd_account() {
   [ -z "${FOLDRENDER_TOKEN:-}" ] || note "FOLDRENDER_TOKEN is still set in this shell. Unset it to sign out completely."
 }
 
+# publish FILE... [options]: each file to its page, one address a line on
+# stdout, in order; on stderr one line a page saying what the publish changed.
 cmd_publish() {
-  local file="" title="" slug="" vis="" share="" mode="" rp="" src="" bytes query url name="" folder="" folder_set=""
+  local files=() title="" slug="" vis="" share="" name="" folder="" folder_set="" as_json="" f
   while [ $# -gt 0 ]; do
     case "$1" in
       --title) need $# "$1"; title="$2"; shift 2 ;;
@@ -487,12 +525,19 @@ cmd_publish() {
       --private) vis=private; shift ;;
       --link) vis=link; shift ;;
       --public) vis=public; shift ;;
-      -) file="-"; shift ;;
+      --json) as_json=1; shift ;;
+      -) files+=("-"); shift ;;
       -*) die 2 "unknown option: $1" ;;
-      *) [ -z "$file" ] || die 2 "publish takes one file"; file="$1"; shift ;;
+      *) files+=("$1"); shift ;;
     esac
   done
-  [ -n "$file" ] || die 2 "usage: foldrender publish <file.html|-> [--title T] [--name N] [--folder F] [--slug ID] [--private|--link|--public|--share a,b]"
+  [ ${#files[@]} -gt 0 ] || die 2 "usage: foldrender publish FILE...|- [--title T] [--name N] [--folder F] [--slug ID] [--private|--link|--public|--share a,b] [--json]"
+  if [ ${#files[@]} -gt 1 ]; then
+    [ -z "$title$slug$name" ] || die 2 "--title, --name and --slug name one page; publish one file with them"
+    for f in "${files[@]}"; do
+      [ "$f" != "-" ] || die 2 "publish - takes the page from stdin, so it goes alone"
+    done
+  fi
   [ -z "$name" ] || check_name "$name" --name
   [ -z "$folder" ] || check_name "$folder" --folder
   if [ -n "$share" ]; then
@@ -501,7 +546,14 @@ cmd_publish() {
     vis=shared
   fi
   require_token
+  for f in "${files[@]}"; do
+    publish_one "$f" "$([ ${#files[@]} -gt 1 ] && printf '%s: ' "$f")"
+  done
+}
 
+# publish_one FILE LABEL: one page, with the options cmd_publish read.
+publish_one() {
+  local file="$1" label="$2" p_slug="$slug" p_vis="$vis" p_title="$title" mode="" rp="" src="" bytes query
   if [ "$file" = "-" ]; then
     src="$TMP/stdin.html"
     cat > "$src"
@@ -512,80 +564,90 @@ cmd_publish() {
     rp="$(abs_path "$file")" || die 1 "cannot resolve the path of $file"
   fi
   bytes="$(wc -c < "$src" | tr -d ' ')"
-  [ "$bytes" -gt 0 ] || die 2 "the page is empty"
-  [ "$bytes" -le "$MAX_BYTES" ] || die 5 "the page is $bytes bytes; the limit is 5 MB"
+  [ "$bytes" -gt 0 ] || die 2 "the page is empty: $file"
+  [ "$bytes" -le "$MAX_BYTES" ] || die 5 "$file is $bytes bytes; the limit is 5 MB"
   warn_if_secrets "$src"
 
   # Which page is this? --slug, then a foldrender-slug meta tag, then the
   # slug this file was published under before.
-  if [ -n "$slug" ]; then
-    page_id "$slug"
-    slug="$PAGE_ID"
+  if [ -n "$p_slug" ]; then
+    page_id "$p_slug"
+    p_slug="$PAGE_ID"
     mode=explicit
   else
-    slug="$(meta_slug "$src")"
-    if [ -n "$slug" ]; then
+    p_slug="$(meta_slug "$src")"
+    if [ -n "$p_slug" ]; then
       mode=meta
     elif [ -n "$rp" ]; then
-      slug="$(map_lookup "$rp")"
-      [ -z "$slug" ] || mode=map
+      p_slug="$(map_lookup "$rp")"
+      [ -z "$p_slug" ] || mode=map
     fi
   fi
-  [ -z "$slug" ] || check_slug "$slug"
+  [ -z "$p_slug" ] || check_slug "$p_slug"
 
-  [ -n "$title" ] || title="$(title_from "$src")"
+  [ -n "$p_title" ] || p_title="$(title_from "$src")"
   # A new page is private unless told otherwise. A re-publish sends only the
   # flags it was given, so the page keeps the visibility and sharing it has.
   # A slug alone does not say which of the two this is: the server makes a new
-  # page for a PUT to a slug nobody has, and gives it the server's default,
-  # which is public. So with no flag, ask first whether the page is one of
-  # yours (its version list answers 404 otherwise).
-  if [ -n "$slug" ] && [ -z "$vis" ]; then
-    api_auth GET "/api/artifacts/$slug/versions"
+  # page for a PUT to a slug nobody has, and gives it the server's default. So
+  # with no flag, ask first whether the page is one of yours (its version list
+  # answers 404 otherwise).
+  if [ -n "$p_slug" ] && [ -z "$p_vis" ]; then
+    api_auth GET "/api/artifacts/$p_slug/versions"
     case "$STATUS" in
       200) ;;
       404)
-        vis=private
+        p_vis=private
         if [ "$mode" = map ]; then
-          note "the page $slug was deleted, so this publish made a new one"
+          note "${label}the page $p_slug was deleted, so this publish made a new one"
           map_forget 1 "$rp"
-          slug=""
+          p_slug=""
         fi
         ;;
       *) fail_http ;;
     esac
   fi
-  if [ -z "$slug" ] && [ -z "$vis" ]; then
-    vis=private
+  if [ -z "$p_slug" ] && [ -z "$p_vis" ]; then
+    p_vis=private
   fi
   query=""
-  [ -z "$title" ] || query="title=$(urlencode "$title")"
-  [ -z "$vis" ] || query="${query:+$query&}visibility=$vis"
+  [ -z "$p_title" ] || query="title=$(urlencode "$p_title")"
+  [ -z "$p_vis" ] || query="${query:+$query&}visibility=$p_vis"
   [ -z "$share" ] || query="${query:+$query&}share=$share"
   [ -z "$name" ] || query="${query:+$query&}name=$name"
   [ -z "$folder_set" ] || query="${query:+$query&}folder=$folder"
 
-  if [ -n "$slug" ]; then
-    upload PUT "/api/artifacts/$slug" "$src" "$query"
+  [ -z "$as_json" ] || ACCEPT="application/json"
+  if [ -n "$p_slug" ]; then
+    upload PUT "/api/artifacts/$p_slug" "$src" "$query"
   else
     upload POST /api/artifacts "$src" "$query"
   fi
   if [ "$STATUS" = 404 ] && [ "$mode" = map ]; then
-    note "the page $slug was deleted, so this publish made a new one"
+    note "${label}the page $p_slug was deleted, so this publish made a new one"
     map_forget 1 "$rp"
     upload POST /api/artifacts "$src" "$query"
   fi
   if [ "$STATUS" = 404 ] && [ "$mode" = explicit ]; then
-    die 1 "there is no page named $slug"
+    die 1 "there is no page named $p_slug"
   fi
   if [ "$STATUS" = 404 ] && [ "$mode" = meta ]; then
-    die 1 "there is no page named $slug (from the foldrender-slug meta tag). Change or remove the tag."
+    die 1 "there is no page named $p_slug (from the foldrender-slug meta tag). Change or remove the tag."
   fi
   if [ "$STATUS" = 409 ]; then
     die 1 "another of your pages is already at that address (${name:+name $name}${folder:+, folder $folder}). Choose another with --name or --folder"
   fi
   expect_2xx
-  read_page_url
+  if [ -n "$as_json" ]; then
+    ACCEPT="text/plain"
+    PAGE_ID="$(json_field id)"
+    PAGE_URL="$(json_field url)"
+    [ -n "$PAGE_ID" ] || die 1 "the server did not say which page it wrote ($(error_text))"
+    cat "$TMP/body"
+    printf '\n'
+  else
+    read_page_url
+  fi
   if [ -n "$rp" ]; then
     map_set "$rp" "$PAGE_ID"
   fi
@@ -593,68 +655,312 @@ cmd_publish() {
   if [ -n "$name" ]; then
     case "$(slug_from "$PAGE_URL")" in
       "$name"|"$PAGE_ID") ;;
-      *) note "the name $name is taken by another of your pages, so this one is at $(slug_from "$PAGE_URL"). Choose another with --name" ;;
+      *) note "${label}the name $name is taken by another of your pages, so this one is at $(slug_from "$PAGE_URL"). Choose another with --name" ;;
     esac
   fi
+  [ -n "$as_json" ] && return 0
   printf '%s\n' "$PAGE_URL"
+  publish_note "$label"
+}
+
+# What a write changed, from the rev=, changed=, added= and removed= lines of
+# its answer, as one note. A server from before revisions sends none: no note.
+publish_note() {
+  local rev
+  rev="$(field rev)"
+  [ -n "$rev" ] || return 0
+  if [ "$(field changed)" = 0 ]; then
+    note "${1}unchanged, rev $rev"
+  elif [ "$rev" = 1 ]; then
+    note "${1}new page, rev 1"
+  else
+    note "${1}rev $rev: +$(field added) -$(field removed) lines"
+  fi
+}
+
+# edit PAGE --old TEXT --new TEXT [...]: exact replacements in the page's HTML,
+# made by the server, so only the changes are sent. Each --old must be in the
+# page exactly once, as the edits before it left it. --edits FILE (or -) reads
+# them as JSON: an array of {"old": ..., "new": ...}, or the request's object.
+# --base REV refuses to edit a page that has moved on from that revision.
+cmd_edit() {
+  local target="" base="" title="" efile="" n=0 have_old="" as_json="" c
+  : > "$TMP/edits.json"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --old)
+        need $# "$1"
+        [ -z "$have_old" ] || die 2 "--old $((n + 1)) has no --new after it"
+        printf '%s' "$2" > "$TMP/old"
+        have_old=1
+        shift 2 ;;
+      --new)
+        need $# "$1"
+        [ -n "$have_old" ] || die 2 "--new needs an --old before it"
+        printf '%s' "$2" > "$TMP/new"
+        [ "$n" -eq 0 ] || printf ',' >> "$TMP/edits.json"
+        { printf '{"old":'; json_str "$TMP/old"; printf ',"new":'; json_str "$TMP/new"; printf '}'; } >> "$TMP/edits.json"
+        n=$((n + 1))
+        have_old=""
+        shift 2 ;;
+      --edits) need $# "$1"; efile="$2"; shift 2 ;;
+      --base)
+        need $# "$1"
+        case "$2" in ''|*[!0-9]*) die 2 "--base takes a revision number (see: foldrender versions PAGE)" ;; esac
+        base="$2"; shift 2 ;;
+      --title) need $# "$1"; title="$2"; shift 2 ;;
+      --json) as_json=1; shift ;;
+      -*) die 2 "unknown option: $1" ;;
+      *) [ -z "$target" ] || die 2 "edit takes one page"; target="$1"; shift ;;
+    esac
+  done
+  [ -z "$have_old" ] || die 2 "the last --old has no --new after it"
+  [ -n "$target" ] || die 2 "usage: foldrender edit PAGE --old TEXT --new TEXT [--old ... --new ...] [--base REV] | --edits FILE"
+  [ "$n" -gt 0 ] || [ -n "$efile" ] || die 2 "nothing to change: give --old TEXT --new TEXT, or --edits FILE"
+  [ "$n" -eq 0 ] || [ -z "$efile" ] || die 2 "--edits and --old/--new do not go together"
+  require_token
+  page_id "$target"
+  check_slug "$PAGE_ID"
+  if [ -n "$efile" ]; then
+    if [ "$efile" = - ]; then
+      cat > "$TMP/efile"
+    else
+      [ -f "$efile" ] || die 2 "no such file: $efile"
+      cp "$efile" "$TMP/efile"
+    fi
+    c="$(tr -d ' \t\r\n' < "$TMP/efile" | head -c 1)"
+    case "$c" in
+      '[') { printf '{"edits":'; cat "$TMP/efile"; } > "$TMP/edit.json" ;;
+      '{') [ -z "$base$title" ] || die 2 "the --edits object carries its own base and title; drop --base and --title"
+           cp "$TMP/efile" "$TMP/edit.json" ;;
+      *) die 2 "--edits takes JSON: an array of {\"old\": ..., \"new\": ...}, or an object with edits" ;;
+    esac
+  else
+    { printf '{"edits":['; cat "$TMP/edits.json"; printf ']'; } > "$TMP/edit.json"
+  fi
+  if [ "$c" != '{' ]; then
+    [ -z "$base" ] || printf ',"base":%s' "$base" >> "$TMP/edit.json"
+    if [ -n "$title" ]; then
+      printf '%s' "$title" > "$TMP/title"
+      { printf ',"title":'; json_str "$TMP/title"; } >> "$TMP/edit.json"
+    fi
+    printf '}' >> "$TMP/edit.json"
+  fi
+  [ -z "$as_json" ] || ACCEPT="application/json"
+  api_auth POST "/api/artifacts/$PAGE_ID/edit" -H "Content-Type: application/json" --data-binary "@$TMP/edit.json"
+  case "$STATUS" in
+    404) die 7 "no page named $PAGE_ID among yours" ;;
+    409)
+      [ -z "$(json_field message)" ] || die 10 "$(json_field message)"
+      die 10 "the edit did not apply ($(error_text))" ;;
+  esac
+  expect_2xx
+  if [ -n "$as_json" ]; then
+    cat "$TMP/body"
+    printf '\n'
+    return 0
+  fi
+  read_page_url
+  printf '%s\n' "$PAGE_URL"
+  publish_note ""
+}
+
+# versions PAGE: the page's revision and the versions it kept, newest first,
+# each with the id restore takes.
+cmd_versions() {
+  local target="" as_json=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) as_json=1; shift ;;
+      -*) die 2 "unknown option: $1" ;;
+      *) [ -z "$target" ] || die 2 "versions takes one page"; target="$1"; shift ;;
+    esac
+  done
+  [ -n "$target" ] || die 2 "usage: foldrender versions PAGE [--json]"
+  require_token
+  page_id "$target"
+  check_slug "$PAGE_ID"
+  [ -z "$as_json" ] || ACCEPT="application/json"
+  api_auth GET "/api/artifacts/$PAGE_ID/versions"
+  [ "$STATUS" != 404 ] || die 7 "no page named $PAGE_ID among yours"
+  expect_2xx
+  if [ -n "$as_json" ] || [ "$(head -c 1 "$TMP/body")" = "{" ]; then
+    cat "$TMP/body"
+    printf '\n'
+    return 0
+  fi
+  awk -F'\t' -v page="$target" '
+    NR == 1 { sub(/^rev=/, ""); printf "%s is at rev %s\n", page, $0; next }
+    { d = $2; sub(/T/, " ", d); printf "%s  %s  %7.1f KB  %s\n", $1, substr(d, 1, 16), $3 / 1024, $4 }
+    END {
+      if (NR <= 1) print "no earlier versions"
+      else printf "put one back: foldrender restore %s VERSION (or foldrender undo %s for the newest)\n", page, page
+    }' "$TMP/body"
+}
+
+# restore PAGE VERSION: that version becomes the page again; the body it
+# replaces is kept as a version, so a restore can be undone.
+cmd_restore() {
+  [ $# -eq 2 ] || die 2 "usage: foldrender restore PAGE VERSION (see: foldrender versions PAGE)"
+  require_token
+  page_id "$1"
+  check_slug "$PAGE_ID"
+  case "$2" in
+    ''|*[!0-9a-f]*) die 2 "not a version id: $2 (see: foldrender versions $1)" ;;
+  esac
+  restore_version "$1" "$2"
+}
+
+restore_version() {
+  api_auth POST "/api/artifacts/$PAGE_ID/versions/$2/restore"
+  [ "$STATUS" != 404 ] || die 7 "no version $2 of $1 (see: foldrender versions $1)"
+  expect_2xx
+  read_page_url
+  printf '%s\n' "$PAGE_URL"
+  note "restored version $2${PAGE_ID:+ of $PAGE_ID}$( [ -n "$(field rev)" ] && printf ' as rev %s' "$(field rev)")"
+}
+
+# undo PAGE: puts back the newest version kept, the body before the current
+# one. The current body is kept in turn, so undo twice is back where it was.
+cmd_undo() {
+  [ $# -eq 1 ] || die 2 "usage: foldrender undo PAGE"
+  local vid
+  require_token
+  page_id "$1"
+  check_slug "$PAGE_ID"
+  api_auth GET "/api/artifacts/$PAGE_ID/versions"
+  [ "$STATUS" != 404 ] || die 7 "no page named $PAGE_ID among yours"
+  expect_2xx
+  vid="$(sed -n '2p' "$TMP/body" | cut -f1)"
+  case "$vid" in
+    ''|*[!0-9a-f]*) die 1 "$1 has no earlier version to go back to" ;;
+  esac
+  restore_version "$1" "$vid"
 }
 
 cmd_share() {
-  local target="" vis="" adds="" removes="" arg slug json url
-  [ $# -ge 1 ] || die 2 "usage: foldrender share <slug-or-url> [+login ...] [-login ...] [--public|--link|--private] [--reset-link]"
-  target="$1"
-  shift
-  local reset=""
+  local targets=() vis="" adds="" removes="" arg json reset="" as_json="" t
   for arg in "$@"; do
     case "$arg" in
       --public) vis=public ;;
       --link) vis=link ;;
       --private) vis=private ;;
       --reset-link) reset=1 ;;
+      --json) as_json=1 ;;
       --*) die 2 "unknown option: $arg" ;;
       +?*) check_logins "${arg#+}"; adds="${adds:+$adds,}${arg#+}" ;;
       -?*) check_logins "${arg#-}"; removes="${removes:+$removes,}${arg#-}" ;;
-      *) die 2 "expected +login, -login, --public, --link, --private or --reset-link, got: $arg" ;;
+      ?*) targets+=("$arg") ;;
+      *) die 2 "expected a page, +login, -login, --public, --link, --private or --reset-link" ;;
     esac
   done
+  [ ${#targets[@]} -gt 0 ] || die 2 "usage: foldrender share PAGE... [+login ...] [-login ...] [--public|--link|--private] [--reset-link]"
   [ -n "$adds$removes$vis$reset" ] || die 2 "nothing to change: give +login, -login, --public, --link, --private or --reset-link"
-  page_id "$target"
-  slug="$PAGE_ID"
-  check_slug "$slug"
 
   json=""
   [ -z "$vis" ] || json="\"visibility\":\"$vis\""
   [ -z "$reset" ] || json="${json:+$json,}\"reset_link\":true"
   [ -z "$adds" ] || json="${json:+$json,}\"share_add\":$(json_array "$adds")"
   [ -z "$removes" ] || json="${json:+$json,}\"share_remove\":$(json_array "$removes")"
-  api_auth PATCH "/api/artifacts/$slug" -H "Content-Type: application/json" --data "{$json}"
-  expect_2xx
-  read_page_url
-  printf '%s\n' "$PAGE_URL"
+  [ -z "$as_json" ] || ACCEPT="application/json"
+  for t in "${targets[@]}"; do
+    page_id "$t"
+    check_slug "$PAGE_ID"
+    api_auth PATCH "/api/artifacts/$PAGE_ID" -H "Content-Type: application/json" --data "{$json}"
+    [ "$STATUS" != 404 ] || die 7 "no page named $PAGE_ID among yours"
+    expect_2xx
+    if [ -n "$as_json" ]; then
+      cat "$TMP/body"
+      printf '\n'
+    else
+      read_page_url
+      printf '%s\n' "$PAGE_URL"
+    fi
+  done
 }
 
+# ls [WORDS...]: your pages, newest first, one line each: the newest 20 unless
+# --all or -n N. WORDS must all be in the id, title or address (any case);
+# --access keeps one kind, --folder one folder; --long adds each address.
 cmd_list() {
+  local words="" limit=20 access="" folder="" long="" as_json=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all|-a) limit=0; shift ;;
+      -n) need $# "$1"; case "$2" in ''|*[!0-9]*) die 2 "-n takes a number" ;; esac; limit="$2"; shift 2 ;;
+      --access|--vis|--visibility)
+        need $# "$1"
+        case "$2" in public|link|private|shared) access="$2" ;; *) die 2 "$1 takes public, link, private or shared" ;; esac
+        shift 2 ;;
+      --folder) need $# "$1"; check_name "$2" --folder; folder="$2"; shift 2 ;;
+      --long|-l) long=1; shift ;;
+      --json) as_json=1; shift ;;
+      -*) die 2 "unknown option: $1" ;;
+      *) words="$words $1"; shift ;;
+    esac
+  done
+  if [ -n "$as_json" ]; then
+    ACCEPT="application/json"
+    api_auth GET /api/artifacts
+    expect_2xx
+    cat "$TMP/body"
+    printf '\n'
+    return 0
+  fi
   api_auth GET /api/artifacts
   expect_2xx
   if [ ! -s "$TMP/body" ]; then
     printf 'No pages yet.\n'
     return 0
   fi
-  printf '%-12s  %-8s  %-20s  %-20s  %s\n' SLUG VISIBILITY UPDATED EXPIRES TITLE
-  awk -F'\t' '{ printf "%-12s  %-8s  %-20s  %-20s  %s%s\n", $1, $2, $3, $4, $5, ($6 != "" && $6 != "-") ? "  " $6 : "" }' "$TMP/body"
+  # The list: id, access, updated (ISO), expires or "-", title, address.
+  awk -F'\t' -v words="$words" -v access="$access" -v folder="$folder" -v limit="$limit" -v long="$long" '
+    BEGIN { nw = split(tolower(words), w, " ") }
+    {
+      hay = tolower($1 " " $5 " " $6)
+      for (i = 1; i <= nw; i++) if (index(hay, w[i]) == 0) next
+      if (access != "" && $2 != access) next
+      if (folder != "" && index($6, "/" folder "/") == 0) next
+      n++
+      if (limit > 0 && n > limit) next
+      id[n] = $1; acc[n] = $2; t[n] = $5; addr[n] = $6
+      up[n] = substr($3, 1, 10) " " substr($3, 12, 5)
+      ex[n] = ($4 != "-" && $4 != "") ? "  (expires " substr($4, 1, 10) ")" : ""
+      if (length($1) > wid) wid = length($1)
+    }
+    END {
+      shown = (limit > 0 && n > limit) ? limit : n
+      if (shown == 0) { print (NR ? "No page matches." : "No pages yet."); exit }
+      printf "%-" wid "s  %-7s  %-16s  %s\n", "ID", "ACCESS", "UPDATED (UTC)", "TITLE"
+      for (i = 1; i <= shown; i++) {
+        printf "%-" wid "s  %-7s  %-16s  %s%s\n", id[i], acc[i], up[i], t[i], ex[i]
+        if (long != "" && addr[i] != "" && addr[i] != "-") printf "%-" wid "s  %s\n", "", addr[i]
+      }
+      if (n > shown) printf "%d more: foldrender ls --all, or narrow it: foldrender ls WORDS\n", n - shown
+    }' "$TMP/body"
 }
 
 cmd_rm() {
-  [ $# -eq 1 ] || die 2 "usage: foldrender rm <slug-or-url>"
-  local slug
-  page_id "$1"
-  slug="$PAGE_ID"
-  check_slug "$slug"
-  api_auth DELETE "/api/artifacts/$slug"
-  [ "$STATUS" != 404 ] || map_forget 2 "$slug"
-  expect_2xx
-  map_forget 2 "$slug"
-  printf 'removed %s\n' "$slug"
+  [ $# -ge 1 ] || die 2 "usage: foldrender rm PAGE..."
+  local t failed=0
+  for t in "$@"; do
+    case "$t" in -*) die 2 "unknown option: $t" ;; esac
+  done
+  for t in "$@"; do
+    page_id "$t"
+    check_slug "$PAGE_ID"
+    api_auth DELETE "/api/artifacts/$PAGE_ID"
+    if [ "$STATUS" = 404 ]; then
+      map_forget 2 "$PAGE_ID"
+      note "not found: $PAGE_ID"
+      failed=1
+      continue
+    fi
+    expect_2xx
+    map_forget 2 "$PAGE_ID"
+    printf 'removed %s\n' "$PAGE_ID"
+  done
+  [ "$failed" = 0 ] || exit 1
 }
 
 # open ID|URL: prints the page's address and opens it. An id, or a link by id,
@@ -757,26 +1063,52 @@ save_assets() {
   fi
 }
 
-# read SLUG|URL: the page as Markdown after a block of facts about it. --html
-# prints the stored HTML, --json the API's JSON, --save FILE writes the stored
-# HTML to a file, --assets DIR also saves embedded images and SVG. A PDF
-# published from the app reads as its text, page by page; its page images are
-# the assets.
+# read SLUG|URL: the page as Markdown after a few facts about it, stopping
+# near FOLDRENDER_READ_MAX_TOKENS (6000) with how much is left, the command
+# that goes on, and the page's sections. --outline lists the headings with their sizes, --section N (or
+# a heading's text) reads one, --from N goes on where a read stopped, --max-tokens
+# and --max-chars set the stop, --all reads everything, --meta full gives every
+# fact. --html prints the stored HTML, --json the API's JSON, --save FILE writes
+# the stored HTML to a file, --assets DIR also saves embedded images and SVG. A
+# PDF published from the app reads as its text, page by page; its page images
+# are the assets.
 cmd_read() {
-  local target="" mode=text assets="" save="" slug query
+  local target="" mode=text assets="" save="" slug query="" part="" outline="" cut=""
+  local maxt="${FOLDRENDER_READ_MAX_TOKENS:-6000}" meta=short
+  case "$maxt" in ''|*[!0-9]*) maxt=6000 ;; esac
   while [ $# -gt 0 ]; do
     case "$1" in
       --html) mode=html; shift ;;
       --json) mode=json; shift ;;
       --assets) need $# "$1"; assets="$2"; shift 2 ;;
       --save|-o) need $# "$1"; save="$2"; shift 2 ;;
+      --outline) outline=1; cut=1; shift ;;
+      --section) need $# "$1"; part="$part&section=$(urlencode "$2")"; cut=1; shift 2 ;;
+      --from)
+        need $# "$1"
+        case "$2" in ''|*[!0-9]*) die 2 "--from takes a character offset, from the next: line of a read that stopped" ;; esac
+        part="$part&from=$2"; cut=1; shift 2 ;;
+      --max-tokens)
+        need $# "$1"
+        case "$2" in ''|*[!0-9]*) die 2 "--max-tokens takes a number (0: no limit)" ;; esac
+        maxt="$2"; cut=1; shift 2 ;;
+      --max-chars)
+        need $# "$1"
+        case "$2" in ''|*[!0-9]*|0) die 2 "--max-chars takes a number above 0" ;; esac
+        part="$part&max_chars=$2"; maxt=0; cut=1; shift 2 ;;
+      --all) maxt=0; shift ;;
+      --meta)
+        need $# "$1"
+        case "$2" in short|full) meta="$2" ;; *) die 2 "--meta takes short or full" ;; esac
+        shift 2 ;;
       -*) die 2 "unknown option: $1" ;;
       *) [ -z "$target" ] || die 2 "read takes one page"; target="$1"; shift ;;
     esac
   done
-  [ -n "$target" ] || die 2 "usage: foldrender read <slug-or-url> [--html|--json] [--assets DIR] [--save FILE]"
+  [ -n "$target" ] || die 2 "usage: foldrender read PAGE [--outline|--section N|--from N] [--max-tokens N|--max-chars N|--all] [--meta full] [--html|--json|--save FILE] [--assets DIR]"
   [ -z "$save" ] || [ "$mode" = text ] || die 2 "--save writes the stored file; drop --html or --json"
   [ -z "$save" ] || [ -z "$assets" ] || die 2 "--save and --assets do not go together"
+  [ -z "$cut" ] || { [ "$mode" != html ] && [ -z "$save" ]; } || die 2 "--outline, --section, --from and --max-* cut the Markdown; drop --html or --save"
   # read never requests the URL itself: a private page's link redirects to the
   # content host, where a client without a cookie jar loses the token and is
   # sent back, round and round. An address is resolved to its id instead.
@@ -796,8 +1128,14 @@ cmd_read() {
     return 0
   fi
 
-  query=""
-  [ "$mode" != html ] || query="?format=html"
+  if [ "$mode" = html ]; then
+    query="?format=html"
+  else
+    query="meta=$meta"
+    [ -n "$outline" ] && query="$query&outline=1"
+    [ -z "$outline" ] && [ "$maxt" != 0 ] && query="$query&max_tokens=$maxt"
+    query="?$query$part"
+  fi
   [ "$mode" != json ] || ACCEPT="application/json"
   read_get "/api/artifacts/$slug$query"
   ACCEPT="text/plain"
@@ -808,71 +1146,99 @@ cmd_read() {
 }
 
 cmd_help() {
-  cat <<'EOF'
-foldrender publishes an HTML file and prints a link you can share, and reads
-published pages back as text.
+  case "${1:-}" in
+    '') cat <<'EOF'
+foldrender publishes HTML pages as links and reads pages back as text.
 
-Usage:
-  foldrender login [--token TOKEN]      sign in with a device code, or save a token
-  foldrender whoami                     show the account and its page usage
-  foldrender logout                     remove the saved token from this machine
-  foldrender export [FILE.zip]          save all your pages and a manifest as one zip
-  foldrender account delete [--confirm LOGIN]
-                                        delete your account, pages and tokens. At a
-                                        terminal you type your login; without one,
-                                        --confirm LOGIN is required
-  foldrender publish FILE|- [options]   publish a page; prints only its address
-      --title TEXT                      page title (default: the file's <title>)
-      --name NAME                       the last part of its address (default: from
-                                        the title); a name another of your pages has
-                                        becomes NAME-2
-      --folder FOLDER                   put it in a folder: .../artifacts/LOGIN/FOLDER/NAME
-      --slug ID                         publish to that page (its id or address):
-                                        update it, or make it if you have none by that id
-      --private                         only you can see it (default for new pages,
-                                        with or without --slug)
-      --link                            anyone with the link can see it; the link
-                                        carries a key, and the page is listed nowhere
-      --public                          anyone can see it, and it is listed on your
-                                        page, .../artifacts/LOGIN/
-      --share LOGIN[,LOGIN...]          only these GitHub logins can see it
-  foldrender share ID|URL [+LOGIN ...] [-LOGIN ...] [--public|--link|--private]
-                                        [--reset-link]: a new key for a --link page;
-                                        the link handed out before stops working
-  foldrender list                       list your pages
-  foldrender read SLUG|URL [options]    print a page as text: its facts, then
-                                        Markdown. Public pages need no sign-in
-      --html                            the page's HTML instead
-      --json                            the API's JSON instead
-      --assets DIR                      also save embedded images and SVG into DIR
-      --save FILE                       save the page's HTML as FILE
-  foldrender rm SLUG|URL                delete a page
-  foldrender open SLUG|URL              open a page in the browser
-  foldrender help                       show this text
+  publish FILE...      publish (or update) pages; prints each address
+  edit PAGE            change part of a page: --old TEXT --new TEXT
+  read PAGE            the page as Markdown; a long page stops at ~6k tokens,
+                       lists its sections and says how to go on (--section N)
+  ls [WORDS]           your newest 20 pages (--all, --access A, --folder F)
+  share PAGE...        +login -login --public --link --private --reset-link
+  versions PAGE        kept versions; restore PAGE VERSION; undo PAGE
+  rm PAGE...           delete pages
+  open PAGE            print the page's address and open it
+  login / logout / whoami / export [FILE] / account delete
 
-Examples:
-  foldrender login
-  foldrender publish report.html
-  foldrender publish report.html --share alice,bob
-  foldrender publish - < diagram.html
-  foldrender publish report.html --folder q3 --link
-  foldrender read https://foldrender.dev/artifacts/alice/q3/report
-  foldrender read abc123 --assets ./abc123-assets
-  foldrender share https://foldrender.dev/artifacts/alice/q3/report +carol -bob
-  foldrender rm abc123
-
-Exit codes: 0 ok, 1 failed, 2 bad usage, 3 not signed in or token rejected,
-4 free-plan limit reached, 5 page too large, 6 network failure,
-7 no such page or not visible to this account, 8 page expired,
-9 too large to read as text (use --html).
-
-Publishing the same file again updates the same link. Environment:
-  FOLDRENDER_TOKEN       token to use instead of the saved login
-  FOLDRENDER_API         API base URL, for testing
-  FOLDRENDER_NO_BROWSER  set to 1 to print the sign-in link instead of opening it
-
-Free plan: 10 pages, each kept for 30 days, up to 5 MB per page.
+PAGE is a page's address, its id, or an old a.foldrender.dev link.
+--json prints the API's answer. More: foldrender help COMMAND, help exit.
 EOF
+    ;;
+    publish) cat <<'EOF'
+foldrender publish FILE...|- [options]
+  Publishes each file and prints its address, one line a page. Publishing the
+  same file again updates the same page; stderr says the revision and the lines
+  added and removed, or "unchanged" (nothing is written then).
+  --private            only you (the default for a new page)
+  --link               anyone with the link; the link carries a key (?k=)
+  --public             anyone, and listed on your page .../artifacts/LOGIN/
+  --share a,b          only these GitHub logins
+  --name NAME          the address's last part (default: from the title)
+  --folder FOLDER      .../artifacts/LOGIN/FOLDER/NAME
+  --title TEXT         the title (default: the file's <title>)
+  --slug ID|ADDRESS    publish to that page
+  --json               the API's answer, one JSON object a page
+Examples: foldrender publish report.html --link
+          foldrender publish a.html b.html c.html --folder q3
+EOF
+    ;;
+    edit) cat <<'EOF'
+foldrender edit PAGE --old TEXT --new TEXT [--old TEXT --new TEXT ...] [--base REV] [--title T]
+foldrender edit PAGE --edits FILE|-    (JSON: [{"old": "...", "new": "..."}, ...])
+  Replaces each --old with its --new in the page's HTML, in order, on the
+  server: only the changes are sent. Each --old must be in the page exactly
+  once (as the edits before it left it), or nothing changes (exit 10).
+  --base REV refuses if the page is no longer at that revision (exit 10).
+  Prints the address; stderr says the new revision and the lines changed.
+EOF
+    ;;
+    read) cat <<'EOF'
+foldrender read PAGE [options]
+  A few facts (title, address, id, updated, size), then the page as Markdown.
+  A long page stops near 6k tokens (FOLDRENDER_READ_MAX_TOKENS) and ends with
+  how much is left, the command that goes on, and its sections by number.
+  --outline            the headings, numbered, each with its size
+  --section N|TEXT     one section (its number in the outline, or its heading)
+  --from N             go on from character N (the next: line says which)
+  --max-tokens N       stop near N tokens; --max-chars N near N characters
+  --all                no stop
+  --meta full          every fact (owner, access, sharing, expiry, type)
+  --json               the API's JSON; --html the stored HTML
+  --save FILE          save the stored HTML; --assets DIR save images and SVG
+EOF
+    ;;
+    ls|list) cat <<'EOF'
+foldrender ls [WORDS...] [--all|-n N] [--access public|link|private|shared] [--folder F] [--long] [--json]
+  Your pages, newest first: the 20 newest unless --all or -n N. WORDS must all
+  be in the id, title or address. --long adds each page's address.
+EOF
+    ;;
+    share) cat <<'EOF'
+foldrender share PAGE... [+LOGIN ...] [-LOGIN ...] [--public|--link|--private] [--reset-link]
+  Changes who can read the pages, without publishing them again; prints each
+  address. --reset-link gives a --link page a new key: the old link stops working.
+EOF
+    ;;
+    versions|restore|undo) cat <<'EOF'
+foldrender versions PAGE       the page's revision and the versions it kept, newest first
+foldrender restore PAGE VERSION   put a version back (the current body is kept in turn)
+foldrender undo PAGE           put back the newest kept version; undo again to return
+EOF
+    ;;
+    exit) cat <<'EOF'
+Exit codes: 0 ok, 1 failed, 2 bad usage, 3 not signed in or token rejected,
+4 plan limit reached, 5 page too large, 6 network failure, 7 no such page or
+not visible to this account, 8 page expired, 9 too large to read as text
+(use --html), 10 an edit did not apply (old text missing or not unique, or
+the page moved on from --base).
+Environment: FOLDRENDER_TOKEN (a token instead of the saved login),
+FOLDRENDER_API (the API, for testing), FOLDRENDER_NO_BROWSER=1,
+FOLDRENDER_READ_MAX_TOKENS. Free plan: 10 pages, 30 days each, 5 MB a page.
+EOF
+    ;;
+    *) die 2 "no help for $1; try: foldrender help" ;;
+  esac
 }
 
 main() {
@@ -885,12 +1251,16 @@ main() {
     export) cmd_export "$@" ;;
     whoami) cmd_whoami ;;
     publish) cmd_publish "$@" ;;
+    edit) cmd_edit "$@" ;;
     share) cmd_share "$@" ;;
-    list|ls) cmd_list ;;
+    list|ls) cmd_list "$@" ;;
     read|cat) cmd_read "$@" ;;
+    versions) cmd_versions "$@" ;;
+    restore) cmd_restore "$@" ;;
+    undo) cmd_undo "$@" ;;
     rm|delete) cmd_rm "$@" ;;
     open) cmd_open "$@" ;;
-    help|-h|--help) cmd_help ;;
+    help|-h|--help) cmd_help "$@" ;;
     *) die 2 "unknown command: $cmd (try: foldrender help)" ;;
   esac
 }
