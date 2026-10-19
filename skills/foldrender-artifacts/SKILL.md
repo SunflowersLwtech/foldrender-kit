@@ -110,7 +110,7 @@ foldrender canvas a.html b.html --title "Q4" --note "read a first" --link 1:2:"n
 foldrender canvas plan.canvas                 a JSON Canvas file; coordinates are optional
 ```
 
-`--name NAME` makes the same command update that canvas instead of making another. To change a canvas, in one step that applies all of it or nothing:
+stdout is the canvas's address; stderr has a line saying what it holds, then its map with each card's id (what `canvas edit` takes). `--name NAME` makes the same command update that canvas instead of making another. To change a canvas, in one step that applies all of it or nothing:
 
 ```
 foldrender canvas edit <canvas> --add risks.html --link RfvO:risks.html:"risks from" --rm hN42 --base 7

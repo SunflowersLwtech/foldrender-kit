@@ -24,7 +24,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.12.0
+FR_CLI_VERSION=0.12.1
 API="${FOLDRENDER_API:-https://a.foldrender.dev}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -1676,6 +1676,9 @@ cmd_canvas() {
       note "warning: the server did not say what the canvas holds, so it may be older than this CLI and have left the cards out. Look: foldrender read $PAGE_URL --outline"
     fi
   fi
+  # Its map on stderr, with each card's id, so that a canvas edit needs no read
+  # first; stdout stays the address alone.
+  print_map >&2
 }
 
 # canvas edit CANVAS [options]: changes a canvas in one request, all of it or
