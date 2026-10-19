@@ -1145,6 +1145,60 @@ cmd_read() {
   cat "$TMP/page"
 }
 
+# canvas [FILE|PAGE ...] [--title T] [--json]: a new canvas with these pages on
+# it as cards, up to 12. A file is published first (to its own page, as
+# publish would); a page (an id or an address) is put on as it is. Prints the
+# canvas's address. With nothing named, a blank canvas.
+cmd_canvas() {
+  local items=() ids="" it as_json="" ctitle=""
+  local title="" slug="" vis="" share="" name="" folder="" folder_set=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --title) need $# "$1"; ctitle="$2"; shift 2 ;;
+      --json) as_json=1; shift ;;
+      -*) die 2 "unknown option: $1" ;;
+      *) items+=("$1"); shift ;;
+    esac
+  done
+  [ ${#items[@]} -le 12 ] || die 2 "a canvas starts with up to 12 pages; add more on the canvas itself"
+  require_token
+  for it in "${items[@]}"; do
+    if [ -f "$it" ]; then
+      publish_one "$it" "$it: " > /dev/null
+    else
+      page_id "$it"
+      check_slug "$PAGE_ID"
+    fi
+    ids="$ids${ids:+,}\"$PAGE_ID\""
+  done
+  {
+    printf '{"from":[%s]' "$ids"
+    if [ -n "$ctitle" ]; then
+      printf '%s' "$ctitle" > "$TMP/ctitle"
+      printf ',"title":'
+      json_str "$TMP/ctitle"
+    fi
+    printf '}'
+  } > "$TMP/canvas.json"
+  ACCEPT="application/json"
+  api_auth POST /api/canvas -H "Content-Type: application/json" --data-binary "@$TMP/canvas.json"
+  ACCEPT="text/plain"
+  [ "$STATUS" != 404 ] || die 1 "this server has no canvases yet"
+  expect_2xx
+  if [ -n "$as_json" ]; then
+    cat "$TMP/body"
+    printf '\n'
+    return 0
+  fi
+  PAGE_URL="$(json_field page_url)"
+  [ -n "$PAGE_URL" ] || PAGE_URL="$(json_field url)"
+  case "$PAGE_URL" in
+    http*) printf '%s\n' "$PAGE_URL" ;;
+    *) die 1 "the server did not say where the canvas is ($(error_text))" ;;
+  esac
+  note "canvas $(json_field id) with ${#items[@]} card(s)"
+}
+
 cmd_help() {
   case "${1:-}" in
     '') cat <<'EOF'
@@ -1157,6 +1211,7 @@ foldrender publishes HTML pages as links and reads pages back as text.
   ls [WORDS]           your newest 20 pages (--all, --access A, --folder F)
   share PAGE...        +login -login --public --link --private --reset-link
   versions PAGE        kept versions; restore PAGE VERSION; undo PAGE
+  canvas FILE|PAGE...  a canvas with these pages on it as cards (up to 12)
   rm PAGE...           delete pages
   open PAGE            print the page's address and open it
   login / logout / whoami / export [FILE] / account delete
@@ -1258,6 +1313,7 @@ main() {
     versions) cmd_versions "$@" ;;
     restore) cmd_restore "$@" ;;
     undo) cmd_undo "$@" ;;
+    canvas) cmd_canvas "$@" ;;
     rm|delete) cmd_rm "$@" ;;
     open) cmd_open "$@" ;;
     help|-h|--help) cmd_help "$@" ;;
