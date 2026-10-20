@@ -9,8 +9,8 @@
 # to stdout, briefly by default; --json prints the API's answer as it is.
 #
 #   FOLDRENDER_TOKEN       API token; takes precedence over the saved login.
-#   FOLDRENDER_API         API base URL (default https://a.foldrender.dev, the API
-#                          host; the links it hands out are on foldrender.dev).
+#   FOLDRENDER_API         API base URL (default https://foldrender.dev/artifacts,
+#                          where the app is; its API is under /api there).
 #   FOLDRENDER_NO_BROWSER  Set to 1 to print the sign-in link, not open it.
 #   FOLDRENDER_READ_MAX_TOKENS  How much `read` prints before it stops, says how
 #                          to go on and lists the sections (default 6000,
@@ -24,8 +24,8 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.12.2
-API="${FOLDRENDER_API:-https://a.foldrender.dev}"
+FR_CLI_VERSION=0.12.3
+API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
 CARD_MAX_BYTES=2097152
