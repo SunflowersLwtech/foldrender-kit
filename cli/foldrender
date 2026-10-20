@@ -24,7 +24,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.12.1
+FR_CLI_VERSION=0.12.2
 API="${FOLDRENDER_API:-https://a.foldrender.dev}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -248,6 +248,20 @@ page_id() {
         *) fail_http ;;
       esac
       [ -n "$PAGE_ID" ] || die 1 "the server did not say which page $1 is"
+      ;;
+    # Anything else on the site itself is not a page. foldrender.dev/<owner>/<repo>
+    # (and /repos/..., /github.com/...) is the site's reader for a GitHub
+    # repository: say where the repository is, rather than look up a page by
+    # the repository's name.
+    http://foldrender.dev/*|https://foldrender.dev/*|http://www.foldrender.dev/*|https://www.foldrender.dev/*)
+      path="/${1#*://*/}"
+      path="${path%%[?#]*}"
+      case "$path" in
+        /guides/*|/install/*|/assets/*|/fonts/*|/zh/*|/ms/*|/api/*|/i18n/*) path="" ;;
+      esac
+      path="$(printf '%s\n' "$path" | sed -nE 's#^/(repos/|github\.com/)?([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9._-]+).*#\2/\3#p')"
+      [ -z "$path" ] || die 2 "$1 is FoldRender's reader for the GitHub repository $path, not a page: read the repository itself (https://github.com/$path) or its DeepWiki (https://deepwiki.com/$path)"
+      die 2 "$1 is not a page's address (pages are at https://foldrender.dev/artifacts/...)"
       ;;
     *) PAGE_ID="$(slug_from "$1")" ;;
   esac
@@ -1251,7 +1265,7 @@ save_assets() {
 # --section for a card, --outline the map alone, --notes adds the annotations
 # (for the owner and collaborators).
 cmd_read() {
-  local target="" mode=text assets="" save="" slug query="" part="" outline="" cut="" sect="" notes=""
+  local target="" mode=text assets="" save="" slug query="" part="" outline="" cut="" sect="" notes="" nonotes=""
   local maxt="${FOLDRENDER_READ_MAX_TOKENS:-6000}" meta=short
   case "$maxt" in ''|*[!0-9]*) maxt=6000 ;; esac
   while [ $# -gt 0 ]; do
@@ -1266,6 +1280,7 @@ cmd_read() {
         [ -z "$sect" ] || die 2 "read takes one --section or --card"
         sect=1; part="$part&section=$(urlencode "$2")"; cut=1; shift 2 ;;
       --notes) [ -n "$notes" ] || part="$part&notes=1"; notes=1; shift ;;
+      --no-notes) nonotes=1; shift ;;
       --from)
         need $# "$1"
         case "$2" in ''|*[!0-9]*) die 2 "--from takes a character offset, from the next: line of a read that stopped" ;; esac
@@ -1287,7 +1302,8 @@ cmd_read() {
       *) [ -z "$target" ] || die 2 "read takes one page"; target="$1"; shift ;;
     esac
   done
-  [ -n "$target" ] || die 2 "usage: foldrender read PAGE [--outline|--section N|--card ID|--from N] [--max-tokens N|--max-chars N|--all] [--notes] [--meta full] [--html|--json|--save FILE] [--assets DIR]"
+  [ -n "$target" ] || die 2 "usage: foldrender read PAGE [--outline|--section N|--card ID|--from N] [--max-tokens N|--max-chars N|--all] [--no-notes] [--meta full] [--html|--json|--save FILE] [--assets DIR]"
+  [ -z "$notes" ] || [ -z "$nonotes" ] || die 2 "--notes and --no-notes do not go together"
   [ -z "$save" ] || [ "$mode" = text ] || die 2 "--save writes the stored file; drop --html or --json"
   [ -z "$save" ] || [ -z "$assets" ] || die 2 "--save and --assets do not go together"
   [ -z "$cut" ] || { [ "$mode" != html ] && [ -z "$save" ]; } || die 2 "--outline, --section, --card, --from and --max-* cut the Markdown; drop --html or --save"
@@ -1309,6 +1325,16 @@ cmd_read() {
     cp "$TMP/body" "$save.part" 2>/dev/null && mv -f "$save.part" "$save" || die 1 "could not write $save"
     printf '%s\n' "$save"
     return 0
+  fi
+
+  # Signed in, a read brings the page's annotations as they are (notes,
+  # highlighted passages, boxes, handwriting as recognized) in a Notes section at
+  # its end, and says how many in its facts: an agent asked about them has them
+  # without knowing to ask. The server shows them to the page's owner and
+  # collaborators only, and tells anyone else that it does. (--html asks for the
+  # stored HTML alone, without these parts.)
+  if [ -z "$notes" ] && [ -z "$nonotes" ] && [ -n "$TOKEN" ]; then
+    part="$part&notes=1"
   fi
 
   if [ "$mode" = html ]; then
@@ -1889,8 +1915,8 @@ foldrender publishes HTML pages as links and reads pages back as text.
 
   publish FILE...      publish (or update) pages; prints each address
   edit PAGE            change part of a page: --old TEXT --new TEXT
-  read PAGE            the page as Markdown; a long page stops at ~6k tokens,
-                       lists its sections and says how to go on (--section N)
+  read PAGE            the page as Markdown, with its annotations (notes, marks,
+                       ink) when signed in; stops at ~6k tokens (--section N)
   ls [WORDS]           your newest 20 pages (--all, --access A, --folder F)
   share PAGE...        +login -login --public --link --private --reset-link
   versions PAGE        kept versions; restore PAGE VERSION; undo PAGE
@@ -1901,7 +1927,8 @@ foldrender publishes HTML pages as links and reads pages back as text.
   login / logout / whoami / export [FILE] / account delete / version
 
 PAGE is a page's address, its id, or an old a.foldrender.dev link.
---json prints the API's answer. More: foldrender help COMMAND, help exit.
+--json prints the API's answer. More: foldrender help COMMAND (or COMMAND
+--help), foldrender help exit.
 EOF
     ;;
     publish) cat <<'EOF'
@@ -1944,8 +1971,13 @@ foldrender read PAGE [options]
   --section N|TEXT     one section (its number in the outline, or its heading)
   --card ID            one card of a canvas: its id (or a unique start of it),
                        its number in reading order, or its title
-  --notes              a canvas's annotations in its map too (for its owner
-                       and collaborators)
+  Signed in, the page's or canvas's annotations come too: notes, highlighted
+  passages with their comments, boxes and handwriting as recognized, each with
+  its author, in a Notes section at the end (a canvas: in its map), and the
+  facts say how many. Only the owner and collaborators see them; anyone else
+  is told so.
+  --no-notes           leave the annotations out (--notes asks for them even
+                       when not signed in)
   --from N             go on from character N (the next: line says which)
   --max-tokens N       stop near N tokens; --max-chars N near N characters
   --all                no stop
@@ -1992,6 +2024,38 @@ Examples:
   foldrender canvas edit "$url" --add costs.html --link RfvO:costs.html:funds
 EOF
     ;;
+    rm|delete) cat <<'EOF'
+foldrender rm PAGE...
+  Deletes each page: its address, its kept versions and its annotations. It
+  cannot be undone. Exit 1 if any page was not found (the others are deleted).
+EOF
+    ;;
+    open) cat <<'EOF'
+foldrender open PAGE
+  Prints the page's address (its canonical one, for an id or an old link) and
+  opens it in the browser (not with FOLDRENDER_NO_BROWSER=1).
+EOF
+    ;;
+    export) cat <<'EOF'
+foldrender export [FILE.zip]
+  Saves every page of the account and a manifest.json as one zip (default:
+  foldrender-artifacts-LOGIN-DATE.zip) and prints its path. Never overwrites.
+EOF
+    ;;
+    login|logout|whoami) cat <<'EOF'
+foldrender login                 sign in: prints a link and a code to approve
+foldrender login --token TOKEN   save a token (from the account page) instead
+foldrender whoami                the signed-in login, plan and pages used
+foldrender logout                remove the saved token
+EOF
+    ;;
+    account) cat <<'EOF'
+foldrender account delete [--confirm LOGIN]
+  Deletes the account, every page and every API token; it cannot be undone.
+  Asks for the login on a terminal; without one, --confirm LOGIN is required.
+  Run foldrender export first to keep a copy.
+EOF
+    ;;
     versions|restore|undo) cat <<'EOF'
 foldrender versions PAGE       the page's revision and the versions it kept, newest first
 foldrender restore PAGE VERSION   put a version back (the current body is kept in turn)
@@ -2014,9 +2078,39 @@ EOF
   esac
 }
 
+# help_asked CMD ARG...: whether ARGs ask for CMD's help (-h or --help), not
+# counting the value of an option that takes one (edit --old --help).
+help_asked() {
+  local cmd="$1" skip="" a
+  shift
+  for a in "$@"; do
+    if [ -n "$skip" ]; then skip=""; continue; fi
+    case "$a" in
+      -h|--help) return 0 ;;
+      --old|--new|--title|--name|--folder|--share|--slug|--edits|--patch|--base|--assets|--save|-o|\
+      --section|--card|--from|--max-tokens|--max-chars|--meta|--access|-n|--add|--rm|--note|--owner|\
+      --confirm|--token) skip=1 ;;
+      --link) [ "$cmd" != canvas ] || skip=1 ;;
+    esac
+  done
+  return 1
+}
+
 main() {
   local cmd="${1:-help}"
   [ $# -eq 0 ] || shift
+  case "$cmd" in
+    login|logout|account|export|whoami|publish|edit|share|list|ls|read|cat|versions|restore|undo|canvas|rm|delete|open|version)
+      if help_asked "$cmd" "$@"; then
+        case "$cmd" in
+          list) cmd_help ls ;;
+          cat) cmd_help read ;;
+          version) cmd_help ;;
+          *) cmd_help "$cmd" ;;
+        esac
+        return 0
+      fi ;;
+  esac
   case "$cmd" in
     login) cmd_login "$@" ;;
     logout) cmd_logout ;;

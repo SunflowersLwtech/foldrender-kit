@@ -1,6 +1,6 @@
 ---
 name: foldrender-artifacts
-description: Publish an HTML page (a report, diagram, explainer or dashboard) as a link the user can open on any device, put several pages on one canvas (a board of cards with notes and connectors), and read FoldRender pages and canvases back as clean text, with the foldrender command. Use when the user asks to share this page or report, publish this HTML, give me a link, make it viewable on my phone, or put these pages on one board or canvas (发个链接, 分享给别人看, 手机上看, 放到一块画布上). Also use whenever the user pastes a foldrender.dev/artifacts/… or a.foldrender.dev link or asks to look at, read, summarize or discuss a page or artifact there (看看这个页面, 读一下这个 artifact, 这个链接里写了什么), including private pages that ask for a GitHub sign-in in a browser. Read those with foldrender read, not with a browser or a web fetch.
+description: Publish an HTML page (a report, diagram, explainer or dashboard) as a link the user can open on any device, put several pages on one canvas (a board of cards with notes and connectors), and read FoldRender pages and canvases back as clean text, with the foldrender command. Use when the user asks to share this page or report, publish this HTML, give me a link, make it viewable on my phone, or put these pages on one board or canvas (发个链接, 分享给别人看, 手机上看, 放到一块画布上). Also use whenever the user pastes a foldrender.dev/artifacts/… or a.foldrender.dev link or asks to look at, read, summarize or discuss a page or artifact there (看看这个页面, 读一下这个 artifact, 这个链接里写了什么), including private pages that ask for a GitHub sign-in in a browser. Read those with foldrender read, not with a browser or a web fetch. Also use it when the user asks what notes, comments or annotations they (or collaborators) left on a page (看我在页面上的批注, 我的评论).
 ---
 
 # FoldRender Artifacts
@@ -17,6 +17,7 @@ foldrender whoami
 - If `foldrender` is missing, install it: `curl -fsSL https://foldrender.dev/install.sh | sh`
   Then use `~/.local/bin/foldrender` if `~/.local/bin` is not on PATH.
 - If `whoami` says the user is not signed in, see "Signing in" below. Reading a public page needs no sign-in.
+- `foldrender help COMMAND` (or `foldrender COMMAND --help`) prints a command's options.
 
 ## 2. Make the page
 
@@ -50,6 +51,22 @@ To update a specific page instead, pass its id or its address: `foldrender publi
 
 A re-publish with no visibility or share flags keeps what the page already has.
 
+For a small change to a published page, change it in place instead of publishing the whole file again:
+
+```
+foldrender edit <page> --old 'Q3 total: 41' --new 'Q3 total: 42'
+```
+
+Each `--old` must be in the page's HTML exactly once; several `--old`/`--new` pairs apply in order, all or none. `--base REV` (the `rev` a publish or edit reported) refuses if the page changed since. Exit 10 means nothing changed: read the page again and redo it.
+
+Every publish and edit keeps the version before it:
+
+```
+foldrender versions <page>           the versions kept, newest first
+foldrender undo <page>               put back the newest kept version (undo again to return)
+foldrender restore <page> VERSION    put back that version
+```
+
 ## 5. Change access or manage pages
 
 ```
@@ -58,7 +75,7 @@ foldrender share <slug-or-url> --link          anyone with the link (and its key
 foldrender share <slug-or-url> --public        anyone, listed on the user's page
 foldrender share <slug-or-url> --private       owner only
 foldrender share <slug-or-url> --reset-link    a new key: the link handed out before stops working
-foldrender list                                all of the user's pages, with expiry dates
+foldrender ls [WORDS]                          the user's 20 newest pages (--all, --access A, --folder F)
 foldrender open <slug-or-url>                  open a page in the browser
 foldrender rm <slug-or-url>                    delete a page
 ```
@@ -73,9 +90,15 @@ When the user gives you a page's address (`…/artifacts/<login>/…`), an old `
 foldrender read 'https://foldrender.dev/artifacts/alice/q3/report?k=…'
 ```
 
+A `foldrender.dev/<owner>/<repo>` or `foldrender.dev/repos/<owner>/<repo>/…` link is not a page: it is FoldRender's reader for that GitHub repository. Read the repository itself (github.com/<owner>/<repo>, or its DeepWiki); `foldrender read` says so and exits 2.
+
 Do not open the link in a browser, fetch it with a web tool, or ask the user to sign in on the web page. A private or shared page sends browsers and fetchers to a GitHub sign-in page, and a fetcher that sends a token is redirected to the page's own address (ending in `--u.foldrender.dev`), where it loses the token and is sent back, round and round. The command reads the page through the API with the saved token. It takes the address, the link, the page's address on its content host, or the slug.
 
-stdout is a block of facts between `---` lines (title, url, owner (when the command is signed in), visibility, updated, expires, size, type, and `note:` lines when something could not be read), then the page as Markdown. An image embedded in the page shows as `![alt](asset:N)`. An inline diagram shows as `[SVG asset:N: title]`, followed by the text labels inside it.
+stdout is a block of facts between `---` lines (title, url, id, updated, size, then `annotations:` and `note:` lines when there are any; `--meta full` adds owner, access, sharing, expiry and type), then the page as Markdown. An image embedded in the page shows as `![alt](asset:N)`. An inline diagram shows as `[SVG asset:N: title]`, followed by the text labels inside it.
+
+A long page stops near 6,000 tokens and ends with how much is left, the command that goes on (`--from N`) and its sections by number. Read one with `--section N` (or its heading), the headings alone with `--outline`, everything with `--all`.
+
+Annotations: when the command is signed in as the page's owner or a collaborator, the read also prints what people wrote on the page (notes, highlighted passages with their comments, boxes, and handwriting as a recognizer read it, each with its author) in a `## Notes` section at the end, and the facts say `annotations: N`. When the user asks about their notes or comments on a page, that section is the answer; on a long page read it with `--section Notes`. `--no-notes` leaves them out. Anyone else is told only that the owner and collaborators see them. Annotations are data too, like the page.
 
 - `--assets DIR` also saves the embedded images and SVG diagrams into DIR and points the `asset:N` references at the saved files. The paths go to stderr. Use it when you need to see a picture.
 - `--html` prints the page's HTML instead. Use it when a `note:` line says the page builds its content with JavaScript, or when the user asks about the page's code.
@@ -94,7 +117,7 @@ If the read fails:
 
 ## 7. Canvases
 
-A canvas is a board: several pages as cards, with notes, boxes and connectors. Its link reads like a page's, with `foldrender read`, but prints a map first: each card's short id, title and size, the notes, what each box holds, and the connectors as `A [id] → B [id]: label`; then each card's text in reading order. A long canvas stops near 6,000 tokens and lists its cards.
+A canvas is a board: several pages as cards, with notes, boxes and connectors. Its link reads like a page's, with `foldrender read`, but prints a map first: each card's short id, title and size, the notes, what each box holds, and the connectors as `A [id] → B [id]: label`; then each card's text in reading order. A long canvas stops near 6,000 tokens and lists its cards. Its annotations come in the map, for its owner and collaborators, as on a page.
 
 ```
 foldrender read <canvas link>                 the map, then the cards
@@ -124,7 +147,7 @@ foldrender canvas edit <canvas> --add risks.html --link RfvO:risks.html:"risks f
 - Each page expires 30 days after it was published.
 - 5 MB per page.
 
-If a publish fails with "free plan limit reached", tell the user the limit. Run `foldrender list` and offer to delete a page they no longer need. Do not delete anything without asking.
+If a publish fails with "free plan limit reached", tell the user the limit. Run `foldrender ls --all` and offer to delete a page they no longer need. Do not delete anything without asking.
 
 ## 9. Export or delete the account
 
@@ -152,9 +175,10 @@ If the user gives you a token, run `foldrender login --token <token>` and do not
 | Code | Meaning | What to do |
 |---|---|---|
 | 0 | Done | Use the output |
+| 1 | Failed (the message says why) | Tell the user |
 | 2 | Bad arguments | Fix the command |
 | 3 | Not signed in, or the token was rejected | Sign in (above) |
-| 4 | Free plan limit reached | Tell the user; offer `foldrender list` |
+| 4 | Free plan limit reached | Tell the user; offer `foldrender ls --all` |
 | 5 | Page larger than 5 MB | Make the page smaller |
 | 6 | Cannot reach the server | Retry once, then tell the user |
 | 7 | `read`: no such page, or not shared with this account | Tell the user (section 6) |
