@@ -4,8 +4,10 @@
 #
 # Needs only bash, curl (7.55 or later, for -H @file) and coreutils, so it runs
 # on macOS's bash 3.2 and on Linux. `publish` and `edit` write nothing to stdout
-# but the page's address, one line a page, so an agent can capture it; the
-# revision, notes and warnings go to stderr, one line each. Other commands print
+# but the page's address, one line a page, so an agent can capture it; on
+# stderr, first one line that says what happened (a new page, an update in
+# place, or no new page because the account has this page already), then
+# notes, warnings and the next commands, one line each. Other commands print
 # to stdout, briefly by default; --json prints the API's answer as it is.
 #
 #   FOLDRENDER_TOKEN       API token; takes precedence over the saved login.
@@ -20,11 +22,13 @@
 # Exit codes: 0 ok, 1 failed, 2 bad usage, 3 not signed in or token rejected,
 # 4 free-plan limit reached, 5 page too large, 6 network failure,
 # 7 no such page, or not visible to this account (read), 8 page expired (read),
-# 9 too large to read as text, 10 an edit did not apply.
+# 9 too large to read as text, 10 an edit did not apply, 11 no new answer
+# before --timeout (answers --wait), 12 the id or address asked for is another
+# page's (publish).
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.12.3
+FR_CLI_VERSION=0.13.1
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -73,16 +77,22 @@ require_token() {
 # and the headers in $TMP/headers. A failed connection exits here. HTTP errors
 # are reported by the caller.
 api() {
-  local method="$1" path="$2" rc
+  api_once "$@" || die 6 "cannot reach $API. Check your network connection and try again. ($(curl_error))"
+  update_note
+}
+
+# api_once METHOD PATH [curl args...]: as api, but a failed connection is curl's
+# exit code, for the caller to try again.
+api_once() {
+  local method="$1" path="$2"
   shift 2
   STATUS="$(curl -sS -X "$method" --connect-timeout 15 --max-time 300 \
     -H "Accept: $ACCEPT" -H "FoldRender-API: 2" -D "$TMP/headers" -o "$TMP/body" -w '%{http_code}' "$@" \
     "$API$path" 2>"$TMP/err")"
-  rc=$?
-  if [ "$rc" -ne 0 ]; then
-    die 6 "cannot reach $API. Check your network connection and try again. ($(sed 's/^curl: ([0-9]*) //' "$TMP/err" | head -n 1))"
-  fi
-  update_note
+}
+
+curl_error() {
+  sed 's/^curl: ([0-9]*) //' "$TMP/err" | head -n 1
 }
 
 # header_value NAME: the value of the header NAME (lowercase) in the last
@@ -328,17 +338,58 @@ map_forget() {
   map_without "$1" "$2" > "$SLUG_MAP.tmp" && mv -f "$SLUG_MAP.tmp" "$SLUG_MAP"
 }
 
+# A temporary file of this run's own: two publishes at once must not write one.
 map_set() {
   mkdir -p "$CONFIG_DIR"
   {
     [ -f "$SLUG_MAP" ] && map_without 1 "$1"
     printf '%s\t%s\n' "$1" "$2"
-  } > "$SLUG_MAP.tmp" && mv -f "$SLUG_MAP.tmp" "$SLUG_MAP"
+  } > "$SLUG_MAP.tmp.$$" && mv -f "$SLUG_MAP.tmp.$$" "$SLUG_MAP"
 }
 
-# upload METHOD PATH FILE QUERY
+# upload METHOD PATH FILE QUERY: the page, sent with this publish's
+# Idempotency-Key (PUB_KEY), tried up to UPLOAD_TRIES times. A dropped
+# connection, a 5xx, or a 409 in_progress (another request is writing this
+# page) is tried again with the same key, and the server answers a try whose
+# first attempt did arrive with the page that attempt made: a retry never makes
+# a second page.
+UPLOAD_TRIES=3
 upload() {
-  api_auth "$1" "$2${4:+?$4}" -H "Content-Type: text/html" --data-binary "@$3"
+  local try=1 rc wait extra=()
+  require_token
+  [ -z "${PUB_KEY:-}" ] || extra=(-H "Idempotency-Key: $PUB_KEY")
+  while :; do
+    api_once "$1" "$2${4:+?$4}" -H "$(auth_header)" -H "Content-Type: text/html" ${extra[@]+"${extra[@]}"} --data-binary "@$3"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      update_note
+      case "$STATUS" in
+        500|502|503|504) ;;
+        409) grep -q in_progress "$TMP/body" || return 0 ;;
+        *) return 0 ;;
+      esac
+    fi
+    [ "$try" -lt "$UPLOAD_TRIES" ] || break
+    wait=$((try * 2))
+    if [ "$rc" -eq 0 ] && [ "$STATUS" = 409 ]; then
+      wait="$(header_value retry-after)"
+      case "$wait" in ''|*[!0-9]*) wait=2 ;; esac
+      [ "$wait" -le 10 ] || wait=10
+      note "${PUB_LABEL:-}another request is writing this page; asking again in ${wait}s"
+    elif [ "$rc" -ne 0 ]; then
+      note "${PUB_LABEL:-}no answer from $API ($(curl_error)); trying again in ${wait}s with the same Idempotency-Key, so the page is made at most once"
+    else
+      note "${PUB_LABEL:-}the server returned HTTP $STATUS; trying again in ${wait}s with the same Idempotency-Key, so the page is made at most once"
+    fi
+    sleep "$wait"
+    try=$((try + 1))
+  done
+  [ "$rc" -eq 0 ] || die 6 "cannot reach $API after $UPLOAD_TRIES tries ($(curl_error)). Run the same command again: it makes the page at most once."
+}
+
+# A new Idempotency-Key: 24 random hex digits.
+new_key() {
+  printf 'cli-%s' "$(od -An -N12 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
 }
 
 # Sets PAGE_URL, and PAGE_ID, from the body of a successful write: the URL on
@@ -701,11 +752,13 @@ cmd_account() {
 # publish FILE... [options]: each file to its page, one address a line on
 # stdout, in order; on stderr one line a page saying what the publish changed.
 cmd_publish() {
-  local files=() title="" slug="" vis="" share="" name="" folder="" folder_set="" as_json="" f
+  local files=() title="" slug="" vis="" share="" name="" folder="" folder_set="" as_json="" key="" allow_dup="" f n=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --title) need $# "$1"; title="$2"; shift 2 ;;
       --slug|--id) need $# "$1"; slug="$2"; shift 2 ;;
+      --idempotency-key) need $# "$1"; key="$2"; shift 2 ;;
+      --allow-duplicate) allow_dup=1; shift ;;
       --name) need $# "$1"; name="$2"; shift 2 ;;
       --folder) need $# "$1"; folder="$2"; folder_set=1; shift 2 ;;
       --share) need $# "$1"; share="${2// /}"; shift 2 ;;
@@ -718,7 +771,12 @@ cmd_publish() {
       *) files+=("$1"); shift ;;
     esac
   done
-  [ ${#files[@]} -gt 0 ] || die 2 "usage: foldrender publish FILE...|- [--title T] [--name N] [--folder F] [--slug ID] [--private|--link|--public|--share a,b] [--json]"
+  [ ${#files[@]} -gt 0 ] || die 2 "usage: foldrender publish FILE...|- [--title T] [--name N] [--folder F] [--slug ID] [--private|--link|--public|--share a,b] [--idempotency-key K] [--allow-duplicate] [--json]"
+  case "$key" in
+    '') ;;
+    *[!A-Za-z0-9._:-]*) die 2 "--idempotency-key takes 8 to 128 letters, digits and . _ : -" ;;
+    *) [ "${#key}" -ge 8 ] && [ "${#key}" -le 120 ] || die 2 "--idempotency-key takes 8 to 120 letters, digits and . _ : -" ;;
+  esac
   if [ ${#files[@]} -gt 1 ]; then
     [ -z "$title$slug$name" ] || die 2 "--title, --name and --slug name one page; publish one file with them"
     for f in "${files[@]}"; do
@@ -734,7 +792,17 @@ cmd_publish() {
   fi
   require_token
   for f in "${files[@]}"; do
-    publish_one "$f" "$([ ${#files[@]} -gt 1 ] && printf '%s: ' "$f")"
+    n=$((n + 1))
+    # One key a page: --idempotency-key K names the publish, and each file of
+    # it is K.1, K.2, ... Without one, each page gets a new key, which its
+    # retries (upload) send again.
+    if [ -n "$key" ]; then
+      PUB_KEY="$key$([ ${#files[@]} -gt 1 ] && printf '.%s' "$n")"
+    else
+      PUB_KEY="$(new_key)"
+    fi
+    PUB_LABEL="$([ ${#files[@]} -gt 1 ] && printf '%s: ' "$f")"
+    publish_one "$f" "$PUB_LABEL"
   done
 }
 
@@ -756,7 +824,8 @@ publish_one() {
   warn_if_secrets "$src"
 
   # Which page is this? --slug, then a foldrender-slug meta tag, then the
-  # slug this file was published under before.
+  # slug this file was published under before (not with --allow-duplicate,
+  # which asks for a new page).
   if [ -n "$p_slug" ]; then
     page_id "$p_slug"
     p_slug="$PAGE_ID"
@@ -765,7 +834,7 @@ publish_one() {
     p_slug="$(meta_slug "$src")"
     if [ -n "$p_slug" ]; then
       mode=meta
-    elif [ -n "$rp" ]; then
+    elif [ -n "$rp" ] && [ -z "$allow_dup" ]; then
       p_slug="$(map_lookup "$rp")"
       [ -z "$p_slug" ] || mode=map
     fi
@@ -803,6 +872,7 @@ publish_one() {
   [ -z "$share" ] || query="${query:+$query&}share=$share"
   [ -z "$name" ] || query="${query:+$query&}name=$name"
   [ -z "$folder_set" ] || query="${query:+$query&}folder=$folder"
+  [ -z "$allow_dup" ] || query="${query:+$query&}allow_duplicate=1"
 
   [ -z "$as_json" ] || ACCEPT="application/json"
   if [ -n "$p_slug" ]; then
@@ -815,17 +885,29 @@ publish_one() {
     map_forget 1 "$rp"
     upload POST /api/artifacts "$src" "$query"
   fi
+  # A PUT to an id nobody has makes that page, so a 404 says the id is another
+  # account's (ids are one namespace for all accounts).
   if [ "$STATUS" = 404 ] && [ "$mode" = explicit ]; then
-    die 1 "there is no page named $p_slug"
+    die 12 "${label}not published: the id $p_slug is a page of another account (ids are shared by every account). Choose another --slug."
   fi
   if [ "$STATUS" = 404 ] && [ "$mode" = meta ]; then
-    die 1 "there is no page named $p_slug (from the foldrender-slug meta tag). Change or remove the tag."
+    die 12 "${label}not published: the id $p_slug (from the foldrender-slug meta tag) is a page of another account. Change or remove the tag."
   fi
   if [ "$STATUS" = 409 ] && [ "$(error_text)" = canvas ]; then
     die 1 "$p_slug is a canvas, not a page: change it with foldrender canvas edit $p_slug (see: foldrender help canvas)"
   fi
+  if [ "$STATUS" = 409 ] && grep -q in_progress "$TMP/body"; then
+    die 1 "${label}not published yet: another request is still writing this page. Run the same command again in a few seconds; it answers with that page rather than making another."
+  fi
+  if [ "$STATUS" = 409 ] && grep -q 'held_id' "$TMP/body"; then
+    held_page
+    die 12 "${label}not published: $HELD_URL is already your page $HELD_ID. To update that page: foldrender publish $(hint_file "$file") --slug $HELD_ID. To make a new page, choose another ${name:+--name}${name:---slug}."
+  fi
   if [ "$STATUS" = 409 ]; then
-    die 1 "another of your pages is already at that address (${name:+name $name}${folder:+, folder $folder}). Choose another with --name or --folder"
+    die 12 "${label}not published: another of your pages is already at that address (${name:+name $name}${folder:+, folder $folder}). Choose another with --name or --folder"
+  fi
+  if [ "$STATUS" = 422 ] && grep -q idempotency_key_reused "$TMP/body"; then
+    die 2 "${label}not published: the Idempotency-Key $PUB_KEY was used within the last day for a publish of other content. Use a new key for a new page, or leave --idempotency-key out."
   fi
   expect_2xx
   if [ -n "$as_json" ]; then
@@ -841,31 +923,82 @@ publish_one() {
   if [ -n "$rp" ]; then
     map_set "$rp" "$PAGE_ID"
   fi
-  # A new page whose name another of the owner's pages holds is given name-2.
-  if [ -n "$name" ]; then
+  # A server from before names were kept as asked gives a taken name -2.
+  if [ -n "$name" ] && [ -z "$as_json" ] && [ "$(field action)" != exists ]; then
     case "$(slug_from "$PAGE_URL")" in
       "$name"|"$PAGE_ID") ;;
       *) note "${label}the name $name is taken by another of your pages, so this one is at $(slug_from "$PAGE_URL"). Choose another with --name" ;;
     esac
   fi
   [ -n "$as_json" ] && return 0
-  printf '%s\n' "$PAGE_URL"
-  publish_note "$label"
+  publish_report "$label" "$file" "$p_title"
 }
 
-# What a write changed, from the rev=, changed=, added= and removed= lines of
-# its answer, as one note. A server from before revisions sends none: no note.
-publish_note() {
-  local rev
+# held_page: HELD_ID and HELD_URL, the page that has the address a write was
+# refused (held_id and held_url of a 409 path_taken, as JSON or as text).
+held_page() {
+  HELD_ID="$(json_field held_id)"
+  HELD_URL="$(json_field held_url)"
+}
+
+# The file as a command to update the page would name it.
+hint_file() {
+  case "$1" in
+    -|'') printf 'FILE' ;;
+    *[!A-Za-z0-9._/+-]*) printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# publish_report LABEL FILE TITLE: after a write, its address on stdout, and on
+# stderr first one line saying what happened (from the answer's action=; a
+# server from before actions says it through rev= and changed=), then what the
+# agent should know before making another page (pages of the account with the
+# same content, or the same title), then the next commands.
+publish_report() {
+  local label="$1" f action vis rev id_name dups titles reason req na
+  f="$(hint_file "$2")"
+  action="$(field action)"
+  vis="$(field visibility)"
   rev="$(field rev)"
-  [ -n "$rev" ] || return 0
-  if [ "$(field changed)" = 0 ]; then
-    note "${1}unchanged, rev $rev"
-  elif [ "$rev" = 1 ]; then
-    note "${1}new page, rev 1"
-  else
-    note "${1}rev $rev: +$(field added) -$(field removed) lines"
+  if [ -z "$action" ] && [ -n "$rev" ]; then
+    if [ "$(field changed)" = 0 ]; then action=unchanged
+    elif [ "$rev" = 1 ]; then action=created
+    else action=updated
+    fi
   fi
+  case "$action" in
+    created) note "${label}created a new page, id $PAGE_ID${vis:+, $vis}: $PAGE_URL" ;;
+    updated) note "${label}updated page $PAGE_ID in place, rev $rev: +$(field added) -$(field removed) lines: $PAGE_URL" ;;
+    unchanged) note "${label}page $PAGE_ID already had this content; nothing changed (rev $rev): $PAGE_URL" ;;
+    exists)
+      reason="$(field reason)"
+      req="$(field requested_id)"
+      case "$reason" in
+        idempotency_key) reason="an earlier try of this publish made it (same Idempotency-Key)" ;;
+        *) reason="you published the same content within the last day" ;;
+      esac
+      note "${label}no new page made: this content is already your page $PAGE_ID ($reason)${req:+, so the id $req was not created}: $PAGE_URL" ;;
+  esac
+  printf '%s\n' "$PAGE_URL"
+  # A page whose id is not the last part of its address (one from before ids
+  # were addresses, or whose name was taken as an id elsewhere): both work.
+  id_name="$(slug_from "$PAGE_URL")"
+  [ -z "$action" ] || [ "$id_name" = "$PAGE_ID" ] ||
+    note "${label}its id ($PAGE_ID) is not the last part of its address ($id_name); commands take the id or the whole address"
+  na="$(field not_applied)"
+  [ "$action" != exists ] || [ -z "$na" ] ||
+    note "${label}that page was left as it is, so what you asked for its $(printf '%s' "$na" | sed 's/,/, /g') was not applied; to change them, publish to it: foldrender publish $f --slug $PAGE_ID with those options"
+  dups="$(field duplicates)"
+  if [ -n "$dups" ] && [ "$dups" != 0 ]; then
+    note "${label}$dups other page(s) of yours have exactly this content: $(sed -n 's/^duplicate=//p' "$TMP/body" | tr '\t' ' ' | paste -sd ';' - | sed 's/;/; /g'). List them all: foldrender ls --duplicates"
+  fi
+  titles="$(field same_titles)"
+  if [ -n "$titles" ] && [ "$titles" != 0 ]; then
+    note "${label}you have $titles other page(s) titled \"${3:-this}\": $(sed -n 's/^same_title=//p' "$TMP/body" | tr '\t' ' ' | paste -sd ';' - | sed 's/;/; /g'). To update one of them instead: foldrender publish $f --slug ID"
+  fi
+  [ -n "$action" ] || return 0
+  note "${label}next: change it with foldrender publish $f --slug $PAGE_ID (or foldrender edit $PAGE_ID), read it with foldrender read $PAGE_ID, delete it with foldrender rm $PAGE_ID$([ "$action" = exists ] && printf '; to make a second page with this content anyway, add --allow-duplicate')"
 }
 
 # edit PAGE --old TEXT --new TEXT [...]: exact replacements in the page's HTML,
@@ -951,8 +1084,7 @@ cmd_edit() {
     return 0
   fi
   read_page_url
-  printf '%s\n' "$PAGE_URL"
-  publish_note ""
+  publish_report "" "" ""
 }
 
 # versions PAGE: the page's revision and the versions it kept, newest first,
@@ -1073,7 +1205,7 @@ cmd_share() {
 # --all or -n N. WORDS must all be in the id, title or address (any case);
 # --access keeps one kind, --folder one folder; --long adds each address.
 cmd_list() {
-  local words="" limit=20 access="" folder="" long="" as_json=""
+  local words="" limit=20 access="" folder="" long="" as_json="" dups=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --all|-a) limit=0; shift ;;
@@ -1084,11 +1216,13 @@ cmd_list() {
         shift 2 ;;
       --folder) need $# "$1"; check_name "$2" --folder; folder="$2"; shift 2 ;;
       --long|-l) long=1; shift ;;
+      --duplicates) dups=1; shift ;;
       --json) as_json=1; shift ;;
       -*) die 2 "unknown option: $1" ;;
       *) words="$words $1"; shift ;;
     esac
   done
+  [ -z "$dups" ] || { list_duplicates "$as_json"; return; }
   if [ -n "$as_json" ]; then
     ACCEPT="application/json"
     api_auth GET /api/artifacts
@@ -1103,9 +1237,12 @@ cmd_list() {
     printf 'No pages yet.\n'
     return 0
   fi
-  # The list: id, access, updated (ISO), expires or "-", title, address.
-  awk -F'\t' -v words="$words" -v access="$access" -v folder="$folder" -v limit="$limit" -v long="$long" '
-    BEGIN { nw = split(tolower(words), w, " ") }
+  # The list: id, access, updated (ISO), expires or "-", title, address. The
+  # table has both names of each page, its id (what commands take, as they take
+  # the address) and its address. --long is what the table always is now.
+  : "$long"
+  awk -F'\t' -v words="$words" -v access="$access" -v folder="$folder" -v limit="$limit" '
+    BEGIN { nw = split(tolower(words), w, " "); wid = 2; aw = 7 }
     {
       hay = tolower($1 " " $5 " " $6)
       for (i = 1; i <= nw; i++) if (index(hay, w[i]) == 0) next
@@ -1113,42 +1250,99 @@ cmd_list() {
       if (folder != "" && index($6, "/" folder "/") == 0) next
       n++
       if (limit > 0 && n > limit) next
-      id[n] = $1; acc[n] = $2; t[n] = $5; addr[n] = $6
+      id[n] = $1; acc[n] = $2; t[n] = $5; addr[n] = ($6 == "" ? "-" : $6)
       up[n] = substr($3, 1, 10) " " substr($3, 12, 5)
       ex[n] = ($4 != "-" && $4 != "") ? "  (expires " substr($4, 1, 10) ")" : ""
       if (length($1) > wid) wid = length($1)
+      if (length(addr[n]) > aw) aw = length(addr[n])
     }
     END {
       shown = (limit > 0 && n > limit) ? limit : n
       if (shown == 0) { print (NR ? "No page matches." : "No pages yet."); exit }
-      printf "%-" wid "s  %-7s  %-16s  %s\n", "ID", "ACCESS", "UPDATED (UTC)", "TITLE"
+      printf "%-" wid "s  %-7s  %-16s  %-" aw "s  %s\n", "ID", "ACCESS", "UPDATED (UTC)", "ADDRESS", "TITLE"
       for (i = 1; i <= shown; i++) {
-        printf "%-" wid "s  %-7s  %-16s  %s%s\n", id[i], acc[i], up[i], t[i], ex[i]
-        if (long != "" && addr[i] != "" && addr[i] != "-") printf "%-" wid "s  %s\n", "", addr[i]
+        printf "%-" wid "s  %-7s  %-16s  %-" aw "s  %s%s\n", id[i], acc[i], up[i], addr[i], t[i], ex[i]
       }
       if (n > shown) printf "%d more: foldrender ls --all, or narrow it: foldrender ls WORDS\n", n - shown
     }' "$TMP/body"
 }
 
+# ls --duplicates [--json]: the account's pages that share their content with
+# another of its pages, in groups, the oldest first, and the command that would
+# delete the rest of each group. It deletes nothing.
+list_duplicates() {
+  [ -z "$1" ] || ACCEPT="application/json"
+  api_auth GET "/api/artifacts?duplicates=1"
+  ACCEPT="text/plain"
+  [ "$STATUS" != 503 ] || die 1 "this server cannot compare pages ($(error_text))"
+  expect_2xx
+  if [ -n "$1" ]; then
+    cat "$TMP/body"
+    printf '\n'
+    return 0
+  fi
+  # A line a page: hash, id, access, created, updated, address, title; then
+  # "unhashed<TAB>N".
+  awk -F'\t' '
+    BEGIN { wid = 2; aw = 7 }
+    $1 == "unhashed" { unhashed = $2 + 0; next }
+    NF >= 7 {
+      if ($1 != h) { g++; h = $1; hash[g] = $1; n[g] = 0; rest[g] = "" }
+      k = ++n[g]
+      id[g, k] = $2; acc[g, k] = $3; made[g, k] = substr($4, 1, 10) " " substr($4, 12, 5); addr[g, k] = $6; t[g, k] = $7
+      if (k > 1) rest[g] = rest[g] " " $2
+      if (length($2) > wid) wid = length($2)
+      if (length($6) > aw) aw = length($6)
+    }
+    END {
+      if (g == 0) print "No duplicates: no two of your pages have the same content."
+      else printf "%d group(s) of your pages have the same content; in each the first is the oldest. Nothing was deleted.\n", g
+      for (i = 1; i <= g; i++) {
+        printf "\nsame content (%s), %d pages:\n", substr(hash[i], 1, 12), n[i]
+        printf "  %-" wid "s  %-7s  %-16s  %-" aw "s  %s\n", "ID", "ACCESS", "CREATED (UTC)", "ADDRESS", "TITLE"
+        for (k = 1; k <= n[i]; k++) printf "  %-" wid "s  %-7s  %-16s  %-" aw "s  %s\n", id[i, k], acc[i, k], made[i, k], addr[i, k], t[i, k]
+        printf "  to keep the oldest and delete the others: foldrender rm%s\n", rest[i]
+      }
+      if (unhashed > 0) printf "\n%d page(s) published before content fingerprints were not compared.\n", unhashed
+    }' "$TMP/body"
+}
+
+# rm PAGE...: one line a page on stdout, saying which page went by both its
+# names (id and address) and its title; --json the API's answer, one a line.
 cmd_rm() {
-  [ $# -ge 1 ] || die 2 "usage: foldrender rm PAGE..."
-  local t failed=0
+  local t failed=0 as_json="" targets=() url title
   for t in "$@"; do
-    case "$t" in -*) die 2 "unknown option: $t" ;; esac
+    case "$t" in
+      --json) as_json=1 ;;
+      -*) die 2 "unknown option: $t" ;;
+      *) targets+=("$t") ;;
+    esac
   done
-  for t in "$@"; do
+  [ ${#targets[@]} -ge 1 ] || die 2 "usage: foldrender rm PAGE... [--json]"
+  for t in "${targets[@]}"; do
     page_id "$t"
     check_slug "$PAGE_ID"
     api_auth DELETE "/api/artifacts/$PAGE_ID"
     if [ "$STATUS" = 404 ]; then
       map_forget 2 "$PAGE_ID"
-      note "not found: $PAGE_ID"
+      note "not deleted: no page $PAGE_ID among yours"
       failed=1
       continue
     fi
     expect_2xx
     map_forget 2 "$PAGE_ID"
-    printf 'removed %s\n' "$PAGE_ID"
+    if [ -n "$as_json" ]; then
+      cat "$TMP/body"
+      printf '\n'
+      continue
+    fi
+    url="$(json_get str url 2>/dev/null)"
+    title="$(json_get str title 2>/dev/null)"
+    if [ -n "$url" ]; then
+      printf 'deleted page %s ("%s"); %s no longer opens\n' "$PAGE_ID" "$title" "$url"
+    else
+      printf 'deleted page %s\n' "$PAGE_ID"
+    fi
   done
   [ "$failed" = 0 ] || exit 1
 }
@@ -1908,6 +2102,123 @@ cmd_canvas_edit() {
   done
 }
 
+#   ------------------------------------------------------------------ answers
+
+# answers PAGE: the page's questions (its data-fr-choice blocks) and what the
+# people who may answer them (its owner, its collaborators) answered, on the
+# page, in a browser: the latest per person, with the suggestion, right or
+# wrong, a note, and what it changed from. Text by default (the server lays it
+# out), --json for the API's answer. An answer counts once its undo window
+# (6 s) is over; reading them with a token marks them read by an agent, which
+# the page shows. --wait waits until there is an answer no agent has read yet
+# (or, with --after N, one newer than answer N), up to --timeout seconds
+# (default 600; exit 11 when none came). --notify NAME says whom the owner's
+# relay tells of new answers on this page ("-" no one, "default" the page's own
+# fr-choice-notify), --clear deletes every answer on the page (owner).
+# answers --inbox lists the answers on your pages nobody has been told of yet,
+# one a line: id, page, whom to tell, question, answer, who, when; --ack
+# ID[,ID...] --to NAME marks them told (a relay's two steps).
+cmd_answers() {
+  local target="" mode=text wait="" timeout=600 after="" notify="" clear="" inbox="" ack="" to="" slug q started left n body
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) mode=json; shift ;;
+      --wait) wait=1; shift ;;
+      --timeout)
+        need $# "$1"
+        case "$2" in ''|*[!0-9]*) die 2 "--timeout takes seconds" ;; esac
+        timeout="$2"; shift 2 ;;
+      --after)
+        need $# "$1"
+        case "$2" in ''|*[!0-9]*) die 2 "--after takes an answer's number (the latest: line of the last answers)" ;; esac
+        after="$2"; shift 2 ;;
+      --notify) need $# "$1"; notify="$2"; shift 2 ;;
+      --clear) clear=1; shift ;;
+      --inbox) inbox=1; shift ;;
+      --ack) need $# "$1"; ack="$2"; shift 2 ;;
+      --to) need $# "$1"; to="$2"; shift 2 ;;
+      -*) die 2 "unknown option: $1" ;;
+      *) [ -z "$target" ] || die 2 "answers takes one page"; target="$1"; shift ;;
+    esac
+  done
+  require_token
+  [ "$mode" != json ] || ACCEPT="application/json"
+  if [ -n "$inbox" ] || [ -n "$ack" ]; then
+    [ -z "$target" ] || die 2 "--inbox and --ack are about all your pages; drop the page"
+    if [ -n "$ack" ]; then
+      case "$ack" in *[!0-9,]*|,*|*,) die 2 "--ack takes answer ids, comma separated" ;; esac
+      [ -z "$to" ] || case "$to" in *[!A-Za-z0-9_.@-]*) die 2 "--to is a name: letters, digits, . _ - @" ;; esac
+      printf '{"ids":[%s],"to":%s}' "$ack" "$(json_arg "$to")" > "$TMP/req"
+      api_auth POST "/api/choices/inbox" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+      expect_2xx
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      printf 'marked %s told\n' "$(sed -n 's/.*"marked" *: *\([0-9]*\).*/\1/p' "$TMP/body")"
+      return 0
+    fi
+    api_auth GET "/api/choices/inbox"
+    expect_2xx
+    cat "$TMP/body"
+    [ "$mode" != json ] || printf '\n'
+    return 0
+  fi
+  [ -n "$target" ] || die 2 "usage: foldrender answers PAGE [--wait [--after N] [--timeout S]] [--json] | --notify NAME | --clear; foldrender answers --inbox | --ack IDS --to NAME"
+  page_id "$target"
+  slug="$PAGE_ID"
+  check_slug "$slug"
+  q="${PAGE_K:+?k=$PAGE_K}"
+  if [ -n "$clear" ]; then
+    api_auth DELETE "/api/artifacts/$slug/choices$q"
+    [ "$STATUS" != 404 ] || die 7 "no page named $slug among yours"
+    expect_2xx
+    printf 'cleared %s answers on %s\n' "$(sed -n 's/.*"cleared" *: *\([0-9]*\).*/\1/p' "$TMP/body")" "$target"
+    return 0
+  fi
+  if [ -n "$notify" ]; then
+    case "$notify" in
+      default) body='{"to":null}' ;;
+      -) body='{"to":"-"}' ;;
+      *[!A-Za-z0-9_.@-]*) die 2 "--notify is a name: letters, digits, . _ - @ (or - for no one, default for the page's own)" ;;
+      *) body="{\"to\":\"$notify\"}" ;;
+    esac
+    printf '%s' "$body" > "$TMP/req"
+    api_auth PUT "/api/artifacts/$slug/choices/notify$q" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+    [ "$STATUS" != 404 ] || die 7 "no page named $slug among yours"
+    expect_2xx
+    case "$notify" in
+      default) printf 'new answers on %s are told as the page says (its fr-choice-notify)\n' "$target" ;;
+      -) printf 'new answers on %s are told to no one\n' "$target" ;;
+      *) printf 'new answers on %s are told to %s\n' "$target" "$notify" ;;
+    esac
+    return 0
+  fi
+  started="$(date +%s)"
+  while :; do
+    q="${PAGE_K:+k=$PAGE_K&}"
+    [ -z "$after" ] || q="${q}after=$after&"
+    if [ -n "$wait" ]; then
+      left=$((timeout - ($(date +%s) - started)))
+      [ "$left" -gt 0 ] || left=0
+      [ "$left" -le 25 ] || left=25
+      q="${q}wait=$left&"
+    fi
+    q="${q%&}"
+    api_auth GET "/api/artifacts/$slug/choices${q:+?$q}"
+    case "$STATUS" in
+      404) die 7 "no page named $slug, or you may not answer it (the owner and collaborators may)" ;;
+    esac
+    expect_2xx
+    n="$(header_value x-fr-new)"
+    if [ -z "$wait" ] || [ "${n:-0}" -gt 0 ]; then
+      cat "$TMP/body"
+      [ "$mode" != json ] || printf '\n'
+      return 0
+    fi
+    if [ $(($(date +%s) - started)) -ge "$timeout" ]; then
+      die 11 "no new answer on $target in $timeout seconds (foldrender answers $target shows them all)"
+    fi
+  done
+}
+
 cmd_help() {
   case "${1:-}" in
     '') cat <<'EOF'
@@ -1917,25 +2228,34 @@ foldrender publishes HTML pages as links and reads pages back as text.
   edit PAGE            change part of a page: --old TEXT --new TEXT
   read PAGE            the page as Markdown, with its annotations (notes, marks,
                        ink) when signed in; stops at ~6k tokens (--section N)
-  ls [WORDS]           your newest 20 pages (--all, --access A, --folder F)
+  ls [WORDS]           your newest pages, id and address (--all, --duplicates)
   share PAGE...        +login -login --public --link --private --reset-link
   versions PAGE        kept versions; restore PAGE VERSION; undo PAGE
   canvas FILE|PAGE...  a canvas with these as cards (up to 24), --note, --link
   canvas edit CANVAS   add or remove cards, notes and connectors in one step
+  answers PAGE         what people answered to the page's questions
+                       (data-fr-choice); --wait waits for a new answer
   rm PAGE...           delete pages
   open PAGE            print the page's address and open it
   login / logout / whoami / export [FILE] / account delete / version
 
 PAGE is a page's address, its id, or an old a.foldrender.dev link.
 --json prints the API's answer. More: foldrender help COMMAND (or COMMAND
---help), foldrender help exit.
+--help), foldrender help choices (questions on a page), foldrender help exit.
 EOF
     ;;
     publish) cat <<'EOF'
 foldrender publish FILE...|- [options]
-  Publishes each file and prints its address, one line a page. Publishing the
-  same file again updates the same page; stderr says the revision and the lines
-  added and removed, or "unchanged" (nothing is written then).
+  Publishes each file and prints its address, one line a page. stderr says
+  first, in one line, what happened: "created a new page", "updated page ID in
+  place" (with the lines added and removed), "already had this content" (nothing
+  written), or "no new page made: this content is already your page ID" (you
+  published the same page within the last day, or this is a retry of a publish
+  that did arrive); then other pages of yours with the same content or title,
+  and the commands to change, read or delete the page.
+  Publishing the same file again updates the same page. A retry never makes a
+  second page: each publish carries an Idempotency-Key, sent again on a retry
+  (a dropped connection is retried twice by itself).
   --private            only you (the default for a new page)
   --link               anyone with the link; the link carries a key (?k=)
   --public             anyone, and listed on your page .../artifacts/LOGIN/
@@ -1943,8 +2263,17 @@ foldrender publish FILE...|- [options]
   --name NAME          the address's last part (default: from the title)
   --folder FOLDER      .../artifacts/LOGIN/FOLDER/NAME
   --title TEXT         the title (default: the file's <title>)
-  --slug ID|ADDRESS    publish to that page
-  --json               the API's answer, one JSON object a page
+  --slug ID|ADDRESS    publish to that page: update yours, or make a page whose
+                       id and address (its last part) are ID. If ID is the
+                       address of another of your pages, nothing is made and
+                       the error says that page's id (exit 12)
+  --allow-duplicate    make a new page even if you have one with this content
+  --idempotency-key K  name this publish (8-120 of A-Z a-z 0-9 . _ : -): the
+                       same key within a day answers with the page it made
+  --json               the API's answer, one JSON object a page: action
+                       (created, updated, unchanged, exists), id, url, access,
+                       content_hash, duplicates and same_title (other pages of
+                       yours, {id, url}), requested_id and not_applied (exists)
 Examples: foldrender publish report.html --link
           foldrender publish a.html b.html c.html --folder q3
 EOF
@@ -1976,8 +2305,11 @@ foldrender read PAGE [options]
   its author, in a Notes section at the end (a canvas: in its map), and the
   facts say how many. Only the owner and collaborators see them; anyone else
   is told so.
-  --no-notes           leave the annotations out (--notes asks for them even
-                       when not signed in)
+  A page with questions (data-fr-choice) shows each where it stands, and,
+  signed in as its owner or a collaborator, an Answers section at the end
+  (foldrender answers PAGE for those alone, or to wait for them).
+  --no-notes           leave the annotations and answers out (--notes asks for
+                       them even when not signed in)
   --from N             go on from character N (the next: line says which)
   --max-tokens N       stop near N tokens; --max-chars N near N characters
   --all                no stop
@@ -1986,10 +2318,70 @@ foldrender read PAGE [options]
   --save FILE          save the stored HTML; --assets DIR save images and SVG
 EOF
     ;;
+    answers) cat <<'EOF'
+foldrender answers PAGE [--wait [--after N] [--timeout S]] [--json]
+foldrender answers PAGE --notify NAME|-|default
+foldrender answers PAGE --clear
+foldrender answers --inbox | --ack ID,ID --to NAME
+  A page asks questions with data-fr-choice blocks (foldrender help choices);
+  its owner and collaborators answer them on the page, signed in, with a tap.
+  This prints each question with its options and the answers: the latest per
+  person, with the suggestion, right or wrong, a note, what it changed from.
+  An answer counts once its undo window (6 s) is over. Reading them marks them
+  read by an agent, which the page shows.
+  --wait               wait for an answer no agent has read yet (returns at once
+                       if there is one); with --after N, for one newer than
+                       answer N (the latest: line says N)
+  --timeout S          stop waiting after S seconds (default 600; exit 11)
+  --notify NAME        whom the owner's relay tells of new answers on this page
+                       (over the page's own fr-choice-notify); - for no one,
+                       default for the page's own again
+  --clear              delete every answer on the page (owner; after a trial)
+  --inbox              answers on your pages nobody has been told of yet, one a
+                       line: id, page, whom to tell, question, answer, who, when
+  --ack IDS --to NAME  mark those told (a relay does --inbox, tells, --ack)
+  --json               the API's answer
+EOF
+    ;;
+    choices) cat <<'EOF'
+Questions on a page (data-fr-choice): plain HTML, no script. Its owner and
+collaborators get pressable options on the page; anyone else reads it as
+written. Answers come back with foldrender answers PAGE (and in read).
+  <div data-fr-choice="D1" data-fr-note="Anything to add?">
+    <h3 data-fr-question>Ship the fix tonight?</h3>
+    <p>Why it matters, what each answer leads to.</p>
+    <p>Suggested: ship it.</p>
+    <button data-fr-option="ship" data-fr-suggested>Ship it</button>
+    <button data-fr-option="wait">Wait for Monday</button>
+  </div>
+  data-fr-choice="ID"   the question's id (letters, digits, . _ -), unique
+  data-fr-option="V"    an answer, inside the block; its text is its label
+                        (or data-fr-label="..."); any element: button, span, li
+  data-fr-suggested     on the option you recommend (write it in the text too:
+                        readers without buttons see only the text)
+  data-fr-multi         any number of options, sent with a Send button
+  data-fr-note          the answerer may add a sentence (value: placeholder);
+                        a block with no options and data-fr-note is an open
+                        question
+  data-fr-question      the question's text (else the block's first heading)
+  data-fr-correct       a quiz: the right option(s); [data-fr-explain] inside
+                        shows once answered; data-fr-topic, data-fr-set group them
+  <meta name="fr-choice-notify" content="NAME">  whom to tell of new answers
+Up to 50 questions a page, 20 options each. Answering needs a person signed
+in on the page (the owner, or a collaborator: Share > Collaborate); a token
+never answers. To let someone else answer, share the page with them and turn
+on Collaborate.
+EOF
+    ;;
     ls|list) cat <<'EOF'
-foldrender ls [WORDS...] [--all|-n N] [--access public|link|private|shared] [--folder F] [--long] [--json]
-  Your pages, newest first: the 20 newest unless --all or -n N. WORDS must all
-  be in the id, title or address. --long adds each page's address.
+foldrender ls [WORDS...] [--all|-n N] [--access public|link|private|shared] [--folder F] [--json]
+  Your pages, newest first: the 20 newest unless --all or -n N, each with its
+  id (what commands take) and its address. WORDS must all be in the id, title
+  or address.
+foldrender ls --duplicates [--json]
+  Your pages that have the same content as another of yours, in groups, the
+  oldest first, with the rm command that would delete the others. Deletes
+  nothing.
 EOF
     ;;
     share) cat <<'EOF'
@@ -2025,9 +2417,10 @@ Examples:
 EOF
     ;;
     rm|delete) cat <<'EOF'
-foldrender rm PAGE...
+foldrender rm PAGE... [--json]
   Deletes each page: its address, its kept versions and its annotations. It
-  cannot be undone. Exit 1 if any page was not found (the others are deleted).
+  cannot be undone. Prints one line a page: "deleted page ID ("TITLE"); ADDRESS
+  no longer opens". Exit 1 if any page was not found (the others are deleted).
 EOF
     ;;
     open) cat <<'EOF'
@@ -2067,7 +2460,10 @@ Exit codes: 0 ok, 1 failed, 2 bad usage, 3 not signed in or token rejected,
 4 plan limit reached (or a canvas save limit), 5 page too large, 6 network
 failure, 7 no such page or not visible to this account, 8 page expired, 9 too
 large to read as text (use --html), 10 an edit did not apply (old text missing
-or not unique, the page moved on from --base, or a canvas edit was refused).
+or not unique, the page moved on from --base, or a canvas edit was refused),
+11 no new answer before --timeout (answers --wait), 12 the id or address
+publish was asked for is another page's (the error names the page and the
+command to update it).
 Environment: FOLDRENDER_TOKEN (a token instead of the saved login),
 FOLDRENDER_API (the API, for testing), FOLDRENDER_NO_BROWSER=1,
 FOLDRENDER_READ_MAX_TOKENS, FOLDRENDER_NO_UPDATE_NOTE=1 (never say that a
@@ -2089,7 +2485,7 @@ help_asked() {
       -h|--help) return 0 ;;
       --old|--new|--title|--name|--folder|--share|--slug|--edits|--patch|--base|--assets|--save|-o|\
       --section|--card|--from|--max-tokens|--max-chars|--meta|--access|-n|--add|--rm|--note|--owner|\
-      --confirm|--token) skip=1 ;;
+      --confirm|--token|--timeout|--after|--notify|--ack|--to|--idempotency-key) skip=1 ;;
       --link) [ "$cmd" != canvas ] || skip=1 ;;
     esac
   done
@@ -2100,7 +2496,7 @@ main() {
   local cmd="${1:-help}"
   [ $# -eq 0 ] || shift
   case "$cmd" in
-    login|logout|account|export|whoami|publish|edit|share|list|ls|read|cat|versions|restore|undo|canvas|rm|delete|open|version)
+    login|logout|account|export|whoami|publish|edit|share|list|ls|read|cat|versions|restore|undo|canvas|answers|rm|delete|open|version)
       if help_asked "$cmd" "$@"; then
         case "$cmd" in
           list) cmd_help ls ;;
@@ -2126,6 +2522,7 @@ main() {
     restore) cmd_restore "$@" ;;
     undo) cmd_undo "$@" ;;
     canvas) cmd_canvas "$@" ;;
+    answers) cmd_answers "$@" ;;
     rm|delete) cmd_rm "$@" ;;
     open) cmd_open "$@" ;;
     version|--version) printf 'foldrender %s\n' "$FR_CLI_VERSION" ;;
