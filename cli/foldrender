@@ -28,7 +28,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.13.1
+FR_CLI_VERSION=0.13.2
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -1287,21 +1287,23 @@ list_duplicates() {
     BEGIN { wid = 2; aw = 7 }
     $1 == "unhashed" { unhashed = $2 + 0; next }
     NF >= 7 {
-      if ($1 != h) { g++; h = $1; hash[g] = $1; n[g] = 0; rest[g] = "" }
+      if ($1 != h) { g++; h = $1; hash[g] = $1; n[g] = 0; rest[g] = ""; apart[g] = 0 }
       k = ++n[g]
       id[g, k] = $2; acc[g, k] = $3; made[g, k] = substr($4, 1, 10) " " substr($4, 12, 5); addr[g, k] = $6; t[g, k] = $7
+      if (k > 1 && (acc[g, k] != acc[g, 1] || t[g, k] != t[g, 1])) apart[g] = 1
       if (k > 1) rest[g] = rest[g] " " $2
       if (length($2) > wid) wid = length($2)
       if (length($6) > aw) aw = length($6)
     }
     END {
       if (g == 0) print "No duplicates: no two of your pages have the same content."
-      else printf "%d group(s) of your pages have the same content; in each the first is the oldest. Nothing was deleted.\n", g
+      else printf "%d group(s) of your pages have the same content; in each the first is the oldest. Nothing was deleted. Two pages can share content on purpose (a test page, another access or readers): ask the user before deleting any.\n", g
       for (i = 1; i <= g; i++) {
         printf "\nsame content (%s), %d pages:\n", substr(hash[i], 1, 12), n[i]
         printf "  %-" wid "s  %-7s  %-16s  %-" aw "s  %s\n", "ID", "ACCESS", "CREATED (UTC)", "ADDRESS", "TITLE"
         for (k = 1; k <= n[i]; k++) printf "  %-" wid "s  %-7s  %-16s  %-" aw "s  %s\n", id[i, k], acc[i, k], made[i, k], addr[i, k], t[i, k]
-        printf "  to keep the oldest and delete the others: foldrender rm%s\n", rest[i]
+        if (apart[i]) printf "  their access or titles differ, so they may be kept apart on purpose; if they are copies, keep the oldest: foldrender rm%s\n", rest[i]
+        else printf "  if they are copies, keep the oldest: foldrender rm%s\n", rest[i]
       }
       if (unhashed > 0) printf "\n%d page(s) published before content fingerprints were not compared.\n", unhashed
     }' "$TMP/body"
