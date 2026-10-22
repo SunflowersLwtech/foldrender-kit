@@ -10,6 +10,7 @@ This repository holds the released versions of:
 |---|---|
 | `skills/foldrender-artifacts/SKILL.md` | A skill that teaches AI coding tools which read `SKILL.md` skills how to use the `foldrender` command |
 | `cli/foldrender` | The `foldrender` command. It needs only bash and curl, and runs on macOS and Linux |
+| `cli/foldrender-bridge.mjs` | What `foldrender bridge` runs: a Node 22+ program the command fetches from the site and checks against the SHA-256 it pins |
 | `install.sh` | The installer served at `https://foldrender.dev/install.sh` |
 
 Later additions for FoldRender (plugins, MCP servers, examples) will live here too.
@@ -73,6 +74,7 @@ FoldRender Kit 收录 [FoldRender Artifacts](https://foldrender.dev/zh/artifacts
 
 - `skills/foldrender-artifacts/SKILL.md`：给支持 `SKILL.md` 技能的 AI 编程工具使用的技能，教它们如何调用 `foldrender` 命令。
 - `cli/foldrender`：`foldrender` 命令，只依赖 bash 和 curl，可在 macOS 和 Linux 上运行。
+- `cli/foldrender-bridge.mjs`：`foldrender bridge` 运行的程序（Node 22 以上），命令从网站取下后按它钉住的 SHA-256 校验。
 - `install.sh`：`https://foldrender.dev/install.sh` 提供的安装脚本。
 
 三种安装方式：

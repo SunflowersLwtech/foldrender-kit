@@ -28,11 +28,11 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.14.0
-# The bridge `foldrender bridge` runs (foldrender-bridge.mjs, served beside this
-# file): the sha256 of the one this version was made with. A bridge that does
-# not match is not run.
-FR_BRIDGE_SHA256=68d6f2c0b25c2430c71fc8d8670ee4e4e128bca9aeea950fe666484b8f7b9055
+FR_CLI_VERSION=0.14.2
+# The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
+# is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
+# version was made with. A bridge that does not match is not run.
+FR_BRIDGE_SHA256=29ba3c078da7a6a0960f9924483244dc001a08c435e476aecec67a718ab368dd
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -2258,7 +2258,9 @@ cmd_bridge() {
     file="$cache/bridge-$FR_BRIDGE_SHA256.mjs"
     if [ ! -f "$file" ] || [ "$(sha256_of "$file")" != "$FR_BRIDGE_SHA256" ]; then
       mkdir -p "$cache" || die 1 "cannot make $cache"
-      url="${API%/artifacts}/install/foldrender-bridge.mjs"
+      # By its sha256: every released bridge stays on the site under its own
+      # name, so an older foldrender keeps the bridge it was made with.
+      url="${API%/artifacts}/install/bridge/$FR_BRIDGE_SHA256.mjs"
       curl -fsS --connect-timeout 15 --max-time 120 -o "$TMP/bridge.mjs" "$url" 2>"$TMP/err" || die 6 "cannot fetch the bridge from $url ($(curl_error))"
       got="$(sha256_of "$TMP/bridge.mjs")"
       [ "$got" = "$FR_BRIDGE_SHA256" ] || die 1 "the bridge at $url is not the one this foldrender ($FR_CLI_VERSION) runs; update foldrender: curl -fsSL ${API%/artifacts}/install.sh | sh"
@@ -2406,7 +2408,11 @@ foldrender bridge --page PAGE [--dir DIR] [--agent claude]
   with the agent beside the page, in a browser; it reads the page with
   foldrender read, works in DIR, and asks before it acts as its own settings
   say. Its questions go to the page, where only you (the owner, who runs it)
-  answer them. Messages sent while the bridge is away wait for it.
+  answer them. Messages sent while the bridge is away wait for it. The page's
+  Markdown panel (its plan) is kept in DIR/.foldrender/PAGE/plan.md: the
+  agent's edit there is written back to the panel, and if someone changed the
+  panel meanwhile, the people on the page choose which text stays; the text
+  not taken is kept beside plan.md and in the conversation.
   Only the page's owner runs a bridge on a page; a second one (another
   computer) takes over from the first. FoldRender runs no model: the agent
   runs here, signed in as you.
