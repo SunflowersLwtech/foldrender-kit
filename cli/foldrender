@@ -28,11 +28,11 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.14.2
+FR_CLI_VERSION=0.15.0
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=29ba3c078da7a6a0960f9924483244dc001a08c435e476aecec67a718ab368dd
+FR_BRIDGE_SHA256=d3c5790e8537d73f61a7456fc997fcf77f17c7b072d5f414d45beedaa25c01c4
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -2225,6 +2225,293 @@ cmd_answers() {
   done
 }
 
+# foldrender desk ...: the desk, a private page of yours that shows what waits
+# on you, what runs, the machines and seats, and what comes next. Your agents
+# write it with tokens of its own (desk token add); you answer on the page. A
+# desk token is read from FOLDRENDER_DESK_TOKEN, never from the command line;
+# without one, the saved sign-in is used.
+DESK_ID=""
+desk_auth() {
+  if [ -n "${FOLDRENDER_DESK_TOKEN:-}" ]; then
+    case "$FOLDRENDER_DESK_TOKEN" in frdk_*) ;; *) die 2 "FOLDRENDER_DESK_TOKEN is a desk token (frdk_...)" ;; esac
+    ( umask 077 && printf 'Authorization: Bearer %s\n' "$FOLDRENDER_DESK_TOKEN" > "$TMP/dauth" ) || die 1 "cannot write $TMP/dauth"
+    printf '@%s' "$TMP/dauth"
+  else
+    require_token
+    auth_header
+  fi
+}
+desk_api() {
+  local method="$1" path="$2"
+  shift 2
+  api "$method" "/api/desk/$DESK_ID$path" -H "$(desk_auth)" "$@"
+}
+# A desk's answer that is not 2xx, with what the server said.
+desk_fail() {
+  local msg why
+  msg="$(error_text)"
+  # The server says why on a message: line (or in a JSON message field).
+  why="$(sed -n -e 's/^message: *//p' -e 's/.*"message" *: *"\([^"]*\)".*/\1/p' "$TMP/body" | head -n 1)"
+  case "$STATUS" in
+    401) die 3 "not signed in, or the token was rejected ($msg)" ;;
+    404) die 7 "no desk $DESK_ID that this token or sign-in may use (foldrender desk init makes one; --desk names another)" ;;
+    409) die 1 "$msg${why:+: $why}" ;;
+    422) die 1 "refused ($msg)${why:+: $why}" ;;
+    429) die 1 "${why:-$msg}" ;;
+    *) fail_http ;;
+  esac
+}
+# A date and time as given (with its zone), or a date (end of that day) or a
+# date and time without a zone, in this computer's zone.
+desk_when() {
+  local z
+  z="$(date +%z)"
+  z="${z%??}:${z#???}"
+  case "$1" in
+    ????-??-??) printf '%sT23:59:00%s' "$1" "$z" ;;
+    ????-??-??T??:??) printf '%s:00%s' "$1" "$z" ;;
+    ????-??-??T??:??:??) printf '%s%s' "$1" "$z" ;;
+    ????-??-??T*Z|????-??-??T*[+-]??:??) printf '%s' "$1" ;;
+    *) die 2 "a time is 2026-10-23, 2026-10-23T10:00 or an ISO date and time: $1" ;;
+  esac
+}
+# links as JSON: each --link URL[=LABEL].
+desk_links() {
+  local out="" l url label
+  for l in "$@"; do
+    case "$l" in *=*) url="${l%=*}"; label="${l##*=}" ;; *) url="$l"; label="" ;; esac
+    case "$label" in */*) url="$l"; label="" ;; esac
+    out="$out${out:+,}{\"url\":$(json_arg "$url"),\"label\":$(json_arg "${label:-page}")}"
+  done
+  printf '[%s]' "$out"
+}
+desk_written() {
+  [ "$1" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+  grep -o '"key":"[^"]*","rev":[0-9]*' "$TMP/body" | sed 's/"key":"\([^"]*\)","rev":\([0-9]*\)/wrote \1 (revision \2)/'
+  grep -q '"unchanged":[1-9]' "$TMP/body" && printf 'unchanged: %s\n' "$(sed -n 's/.*"unchanged":\([0-9]*\).*/\1/p' "$TMP/body")"
+  return 0
+}
+
+cmd_desk() {
+  local sub="${1:-}" mode=text key="" a
+  [ $# -eq 0 ] || shift
+  DESK_ID="${FOLDRENDER_DESK:-desk}"
+  # --desk and --json may come anywhere.
+  local rest=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --desk) need $# "$1"; DESK_ID="$2"; shift 2 ;;
+      --json) mode=json; shift ;;
+      *) rest+=("$1"); shift ;;
+    esac
+  done
+  set -- ${rest[@]+"${rest[@]}"}
+  case "$DESK_ID" in http://*|https://*) page_id "$DESK_ID"; DESK_ID="$PAGE_ID" ;; esac
+  check_slug "$DESK_ID"
+  case "$sub" in
+    init)
+      local name="" title="" lang=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --name) need $# "$1"; name="$2"; shift 2 ;;
+          --title) need $# "$1"; title="$2"; shift 2 ;;
+          --lang) need $# "$1"; lang="$2"; shift 2 ;;
+          *) die 2 "desk init takes --name, --title, --lang en|zh" ;;
+        esac
+      done
+      [ -z "$name" ] || check_name "$name" --name
+      printf '{%s}' "$(printf '"name":%s' "$(json_arg "${name:-desk}")")${title:+,\"title\":$(json_arg "$title")}${lang:+,\"lang\":$(json_arg "$lang")}" > "$TMP/req"
+      api_auth POST "/api/desk" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+      expect_2xx
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      sed -n 's/.*"url" *: *"\([^"]*\)".*/\1/p' "$TMP/body"
+      local id
+      id="$(sed -n 's/.*"slug" *: *"\([^"]*\)".*/\1/p' "$TMP/body")"
+      if grep -q '"created":true' "$TMP/body"; then note "made your desk, id $id; give it agents with: foldrender desk token add --role agent --name NAME"
+      else note "you have this desk already, id $id"; fi
+      [ "$id" = desk ] || note "its id is $id: pass --desk $id (or set FOLDRENDER_DESK=$id) to the other desk commands"
+      ;;
+    token)
+      local op="${1:-ls}" role="" name=""
+      [ $# -eq 0 ] || shift
+      case "$op" in
+        add)
+          while [ $# -gt 0 ]; do
+            case "$1" in
+              --role) need $# "$1"; role="$2"; shift 2 ;;
+              --name) need $# "$1"; name="$2"; shift 2 ;;
+              *) die 2 "desk token add --role feed|agent --name NAME" ;;
+            esac
+          done
+          case "$role" in feed|agent) ;; *) die 2 "--role is feed (sends snapshots, reads nothing) or agent (asks, tasks, reads the answers)" ;; esac
+          [ -n "$name" ] || die 2 "--name names who holds it, e.g. --name secretary"
+          printf '{"role":"%s","name":%s}' "$role" "$(json_arg "$name")" > "$TMP/req"
+          require_token
+          api POST "/api/desk/$DESK_ID/tokens" -H "$(auth_header)" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+          [ "${STATUS#2}" != "$STATUS" ] || desk_fail
+          [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+          sed -n 's/.*"token" *: *"\(frdk_[^"]*\)".*/\1/p' "$TMP/body"
+          note "a $role token for desk $DESK_ID, id $(sed -n 's/.*"id" *: *"\([0-9a-f]*\)".*/\1/p' "$TMP/body"); shown once. Keep it where the agent reads it (FOLDRENDER_DESK_TOKEN from a secret store or a 600 file), never in a command line. Revoke: foldrender desk token rm ID"
+          ;;
+        ls)
+          ACCEPT="text/plain"
+          [ "$mode" != json ] || ACCEPT="application/json"
+          require_token
+          api GET "/api/desk/$DESK_ID/tokens" -H "$(auth_header)"
+          [ "${STATUS#2}" != "$STATUS" ] || desk_fail
+          cat "$TMP/body"
+          ;;
+        rm)
+          [ $# -ge 1 ] || die 2 "desk token rm ID"
+          case "$1" in *[!0-9a-f]*|'') die 2 "a token's id is 16 hex characters (desk token ls)" ;; esac
+          require_token
+          api DELETE "/api/desk/$DESK_ID/tokens/$1" -H "$(auth_header)"
+          [ "${STATUS#2}" != "$STATUS" ] || desk_fail
+          printf 'revoked %s\n' "$1"
+          ;;
+        *) die 2 "desk token add | ls | rm" ;;
+      esac
+      ;;
+    ask|task|timer|known)
+      key="${1:-}"
+      [ $# -eq 0 ] || shift
+      case "$key" in ''|-*) die 2 "desk $sub KEY ...: KEY names the thing (letters, digits, . _ : -), the same key again changes it" ;; esac
+      local title="" product="" state="" context="" suggest="" deadline="" need="" heavy="" input="" device="" minutes="" session="" next="" at="" star="" match="" until="" reply="" base=""
+      local opts=() links=()
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --title) need $# "$1"; title="$2"; shift 2 ;;
+          --product) need $# "$1"; product="$2"; shift 2 ;;
+          --state) need $# "$1"; state="$2"; shift 2 ;;
+          --context) need $# "$1"; context="$2"; shift 2 ;;
+          --suggest) need $# "$1"; suggest="$2"; shift 2 ;;
+          --option) need $# "$1"; opts+=("$2"); shift 2 ;;
+          --deadline) need $# "$1"; deadline="$(desk_when "$2")" || exit 2; shift 2 ;;
+          --hands) need=hands; shift ;;
+          --heavy) heavy=1; shift ;;
+          --input) input=1; shift ;;
+          --device) need $# "$1"; device="$2"; shift 2 ;;
+          --minutes) need $# "$1"; minutes="$2"; shift 2 ;;
+          --session) need $# "$1"; session="$2"; shift 2 ;;
+          --next) need $# "$1"; next="$2"; shift 2 ;;
+          --at) need $# "$1"; at="$(desk_when "$2")" || exit 2; shift 2 ;;
+          --star) star=1; shift ;;
+          --match) need $# "$1"; match="$2"; shift 2 ;;
+          --note) need $# "$1"; [ "$sub" = known ] && title="$2" || die 2 "--note is for desk known and desk done"; shift 2 ;;
+          --until) need $# "$1"; until="$(desk_when "$2")" || exit 2; shift 2 ;;
+          --link) need $# "$1"; links+=("$2"); shift 2 ;;
+          --reply-url) need $# "$1"; reply="$2"; shift 2 ;;
+          --base) need $# "$1"; case "$2" in ''|*[!0-9]*) die 2 "--base is the revision you read" ;; esac; base="$2"; shift 2 ;;
+          *) die 2 "desk $sub: unknown option $1 (foldrender help desk)" ;;
+        esac
+      done
+      [ -n "$title" ] || die 2 "desk $sub needs --title (desk known: --note)"
+      case "$minutes" in ''|[0-9]|[0-9][0-9]|[0-9][0-9][0-9]) ;; *) die 2 "--minutes is a number" ;; esac
+      [ ${#opts[@]} -le 3 ] || die 2 "at most 3 --option"
+      local body="" i=1 o ol=""
+      for o in ${opts[@]+"${opts[@]}"}; do ol="$ol${ol:+,}{\"id\":\"o$i\",\"label\":$(json_arg "$o")}"; i=$((i + 1)); done
+      [ -z "$context" ] || body="$body,\"context\":$(json_arg "$context")"
+      [ -z "$suggest" ] || body="$body,\"suggest\":$(json_arg "$suggest")"
+      [ -z "$ol" ] || body="$body,\"options\":[$ol]"
+      [ -z "$deadline" ] || body="$body,\"deadline\":$(json_arg "$deadline")"
+      [ -z "$need" ] || body="$body,\"need\":\"hands\""
+      [ -z "$heavy" ] || body="$body,\"heavy\":true"
+      [ -z "$input" ] || body="$body,\"input\":true"
+      [ -z "$device" ] || body="$body,\"device\":$(json_arg "$device")"
+      [ -z "$minutes" ] || body="$body,\"minutes\":$minutes"
+      [ -z "$session" ] || body="$body,\"session\":$(json_arg "$session")"
+      [ -z "$next" ] || body="$body,\"next_check\":$(json_arg "$next")"
+      [ -z "$at" ] || body="$body,\"at\":$(json_arg "$at")"
+      [ -z "$star" ] || body="$body,\"star\":true"
+      [ -z "$match" ] || body="$body,\"match\":$(json_arg "$match")"
+      [ -z "$until" ] || body="$body,\"until\":$(json_arg "$until")"
+      [ -z "$reply" ] || body="$body,\"reply_url\":$(json_arg "$reply")"
+      [ ${#links[@]} -eq 0 ] || body="$body,\"links\":$(desk_links "${links[@]}")"
+      [ "$sub" != task ] || [ -n "$state" ] || state=doing
+      printf '{"items":[{"key":%s,"kind":"%s","title":%s%s%s%s,"body":{%s}}]}' \
+        "$(json_arg "$key")" "$sub" "$(json_arg "$title")" "${product:+,\"product\":$(json_arg "$product")}" "${state:+,\"state\":$(json_arg "$state")}" "${base:+,\"base\":$base}" "${body#,}" > "$TMP/req"
+      desk_api POST /items -H "Content-Type: application/json" --data-binary "@$TMP/req"
+      [ "${STATUS#2}" != "$STATUS" ] || desk_fail
+      desk_written "$mode"
+      ;;
+    done|rm)
+      local keys=() note="" k list=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --note) need $# "$1"; [ "$sub" = done ] || die 2 "--note is for desk done"; note="$2"; shift 2 ;;
+          -*) die 2 "desk $sub KEY... ${sub/done/[--note TEXT]}" ;;
+          *) keys+=("$1"); shift ;;
+        esac
+      done
+      [ ${#keys[@]} -ge 1 ] || die 2 "desk $sub KEY..."
+      for k in "${keys[@]}"; do
+        if [ "$sub" = done ]; then list="$list${list:+,}{\"key\":$(json_arg "$k")${note:+,\"note\":$(json_arg "$note")}}"
+        else list="$list${list:+,}$(json_arg "$k")"; fi
+      done
+      if [ "$sub" = done ]; then printf '{"done":[%s]}' "$list" > "$TMP/req"; else printf '{"remove":[%s]}' "$list" > "$TMP/req"; fi
+      desk_api POST /items -H "Content-Type: application/json" --data-binary "@$TMP/req"
+      [ "${STATUS#2}" != "$STATUS" ] || desk_fail
+      if [ "$mode" = json ]; then cat "$TMP/body"; printf '\n'
+      elif [ "$sub" = done ]; then printf 'done: %s\n' "${keys[*]}"
+      else printf 'removed: %s\n' "$(sed -n 's/.*"removed":\[\([^]]*\)\].*/\1/p' "$TMP/body" | tr -d '"' | sed 's/,/ /g')"; fi
+      ;;
+    feed)
+      local source="${1:-}" file="${2:-}"
+      case "$source" in ''|*[!a-z0-9-]*|-*) die 2 "desk feed SOURCE FILE.json|-: SOURCE is lowercase letters, digits and -" ;; esac
+      [ -n "$file" ] || die 2 "desk feed SOURCE FILE.json|- (the file: {\"every_s\": 60, \"items\": [...]})"
+      if [ "$file" = - ]; then cat > "$TMP/feed"; file="$TMP/feed"; fi
+      [ -f "$file" ] || die 2 "no file $file"
+      desk_api PUT "/feed/$source" -H "Content-Type: application/json" --data-binary "@$file"
+      [ "${STATUS#2}" != "$STATUS" ] || desk_fail
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      printf 'feed %s: %s things, %s changed, %s removed\n' "$source" "$(sed -n 's/.*"items":\([0-9]*\).*/\1/p' "$TMP/body")" "$(sed -n 's/.*"changed":\([0-9]*\).*/\1/p' "$TMP/body")" "$(sed -n 's/.*"removed":\([0-9]*\).*/\1/p' "$TMP/body")"
+      ;;
+    ls|'')
+      [ "$mode" = json ] && ACCEPT="application/json" || ACCEPT="text/plain"
+      desk_api GET ""
+      [ "${STATUS#2}" != "$STATUS" ] || desk_fail
+      cat "$TMP/body"
+      [ "$mode" != json ] || printf '\n'
+      ;;
+    inbox)
+      local q=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --all) q="${q}all=1&"; shift ;;
+          --after) need $# "$1"; case "$2" in ''|*[!0-9]*) die 2 "--after takes an answer's id" ;; esac; q="${q}after=$2&"; shift 2 ;;
+          *) die 2 "desk inbox [--all] [--after ID] [--json]" ;;
+        esac
+      done
+      q="${q%&}"
+      [ "$mode" = json ] && ACCEPT="application/json" || ACCEPT="text/plain"
+      desk_api GET "/inbox${q:+?$q}"
+      [ "${STATUS#2}" != "$STATUS" ] || desk_fail
+      cat "$TMP/body"
+      [ "$mode" != json ] || printf '\n'
+      ;;
+    ack)
+      local id="${1:-}" st="" result=""
+      [ $# -eq 0 ] || shift
+      case "$id" in ''|*[!0-9]*) die 2 "desk ack ID --sent | --doing | --done TEXT (ID from desk inbox)" ;; esac
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --sent) st=sent; shift ;;
+          --doing) st=doing; shift ;;
+          --done) need $# "$1"; st=done; result="$2"; shift 2 ;;
+          *) die 2 "desk ack ID --sent | --doing | --done TEXT" ;;
+        esac
+      done
+      [ -n "$st" ] || die 2 "desk ack ID --sent | --doing | --done TEXT"
+      printf '{"state":"%s"%s}' "$st" "${result:+,\"result\":$(json_arg "$result")}" > "$TMP/req"
+      desk_api POST "/actions/$id/state" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+      [ "${STATUS#2}" != "$STATUS" ] || desk_fail
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      printf 'answer %s marked %s\n' "$id" "$st"
+      ;;
+    *) die 2 "unknown desk command: $sub (foldrender help desk)" ;;
+  esac
+}
+
 # foldrender bridge --page PAGE [--agent NAME] [--dir DIR]: connects a coding
 # agent on this computer to the page's agent sidebar, until stopped. The bridge
 # is a Node program (foldrender-bridge.mjs) fetched from the site once, checked
@@ -2291,8 +2578,8 @@ foldrender publishes HTML pages as links and reads pages back as text.
   versions PAGE        kept versions; restore PAGE VERSION; undo PAGE
   canvas FILE|PAGE...  a canvas with these as cards (up to 24), --note, --link
   canvas edit CANVAS   add or remove cards, notes and connectors in one step
-  answers PAGE         what people answered to the page's questions
-                       (data-fr-choice); --wait waits for a new answer
+  answers PAGE         answers to the page's questions (data-fr-choice); --wait
+  desk ...             your desk: agents ask and report, you answer (help desk)
   bridge --page PAGE   connect Claude Code here to the page's agent sidebar
   rm PAGE... / open PAGE   delete pages / print a page's address and open it
   login / logout / whoami / export [FILE] / account delete / version
@@ -2374,6 +2661,52 @@ foldrender read PAGE [options]
   --meta full          every fact (owner, access, sharing, expiry, type)
   --json               the API's JSON; --html the stored HTML
   --save FILE          save the stored HTML; --assets DIR save images and SVG
+EOF
+    ;;
+    desk) cat <<'EOF'
+foldrender desk COMMAND [--desk ID] [--json]
+  A desk is a private page of yours that answers, at a glance, what waits on
+  you, what is running and where it is stuck, the machines and seats, what was
+  done today and what happens next. Your agents write it; you answer each
+  question on the page with a tap (6 seconds to undo), and they take your
+  answers from its inbox. Open it at its address, signed in (only you can).
+  init [--name desk] [--title T] [--lang en|zh]
+                       make your desk (or say where it is); prints its address
+  token add --role agent|feed --name NAME
+                       a token for this desk alone, printed once. agent: writes
+                       asks, tasks, done, timers, known; reads the desk and your
+                       answers. feed: replaces one source's snapshot (sessions,
+                       machines, seats, alerts) and reads nothing
+  token ls | token rm ID
+  ask KEY --title "the question in a sentence" [--context TEXT]
+      [--suggest "what you suggest, and why"] [--option LABEL]... (alternatives)
+      [--product P] [--deadline 2026-10-23[T10:00]] [--heavy] [--device D]
+      [--minutes N] [--link URL[=LABEL]]... [--reply-url URL] [--base REV]
+      [--hands]  the owner's own to do (buttons: do it now, remind me later)
+      [--input]  answered by writing (no "agree"; --suggest says how to fill it)
+  task KEY --title T [--product P] [--state doing|you|external] [--session NAME]
+      [--next "10-23 10:00 check"] [--link URL[=LABEL]]...
+  timer KEY --title T --at 2026-10-23T10:00 [--star]
+  known KEY --match "text of an alert" --note "why it is known" [--until WHEN]
+  done KEY... [--note "what was done"]   rm KEY...
+  feed SOURCE FILE.json|-   a snapshot: {"every_s": 60, "items": [{key, kind:
+                       session|host|seat|alert|timer, title, product?, state?,
+                       body?}]}; what it no longer names is removed
+  ls                   the desk as text (also: foldrender read DESK)
+  inbox [--all] [--after ID]
+                       your answers that count and no agent has taken yet
+  ack ID --sent | --doing | --done "what was done"
+                       mark an answer; the page shows each step under it
+  The same KEY again changes the thing (its revision goes up; an answer to an
+  older revision is refused). Anything that looks like a secret (a key, a
+  token, a link's ?k=) is refused whole; links go to foldrender.dev,
+  github.com and Feishu only. Write sentences and numbers, never terminal
+  output. --desk ID (or FOLDRENDER_DESK) names the desk (default: desk).
+  FOLDRENDER_DESK_TOKEN: a desk token (frdk_...) instead of your sign-in; keep
+  it in the environment or a 600 file, never in a command line.
+Examples: foldrender desk ask aws-pay --title "Bind a card for the new models?" \
+            --suggest "Yes: set a budget alert first" --option "Not now" --heavy
+          foldrender desk inbox; foldrender desk ack 12 --done "card bound"
 EOF
     ;;
     answers) cat <<'EOF'
@@ -2565,7 +2898,9 @@ help_asked() {
       -h|--help) return 0 ;;
       --old|--new|--title|--name|--folder|--share|--slug|--edits|--patch|--base|--assets|--save|-o|\
       --section|--card|--from|--max-tokens|--max-chars|--meta|--access|-n|--add|--rm|--note|--owner|\
-      --confirm|--token|--timeout|--after|--notify|--ack|--to|--idempotency-key|--page|--agent|--dir) skip=1 ;;
+      --confirm|--token|--timeout|--after|--notify|--ack|--to|--idempotency-key|--page|--agent|--dir|\
+      --desk|--role|--context|--suggest|--option|--deadline|--product|--state|--device|--minutes|--session|\
+      --next|--at|--match|--until|--reply-url|--lang|--done) skip=1 ;;
       --link) [ "$cmd" != canvas ] || skip=1 ;;
     esac
   done
@@ -2576,7 +2911,7 @@ main() {
   local cmd="${1:-help}"
   [ $# -eq 0 ] || shift
   case "$cmd" in
-    login|logout|account|export|whoami|publish|edit|share|list|ls|read|cat|versions|restore|undo|canvas|answers|bridge|rm|delete|open|version)
+    login|logout|account|export|whoami|publish|edit|share|list|ls|read|cat|versions|restore|undo|canvas|answers|desk|bridge|rm|delete|open|version)
       if help_asked "$cmd" "$@"; then
         case "$cmd" in
           list) cmd_help ls ;;
@@ -2603,6 +2938,7 @@ main() {
     undo) cmd_undo "$@" ;;
     canvas) cmd_canvas "$@" ;;
     answers) cmd_answers "$@" ;;
+    desk) cmd_desk "$@" ;;
     bridge) cmd_bridge "$@" ;;
     rm|delete) cmd_rm "$@" ;;
     open) cmd_open "$@" ;;
