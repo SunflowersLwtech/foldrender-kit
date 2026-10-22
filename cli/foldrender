@@ -28,7 +28,11 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.13.2
+FR_CLI_VERSION=0.14.0
+# The bridge `foldrender bridge` runs (foldrender-bridge.mjs, served beside this
+# file): the sha256 of the one this version was made with. A bridge that does
+# not match is not run.
+FR_BRIDGE_SHA256=68d6f2c0b25c2430c71fc8d8670ee4e4e128bca9aeea950fe666484b8f7b9055
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -2221,6 +2225,56 @@ cmd_answers() {
   done
 }
 
+# foldrender bridge --page PAGE [--agent NAME] [--dir DIR]: connects a coding
+# agent on this computer to the page's agent sidebar, until stopped. The bridge
+# is a Node program (foldrender-bridge.mjs) fetched from the site once, checked
+# against FR_BRIDGE_SHA256 and kept in the cache folder; the sign-in goes to it
+# in the environment, never on its command line.
+cmd_bridge() {
+  local target="" agent="claude" dir="$PWD" node_major file cache url got
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --page) need $# "$1"; target="$2"; shift 2 ;;
+      --agent) need $# "$1"; agent="$2"; shift 2 ;;
+      --dir) need $# "$1"; dir="$2"; shift 2 ;;
+      -*) die 2 "unknown option: $1" ;;
+      *) [ -z "$target" ] || die 2 "bridge takes one page"; target="$1"; shift ;;
+    esac
+  done
+  [ -n "$target" ] || die 2 "which page? foldrender bridge --page PAGE"
+  case "$agent" in claude) ;; *) die 2 "unknown agent: $agent (one of: claude)" ;; esac
+  [ -d "$dir" ] || die 2 "--dir $dir is not a folder"
+  require_token
+  command -v node >/dev/null 2>&1 || die 2 "the bridge needs Node 22 or later (https://nodejs.org); it is not installed"
+  node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null)"
+  case "$node_major" in ''|*[!0-9]*) node_major=0 ;; esac
+  [ "$node_major" -ge 22 ] || die 2 "the bridge needs Node 22 or later; this is $(node -v 2>/dev/null)"
+  page_id "$target"
+  if [ -n "${FOLDRENDER_BRIDGE:-}" ]; then
+    file="$FOLDRENDER_BRIDGE"
+    [ -f "$file" ] || die 2 "FOLDRENDER_BRIDGE=$file is not a file"
+  else
+    cache="${XDG_CACHE_HOME:-$HOME/.cache}/foldrender"
+    file="$cache/bridge-$FR_BRIDGE_SHA256.mjs"
+    if [ ! -f "$file" ] || [ "$(sha256_of "$file")" != "$FR_BRIDGE_SHA256" ]; then
+      mkdir -p "$cache" || die 1 "cannot make $cache"
+      url="${API%/artifacts}/install/foldrender-bridge.mjs"
+      curl -fsS --connect-timeout 15 --max-time 120 -o "$TMP/bridge.mjs" "$url" 2>"$TMP/err" || die 6 "cannot fetch the bridge from $url ($(curl_error))"
+      got="$(sha256_of "$TMP/bridge.mjs")"
+      [ "$got" = "$FR_BRIDGE_SHA256" ] || die 1 "the bridge at $url is not the one this foldrender ($FR_CLI_VERSION) runs; update foldrender: curl -fsSL ${API%/artifacts}/install.sh | sh"
+      mv "$TMP/bridge.mjs" "$file" || die 1 "cannot write $file"
+    fi
+  fi
+  export FOLDRENDER_TOKEN="$TOKEN"
+  exec node "$file" --api "$API" --page "$PAGE_ID" --agent "$agent" --dir "$dir"
+}
+
+# sha256_of FILE: its sha256, in hex (sha256sum, or shasum on a Mac).
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  else shasum -a 256 "$1" | awk '{print $1}'; fi
+}
+
 cmd_help() {
   case "${1:-}" in
     '') cat <<'EOF'
@@ -2237,8 +2291,8 @@ foldrender publishes HTML pages as links and reads pages back as text.
   canvas edit CANVAS   add or remove cards, notes and connectors in one step
   answers PAGE         what people answered to the page's questions
                        (data-fr-choice); --wait waits for a new answer
-  rm PAGE...           delete pages
-  open PAGE            print the page's address and open it
+  bridge --page PAGE   connect Claude Code here to the page's agent sidebar
+  rm PAGE... / open PAGE   delete pages / print a page's address and open it
   login / logout / whoami / export [FILE] / account delete / version
 
 PAGE is a page's address, its id, or an old a.foldrender.dev link.
@@ -2343,6 +2397,24 @@ foldrender answers --inbox | --ack ID,ID --to NAME
                        line: id, page, whom to tell, question, answer, who, when
   --ack IDS --to NAME  mark those told (a relay does --inbox, tells, --ack)
   --json               the API's answer
+EOF
+    ;;
+    bridge) cat <<'EOF'
+foldrender bridge --page PAGE [--dir DIR] [--agent claude]
+  Connects a coding agent on this computer to PAGE's agent sidebar, and stays
+  connected until stopped (Ctrl-C). The page's owner and its collaborators talk
+  with the agent beside the page, in a browser; it reads the page with
+  foldrender read, works in DIR, and asks before it acts as its own settings
+  say. Its questions go to the page, where only you (the owner, who runs it)
+  answer them. Messages sent while the bridge is away wait for it.
+  Only the page's owner runs a bridge on a page; a second one (another
+  computer) takes over from the first. FoldRender runs no model: the agent
+  runs here, signed in as you.
+  --dir DIR            the folder the agent works in (default: this one)
+  --agent claude       the agent (Claude Code, through its ACP adapter,
+                       @agentclientprotocol/claude-agent-acp; fetched with npx)
+  Needs Node 22 or later and the agent installed and signed in. The bridge
+  program is fetched once from the site and checked against this version.
 EOF
     ;;
     choices) cat <<'EOF'
@@ -2487,7 +2559,7 @@ help_asked() {
       -h|--help) return 0 ;;
       --old|--new|--title|--name|--folder|--share|--slug|--edits|--patch|--base|--assets|--save|-o|\
       --section|--card|--from|--max-tokens|--max-chars|--meta|--access|-n|--add|--rm|--note|--owner|\
-      --confirm|--token|--timeout|--after|--notify|--ack|--to|--idempotency-key) skip=1 ;;
+      --confirm|--token|--timeout|--after|--notify|--ack|--to|--idempotency-key|--page|--agent|--dir) skip=1 ;;
       --link) [ "$cmd" != canvas ] || skip=1 ;;
     esac
   done
@@ -2498,7 +2570,7 @@ main() {
   local cmd="${1:-help}"
   [ $# -eq 0 ] || shift
   case "$cmd" in
-    login|logout|account|export|whoami|publish|edit|share|list|ls|read|cat|versions|restore|undo|canvas|answers|rm|delete|open|version)
+    login|logout|account|export|whoami|publish|edit|share|list|ls|read|cat|versions|restore|undo|canvas|answers|bridge|rm|delete|open|version)
       if help_asked "$cmd" "$@"; then
         case "$cmd" in
           list) cmd_help ls ;;
@@ -2525,6 +2597,7 @@ main() {
     undo) cmd_undo "$@" ;;
     canvas) cmd_canvas "$@" ;;
     answers) cmd_answers "$@" ;;
+    bridge) cmd_bridge "$@" ;;
     rm|delete) cmd_rm "$@" ;;
     open) cmd_open "$@" ;;
     version|--version) printf 'foldrender %s\n' "$FR_CLI_VERSION" ;;
