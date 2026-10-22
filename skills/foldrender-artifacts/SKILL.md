@@ -182,6 +182,35 @@ A page can ask questions its owner (and anyone they let collaborate) answers wit
 </div>
 ```
 
+### The decision card (a fixed template)
+
+For a question the user decides (a plan's open points, "pick one of these"), use this card as it is and fill in the words in capitals: every decision page then looks and reads the same, on a phone and on a desktop, for readers who can answer and for those who cannot. Put the `<style>` once in the page's `<head>` (the card takes the page's own colours and is at most 760 px wide; see below on a dark scheme); one `<section>` per question; as many option `<div>`s as there are options (keep `data-fr-suggested` and the SUGGESTED tag on the one you recommend only, or on none). `data-fr-label` is the option's short name, the words the user sees recorded and you read back: a few words, not the sentence of what it leads to. Leave out `data-fr-note` when the question takes no note; add `data-fr-multi` to the `<section>` when any number may be picked.
+
+```html
+<style>
+.fr-card{box-sizing:border-box;max-width:760px;margin:20px 0;padding:16px 18px;border:1px solid rgba(127,127,127,.28);border-left:4px solid #b8862c;border-radius:10px;background:transparent;color:inherit;font:15px/1.6 system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+.fr-card .fr-card-id{display:inline-block;margin:0 0 6px;padding:1px 8px;border-radius:6px;background:rgba(184,134,44,.16);color:inherit;font:600 12px/1.6 system-ui,sans-serif}
+.fr-card h3{margin:0 0 8px;font-size:17px;line-height:1.45}
+.fr-card .fr-card-why{margin:0 0 12px;opacity:.78}
+.fr-card .fr-card-opt{display:block;margin:8px 0;padding:10px 12px;border:1px solid rgba(127,127,127,.28);border-radius:8px}
+.fr-card .fr-card-opt b{display:block;font-weight:600}
+.fr-card .fr-card-opt::before{float:right;margin-left:8px}
+.fr-card .fr-card-opt small{display:block;margin-top:2px;font-size:13px;opacity:.7}
+.fr-card .fr-card-tag{margin-left:6px;padding:0 6px;border-radius:5px;background:rgba(22,163,74,.16);color:inherit;font:600 12px/1.6 system-ui,sans-serif}
+.fr-card .fr-card-suggest{margin:12px 0 0;padding:10px 12px;border-radius:8px;background:rgba(184,134,44,.1)}
+</style>
+<section class="fr-card" data-fr-choice="ID" data-fr-note="NOTE PROMPT">
+  <div class="fr-card-id">ID</div>
+  <h3 data-fr-question>QUESTION</h3>
+  <p class="fr-card-why">WHY: what it is about and why it is the user's call</p>
+  <div class="fr-card-opt" data-fr-option="A" data-fr-label="A SHORT LABEL" data-fr-suggested><b>A SHORT LABEL <span class="fr-card-tag">SUGGESTED</span></b><small>WHAT A LEADS TO</small></div>
+  <div class="fr-card-opt" data-fr-option="B" data-fr-label="B SHORT LABEL"><b>B SHORT LABEL</b><small>WHAT B LEADS TO</small></div>
+  <p class="fr-card-suggest">SUGGESTION: what you suggest, and why</p>
+</section>
+```
+
+The card has no colours of its own: it shows the page's. A page that declares a dark scheme (`<meta name="color-scheme" content="light dark">`, or `color-scheme` in its CSS) is drawn on a dark background in dark mode, so every colour the page writes itself (text, backgrounds, boxes) needs a dark one too, under `@media (prefers-color-scheme: dark)`. One that declares it and still writes, say, `color:#333` shows dark text on a dark background. Not sure: leave the declaration out; the page then stays light.
+
 - `data-fr-choice="ID"`: a short id, unique on the page (letters, digits, `. _ -`), the one the user will say ("D1"). `data-fr-option="VALUE"` on each answer inside it, any element (a button, a span, a list item); its text is its label.
 - `data-fr-suggested` on the option you recommend. Write the suggestion in the text as well: readers who cannot answer see the page as written, with the options as plain text.
 - `data-fr-multi`: any number of options, sent with a Send button. `data-fr-note`: the answerer may add a sentence (the attribute's value is the field's placeholder); a block with `data-fr-note` and no options is an open question.
@@ -221,7 +250,7 @@ A page's owner can connect you (the coding agent on their computer) to a page, a
 foldrender bridge --page <page> --dir <folder>     # runs until Ctrl-C; the user's own Claude Code
 ```
 
-Run it in a terminal of its own (it does not return), as the page's owner, and only when the user asked: from then on, what people on the page say reaches their agent, which acts on their computer. On the page, the owner and collaborators open the sidebar with the chat button in the page's bar: the agent's replies stream in, its tool calls and file changes show (red and green), and its permission questions have the agent's own buttons, which only the owner can press. Text selected in the page is sent along as a quote. Wide screens show page, Markdown panel and sidebar side by side; narrower ones show the panel and the conversation as two tabs. When the bridge is not connected, the owner's sidebar shows the exact `foldrender bridge` command to run. The agent asks before it acts as its own settings say, and those questions go to the page, where only the owner answers them. A second bridge on the same page (another computer) takes over from the first. Messages sent while no bridge is connected wait for it. It needs Node 22 or later and Claude Code installed and signed in; FoldRender runs no model.
+Run it in a terminal of its own (it does not return), as the page's owner, and only when the user asked: from then on, what people on the page say reaches their agent, which acts on their computer. On the page, the owner and collaborators open the sidebar with the chat button in the page's bar: the agent's replies stream in, its tool calls and file changes show (red and green), and its permission questions have the agent's own buttons, which only the owner can press. Text selected in the page is sent along as a quote. Wide screens show page, Markdown panel and sidebar side by side; narrower ones show the panel and the conversation as two tabs. When the bridge is not connected, what people send waits for it (the owner's page list shows how many) and the owner's sidebar shows the exact `foldrender bridge` command to run; run on another computer, the bridge carries on the conversation (its agent is given what was said so far). The agent asks before it acts as its own settings say, and those questions go to the page, where only the owner answers them. A second bridge on the same page (another computer) takes over from the first. Messages sent while no bridge is connected wait for it. It needs Node 22 or later and Claude Code installed and signed in; FoldRender runs no model.
 
 The page's Markdown panel (its plan) is kept in the agent's folder as `.foldrender/<page>/plan.md`; when you are the agent in the sidebar and are asked to change the plan, edit that file: your edit is written back to the panel, made on the revision you read, and if someone changed the panel meanwhile the people on the page choose which text stays (the text not taken is kept: beside `plan.md` as `plan.md.<time>.agent` or `.replaced`, in the conversation, and the page's among the panel's earlier versions).
 
