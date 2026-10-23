@@ -22,12 +22,12 @@
 //                        on the command line)
 //   --api URL            FoldRender's API (https://foldrender.dev/artifacts)
 //   --page ID            the page
-//   --agent NAME         claude (the only one so far)
+//   --agent NAME         claude, codex, gemini, grok, devin or pi (AGENTS below)
 //   --dir DIR            the folder the agent works in (default: here)
 //   FOLDRENDER_ACP_COMMAND  a JSON array: start this instead of the agent's
 //                        adapter (the tests' stand-in agent)
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, unwatchFile, watchFile, writeFileSync } from "node:fs";
 import { hostname, homedir } from "node:os";
@@ -35,11 +35,16 @@ import { delimiter, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
-export const BRIDGE_VERSION = "0.15.3";
+export const BRIDGE_VERSION = "0.15.4";
 export const PROTOCOL = "fr-agent.1";
 
-// The agents this bridge starts, each through its ACP adapter, at a pinned
-// version (an adapter's update is a change of its own, made here).
+// The agents this bridge starts, as the ACP registry
+// (github.com/agentclientprotocol/registry, read 2026-10-22) starts them: an
+// adapter or the agent's own package at a pinned version (an update is a
+// change of its own, made here), or the agent's own CLI where it speaks ACP
+// itself (`local`, used when it is on the PATH: the owner's install, signed
+// in as them). Nothing here skips a permission question: no flag of the kind
+// (grok's --always-approve, say) is passed.
 export const AGENTS = {
   claude: {
     name: "Claude Code",
@@ -48,8 +53,66 @@ export const AGENTS = {
     // dependency (about 270 MB); it runs the one already installed instead.
     command: ["npx", "--yes", "@agentclientprotocol/claude-agent-acp@0.94.0"],
     env: { npm_config_omit: "optional" },
+    signIn: ["claude", "and type /login"],
+  },
+  codex: {
+    name: "Codex",
+    adapter: "@agentclientprotocol/codex-acp@2.2.2",
+    command: ["npx", "--yes", "@agentclientprotocol/codex-acp@2.2.2"],
+    signIn: ["codex login"],
+  },
+  gemini: {
+    name: "Gemini CLI",
+    adapter: "@google/gemini-cli@0.65.0",
+    command: ["npx", "--yes", "@google/gemini-cli@0.65.0", "--acp"],
+    signIn: ["gemini", "and sign in"],
+  },
+  grok: {
+    name: "Grok Build",
+    adapter: "@xai-official/grok@1.0.67",
+    local: ["grok", "agent", "stdio"],
+    command: ["npx", "--yes", "@xai-official/grok@1.0.67", "agent", "stdio"],
+    signIn: ["grok login"],
+  },
+  devin: {
+    name: "Devin",
+    adapter: "devin",
+    // Its CLI only (the registry's is a download per platform): install it
+    // from devin.ai first.
+    local: ["devin", "acp"],
+    signIn: ["devin auth login"],
+  },
+  pi: {
+    name: "pi",
+    adapter: "pi-acp@0.0.34",
+    command: ["npx", "--yes", "pi-acp@0.0.34"],
+    signIn: ["pi", "and set its model"],
   },
 };
+
+// The program on the PATH, if there is one.
+export function onPath(name, env = process.env) {
+  const exts = process.platform === "win32" ? ["", ".exe", ".cmd"] : [""];
+  for (const d of (env.PATH || "").split(delimiter).filter(Boolean)) {
+    for (const e of exts) {
+      const f = join(d, name + e);
+      try {
+        if (existsSync(f) && statSync(f).isFile()) return f;
+      } catch {
+        // not one we may read
+      }
+    }
+  }
+  return "";
+}
+
+// How an agent is started here: its own CLI when it is installed, else its
+// pinned package; null when neither (an agent with no package to fetch).
+export function agentCommand(known, env = process.env) {
+  if (known.local && onPath(known.local[0], env)) return { command: known.local, version: "installed" };
+  if (known.command) return { command: known.command, version: known.adapter.split("@").pop() };
+  return null;
+}
 
 // ---------- small things ----------
 
@@ -63,6 +126,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // not a log to keep).
 const DEBUG = /^(1|true|yes)$/i.test(process.env.FOLDRENDER_BRIDGE_DEBUG || "");
 const debug = (dir, line) => { if (DEBUG) process.stderr.write(`[acp ${dir}] ${cut(line, 400)}\n`); };
+
+// How to sign an agent in on this computer, in words: its command, and what
+// to do in it when the command alone does not sign in.
+export function signInWords(known) {
+  const [cmd, then] = known.signIn;
+  return `run \`${cmd}\` in a terminal there once${then ? ` ${then}` : ""}`;
+}
 
 export function parseArgs(argv) {
   const out = { api: "https://foldrender.dev/artifacts", page: "", agent: "claude", dir: process.cwd() };
@@ -130,7 +200,7 @@ export function findClaude(env = process.env) {
 // reads them: the folder's local settings over its shared ones over the
 // user's for the mode, and the rules of all three together.
 const BLANKET = /^(Bash|Edit|Write|MultiEdit)(\((\*|\*\*|:\*|\/\*\*)\))?$/;
-export function claudeAutoRuns(dir, env = process.env) {
+export function claudeAutoRuns(dir, env = process.env, sessionMode = null) {
   const home = env.HOME || env.USERPROFILE || homedir();
   const config = env.CLAUDE_CONFIG_DIR || join(home, ".claude");
   const files = [join(dir, ".claude", "settings.local.json"), join(dir, ".claude", "settings.json"), join(config, "settings.json")];
@@ -149,11 +219,43 @@ export function claudeAutoRuns(dir, env = process.env) {
       }
     }
   }
-  if (mode === "bypassPermissions") return { commands: true, edits: true };
+  // The session's own mode, when the agent reported one, over the settings'.
+  if (sessionMode) mode = sessionMode;
+  if (mode === "bypassPermissions" || mode === "auto") return { commands: true, edits: true };
   return {
     commands: allowed.has("commands") && !asked.has("commands"),
     edits: mode === "acceptEdits" || (allowed.has("edits") && !asked.has("edits")),
   };
+}
+
+// What an agent's session may be set to, as the agent reports it when the
+// session opens (ACP's session config options, or its earlier modes and
+// models): its own list, cut to size, and never one made up here.
+// {via: "config" | "legacy", options: [{id, name, category, current, options: [{value, name, description}]}]}
+export function optionsOf(r) {
+  const clip = (v, n) => String(v ?? "").slice(0, n);
+  const out = [];
+  const add = (id, name, category, current, list) => {
+    const all = (list || []).map((o) => ({ value: clip(o.value, 120), name: clip(o.name || o.value, 80), ...(o.description ? { description: clip(o.description, 160) } : {}) })).filter((o) => o.value);
+    // At most 40, and always the one it is set to (shown as chosen, and
+    // chosen again), wherever it is in the agent's list.
+    let options = all.slice(0, 40);
+    const now = all.find((o) => o.value === clip(current, 120));
+    if (now && !options.includes(now)) options = [now, ...options.slice(0, 39)];
+    if (id && options.length) out.push({ id: clip(id, 60), name: clip(name || id, 60), category: clip(category, 30), current: clip(current, 120), options });
+  };
+  if (Array.isArray(r?.configOptions)) {
+    for (const c of r.configOptions.slice(0, 6)) {
+      if (!c || c.type !== "select") continue;
+      // Options may come in groups.
+      const flat = (c.options || []).flatMap((o) => (Array.isArray(o?.options) ? o.options : [o]));
+      add(c.id, c.name, c.category || "", c.currentValue, flat);
+    }
+    return { via: "config", options: out };
+  }
+  if (Array.isArray(r?.modes?.availableModes)) add("mode", "Mode", "mode", r.modes.currentModeId, r.modes.availableModes.map((m) => ({ value: m.id, name: m.name, description: m.description })));
+  if (Array.isArray(r?.models?.availableModels)) add("model", "Model", "model", r.models.currentModelId, r.models.availableModels.map((m) => ({ value: m.modelId, name: m.name, description: m.description })));
+  return { via: "legacy", options: out };
 }
 
 // Whether Claude Code is sure to ask the owner before it changes anything on
@@ -216,6 +318,31 @@ export function claudeAsks(dir, env = process.env, sessionMode = null, managed =
 
 // ---------- the agent: an ACP client over a child's stdio ----------
 
+// What a Windows stop needs that a POSIX one does not: `taskkill /T /F` takes
+// down the shell and everything it started (an exit code of 128 means it was
+// already gone). `run` is given for the tests.
+// The signals that stop the bridge the same way: the terminal's Ctrl-C, a
+// service's SIGTERM, and the terminal's own close (SIGHUP: an agent that does
+// not exit when its standard input closes, as Gemini CLI's does not, would
+// otherwise be left running once the terminal is gone).
+export const STOP_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"];
+export function stopOnSignals(done, on = process) {
+  for (const sig of STOP_SIGNALS) on.on(sig, done);
+  // A terminal that has closed (SIGHUP, a hangup on the ssh session) makes the
+  // next write to its streams fail with EIO; unhandled, that error would end the
+  // bridge before it has stopped the agent, leaving an agent that ignores
+  // SIGTERM running. Writes to a stream that is gone are not news.
+  for (const stream of [on.stdout, on.stderr]) {
+    if (stream && typeof stream.on === "function") stream.on("error", () => {});
+  }
+}
+
+export function treeKill(pid, { platform = process.platform, run = (command, args) => spawnSync(command, args, { windowsHide: true }) } = {}) {
+  if (platform !== "win32") return false;
+  const r = run("taskkill", ["/pid", String(pid), "/T", "/F"]);
+  return Boolean(r) && (r.status === 0 || r.status === 128);
+}
+
 export class AgentProcess {
   // command: [program, ...args]; handlers: {update(params), permission(params) -> Promise<result>}
   constructor(command, { env = process.env, cwd = process.cwd(), handlers }) {
@@ -224,7 +351,9 @@ export class AgentProcess {
     this.waiting = new Map();
     this.closed = false;
     this.stderr = "";
-    this.child = spawn(command[0], command.slice(1), { cwd, env, stdio: ["pipe", "pipe", "pipe"], shell: process.platform === "win32" });
+    // A process group of its own (but on Windows): what it starts (npx, the
+    // CLI it runs, that CLI's children) is stopped with it.
+    this.child = spawn(command[0], command.slice(1), { cwd, env, stdio: ["pipe", "pipe", "pipe"], shell: process.platform === "win32", detached: process.platform !== "win32" });
     this.exited = new Promise((resolveExit) => {
       this.child.on("exit", (code, signal) => {
         this.closed = true;
@@ -295,10 +424,36 @@ export class AgentProcess {
     if (m.id !== undefined) this.write({ jsonrpc: "2.0", id: m.id, error: { code: -32601, message: `this client does not offer ${m.method}` } });
   }
 
-  stop() {
-    if (!this.closed) {
-      try { this.child.kill(); } catch { /* gone */ }
-    }
+  // Stopped: the agent and everything it started, as one process group (some
+  // ignore SIGTERM, or outlive the one that started them, as Gemini CLI's
+  // do); what is still there after `graceMs`, killed. Resolves once done.
+  stop(graceMs = 2000) {
+    const pid = this.child.pid;
+    const group = process.platform !== "win32" && pid;
+    const alive = () => {
+      if (!group) return !this.closed;
+      try { process.kill(-pid, 0); return true; } catch { return false; }
+    };
+    const kill = (sig) => {
+      try {
+        if (group) process.kill(-pid, sig);
+        // On Windows the agent runs under a shell: killing it would leave what
+        // it started (npx, the CLI) running, so the tree goes.
+        else if (!this.closed && !treeKill(pid)) this.child.kill(sig);
+      } catch { /* gone */ }
+    };
+    try { this.child.stdin.end(); } catch { /* closed */ }
+    if (!alive()) return Promise.resolve();
+    kill("SIGTERM");
+    return new Promise((done) => {
+      const end = Date.now() + graceMs;
+      const tick = () => {
+        if (!alive()) return done();
+        if (Date.now() >= end) { kill("SIGKILL"); return done(); }
+        setTimeout(tick, 100);
+      };
+      tick();
+    });
   }
 }
 
@@ -493,7 +648,7 @@ export class PanelSync {
   async call(method, body) {
     const res = await this.b.fetchImpl(`${this.b.api}/api/artifacts/${encodeURIComponent(this.b.page)}/md`, {
       method,
-      headers: { Authorization: `Bearer ${this.b.token}`, Accept: "application/json", "FoldRender-API": "2", ...(body ? { "Content-Type": "application/json" } : {}) },
+      headers: { ...this.b.auth(), Accept: "application/json", "FoldRender-API": "2", ...(body ? { "Content-Type": "application/json" } : {}) },
       body: body ? JSON.stringify(body) : undefined,
     });
     let d = null;
@@ -635,10 +790,22 @@ export class PanelSync {
 // ---------- the bridge ----------
 
 export class Bridge {
-  constructor({ api, page, agent, dir, token, command, fetchImpl = fetch, WebSocketImpl = globalThis.WebSocket, env = process.env, claudeManaged = managedSettingsFiles() }) {
-    Object.assign(this, { api, page, agentId: agent, dir, token, command, fetchImpl, WebSocketImpl, env, claudeManaged });
-    this.known = AGENTS[agent];
+  // Two seams for the desktop app, which is a bridge of its own: `authHeaders`
+  // (its signed-in session, in place of the CLI's token) and `agentFactory`
+  // ({env, cwd, handlers} -> an agent with request, notify, stop, exited and
+  // closed, as AgentProcess has: the app's own ACP client).
+  constructor({ api, page, agent, dir, token, command, fetchImpl = fetch, WebSocketImpl = globalThis.WebSocket, env = process.env, authHeaders = null, agentFactory = null, known = null, claudeManaged = managedSettingsFiles() }) {
+    Object.assign(this, { api, page, agentId: agent, dir, token, command, fetchImpl, WebSocketImpl, env, authHeaders, agentFactory, claudeManaged });
+    this.known = known || AGENTS[agent];
+    // How the agent starts (a test's command, the app's client, its CLI, or its package).
+    this.how = command ? { command, version: "custom" } : agentFactory ? { command: null, version: "app" } : agentCommand(this.known, env);
     this.sessions = new Map(); // room session id -> ACP session id
+    // What each conversation's session may be set to, as its agent reports it
+    // (room session id -> {acp, via, options}); the last reported, for a new
+    // conversation; and what was chosen for the next new conversation.
+    this.opts = new Map();
+    this.defaults = null;
+    this.pending = new Map();
     this.agent = null;
     this.ws = null;
     this.turn = null; // {seq, sid, acp, record, pending: Map, batch: []}
@@ -655,11 +822,23 @@ export class Bridge {
     this.asksSaid = undefined;
   }
 
-  // Whether the agent is sure to ask the owner first (Claude Code, as its
-  // settings and its sessions' modes say); null: another agent, not known.
+  // Whether the agent is sure to ask the owner first, in a conversation set
+  // to `options` (the agent's own modes): Claude Code as its settings and
+  // that mode say (the app starts each in the mode that asks); Codex only in
+  // its read-only mode; pi never asks; another agent, or Codex before it says
+  // its mode, is not known (null). Not after a Claude Code session took a
+  // mode that does not ask, or the owner allowed something always.
+  asksFor(options) {
+    if (this.loosened) return false;
+    const mode = (options || []).find((x) => x.id === "mode" || x.category === "mode")?.current || null;
+    if (this.agentId === "claude") return claudeAsks(this.dir, this.env, mode || (this.agentFactory ? "default" : null), this.claudeManaged);
+    if (this.agentId === "pi") return false;
+    if (this.agentId === "codex" && mode) return mode === "read-only";
+    return null;
+  }
+  // For a new conversation: as the bridge's defaults are set.
   asksNow() {
-    if (this.agentId !== "claude") return null;
-    return !this.loosened && claudeAsks(this.dir, this.env, null, this.claudeManaged);
+    return this.asksFor(this.defaults?.options || null);
   }
   sayAsks() {
     const asks = this.asksNow();
@@ -686,7 +865,7 @@ export class Bridge {
   async grant() {
     const res = await this.fetchImpl(`${this.api}/api/artifacts/${encodeURIComponent(this.page)}/agent`, {
       method: "POST",
-      headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json", Accept: "application/json", "FoldRender-API": "2" },
+      headers: { ...this.auth(), "Content-Type": "application/json", Accept: "application/json", "FoldRender-API": "2" },
       body: JSON.stringify({ as: "bridge" }),
     });
     let body = null;
@@ -695,6 +874,11 @@ export class Bridge {
     const why = body?.error || `HTTP ${res.status}`;
     const fatal = [401, 403, 404].includes(res.status);
     throw Object.assign(new Error(res.status === 404 ? `no page ${this.page} for this account, or the agent sidebar is off` : why), { fatal });
+  }
+
+  // How this bridge signs its requests: the CLI's token, or the app's session.
+  auth() {
+    return this.authHeaders ? { ...this.authHeaders } : { Authorization: `Bearer ${this.token}` };
   }
 
   // Start the agent (once) and say hello in ACP.
@@ -706,18 +890,17 @@ export class Bridge {
       const claude = findClaude(env);
       if (claude) env.CLAUDE_CODE_EXECUTABLE = claude;
     }
-    const command = this.command || this.known.command;
-    if (!this.command) log(`starting ${this.known.name} (the first start fetches its ACP adapter, ${this.known.adapter}, which can take a minute)`);
-    const agent = new AgentProcess(command, {
-      env,
-      cwd: this.dir,
-      handlers: {
-        update: (params) => this.onUpdate(params),
-        permission: (params) => this.onPermission(params),
-      },
-    });
+    if (!this.how) throw new Error(`${this.known.name} is not installed here (its CLI, ${this.known.local?.[0] || "?"}, is not on the PATH)`);
+    const command = this.how.command;
+    if (!this.command && !this.agentFactory) log(this.how.version === "installed" ? `starting ${this.known.name} (${command.join(" ")})` : `starting ${this.known.name} (the first start fetches ${this.known.adapter}, which can take a minute)`);
+    const handlers = {
+      update: (params) => this.onUpdate(params),
+      permission: (params) => this.onPermission(params),
+    };
+    const agent = this.agentFactory ? this.agentFactory({ env, cwd: this.dir, handlers }) : new AgentProcess(command, { env, cwd: this.dir, handlers });
     this.agent = agent;
     this.sessions.clear();
+    this.opts.clear();
     const init = await agent.request("initialize", {
       protocolVersion: 1,
       clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
@@ -769,7 +952,8 @@ export class Bridge {
       ws.onopen = () => {
         opened = true;
         lastHeard = Date.now();
-        const auto = this.agentId === "claude" ? claudeAutoRuns(this.dir, this.env) : null;
+        // (The desktop app starts every session in the mode that asks.)
+        const auto = this.agentId === "claude" ? claudeAutoRuns(this.dir, this.env, this.agentFactory ? "default" : null) : null;
         // A turn still running here (the socket dropped, the agent did not) is
         // named, so that the room takes it up again, and its questions asked
         // again.
@@ -777,16 +961,19 @@ export class Bridge {
         // An open conflict here (or none: a bridge started again has none, and
         // the room ends one it was waiting on).
         const conflict = this.panel.conflict ? { rev: this.panel.conflict.panelRev } : null;
-        // Whether it asks before it acts: the room holds what others say for
-        // the owner unless it is sure to.
+        // Whether it asks before it acts (for a new conversation; each
+        // conversation's with its settings): the room holds what others say
+        // for the owner unless it is sure to.
         const asks = this.asksNow();
         this.asksSaid = asks;
-        this.send({ t: "hello", agent: { id: this.agentId, name: this.known.name, version: this.known.adapter.split("@").pop() }, host: hostname(), auto, asks, turn: busy, conflict });
+        this.send({ t: "hello", agent: { id: this.agentId, name: this.known.name, version: this.how?.version || "" }, host: hostname(), auto, asks, turn: busy, conflict });
+        if (this.defaults) this.sendDefaults();
+        for (const [sid, o] of this.opts) this.send({ t: "options", sid, options: o.options, auto: this.autoFor(o.options), asks: this.asksFor(o.options) });
         if (this.turn) for (const [req, w] of this.turn.pending) this.send({ t: "ask", seq: this.turn.seq, req, call: w.call, options: w.options.map((o) => ({ optionId: o.optionId, name: o.name, kind: o.kind })) });
         log(`connected to "${this.info.title}" (${this.info.url}) as @${this.info.login}; ${this.known.name} works in ${this.dir}`);
         this.panel.pull().then(() => { if (!this.panel.off && this.panel.rev !== null) log(`the page's Markdown panel is in ${this.panel.file}`); });
         if (asks !== true) {
-          const what = auto && (auto.commands || auto.edits) ? `your Claude Code settings let it ${[auto.commands && "run commands", auto.edits && "change files"].filter(Boolean).join(" and ")} without asking` : `${this.known.name} may act without asking here (its mode, an allow rule, a hook or a plugin in its settings)`;
+          const what = auto && (auto.commands || auto.edits) ? `your Claude Code settings let it ${[auto.commands && "run commands", auto.edits && "change files"].filter(Boolean).join(" and ")} without asking` : `${this.known.name} may act without asking here (${this.agentId === "claude" ? "its mode, an allow rule, a hook or a plugin in its settings" : this.agentId === "pi" ? "it never asks" : this.agentId === "codex" ? "only its read-only mode asks first" : "FoldRender cannot tell whether it asks first"})`;
           warn(`${what}; the sidebar says so to everyone on the page, and what others say there waits for you to hand it to the agent`);
         }
         // A heartbeat while it is quiet: a socket that hears nothing for 40 s is
@@ -849,6 +1036,9 @@ export class Bridge {
     if (m.t === "cancel") return this.cancel(m);
     if (m.t === "panel-choose" && (m.choice === "panel" || m.choice === "agent")) return this.panel.choose(m.choice, typeof m.by === "string" ? m.by : null);
     if (m.t === "permit") return this.permitted(m);
+    if (m.t === "set-option" && typeof m.id === "string" && typeof m.value === "string") {
+      return this.setOption(typeof m.sid === "string" ? m.sid : null, m.id, m.value, typeof m.by === "string" ? m.by : null).catch((err) => warn("a setting was not changed:", err.message));
+    }
     if (m.t === "context") {
       const w = this.contextWaiters.get(m.sid);
       if (w) {
@@ -856,6 +1046,57 @@ export class Bridge {
         w(m.entries || []);
       }
     }
+  }
+
+  // ---- what a conversation's session may be set to ----
+  gotOptions(sid, acp, o) {
+    this.opts.set(sid, { acp, via: o.via, options: o.options });
+    this.send({ t: "options", sid, options: o.options, auto: this.autoFor(o.options), asks: this.asksFor(o.options) });
+    if (o.options.length) {
+      this.defaults = { via: o.via, options: o.options.map((x) => ({ ...x })) };
+      this.sendDefaults();
+    }
+  }
+  // For a new conversation: the last session's choices, with what was chosen
+  // for the next one.
+  sendDefaults() {
+    const options = this.defaults.options.map((x) => ({ ...x, current: this.pending.has(x.id) ? this.pending.get(x.id) : x.current }));
+    this.send({ t: "options", sid: null, options, auto: this.autoFor(options), asks: this.asksFor(options) });
+  }
+  // The owner's choice (the room takes it from the bridge's login only), one
+  // of the agent's own options; for a conversation with no session yet, kept
+  // for when it opens.
+  async setOption(sid, id, value, by) {
+    const o = sid !== null ? this.opts.get(sid) : null;
+    if (!o) {
+      const known = this.defaults?.options.find((x) => x.id === id);
+      if (!known || !known.options.some((x) => x.value === value)) return this.send({ t: "option-refused", sid, id, error: "not one of the agent's options" });
+      this.pending.set(id, value);
+      this.sendDefaults();
+      return;
+    }
+    const sel = o.options.find((x) => x.id === id);
+    if (!sel || !sel.options.some((x) => x.value === value)) return this.send({ t: "option-refused", sid, id, error: "not one of the agent's options" });
+    const agent = await this.startAgent();
+    let r = null;
+    try {
+      if (o.via === "config") r = await agent.request("session/set_config_option", { sessionId: o.acp, configId: id, value });
+      else if (id === "mode") r = await agent.request("session/set_mode", { sessionId: o.acp, modeId: value });
+      else if (id === "model") r = await agent.request("session/set_model", { sessionId: o.acp, modelId: value });
+    } catch (err) {
+      return this.send({ t: "option-refused", sid, id, error: cut(err.message, 300) });
+    }
+    if (Array.isArray(r?.configOptions)) this.gotOptions(sid, o.acp, optionsOf(r));
+    else { sel.current = value; this.gotOptions(sid, o.acp, o); }
+    log(`${by ? `@${by}` : "the page"} set ${sel.name} to ${sel.options.find((x) => x.value === value)?.name || value}`);
+  }
+  // Whether the session's mode lets the agent act without asking (Claude
+  // Code's modes; for another agent, nothing is assumed): with the owner's
+  // settings' rules for the rest.
+  autoFor(options) {
+    if (this.agentId !== "claude") return null;
+    const mode = options.find((x) => x.id === "mode" || x.category === "mode")?.current || null;
+    return claudeAutoRuns(this.dir, this.env, mode);
   }
 
   // The conversation so far in a room session, from the room.
@@ -871,7 +1112,7 @@ export class Bridge {
   // not sure to ask first: not given to it, whatever the room did. The room
   // holds it for the owner again ({t: "held-back"}).
   holdsBack(p) {
-    if (p.by === this.info?.login || p.ok_by || this.asksNow() === true) return false;
+    if (p.by === this.info?.login || p.ok_by || this.asksFor(this.opts.get(p.sid)?.options || this.defaults?.options || null) === true) return false;
     this.send({ t: "held-back", seq: p.seq });
     warn(`@${p.by}'s message is held for you to hand to the agent in the sidebar (it may act without asking here)`);
     return true;
@@ -904,6 +1145,10 @@ export class Bridge {
           this.sayAsks();
         }
         this.sessions.set(p.sid, acp);
+        this.gotOptions(p.sid, acp, optionsOf(made));
+        // What was chosen for a new conversation before it had a session.
+        for (const [id, value] of [...this.pending]) await this.setOption(p.sid, id, value, null).catch((err) => warn("a setting was not changed:", err.message));
+        this.pending.clear();
         // ...and so not for this message either, if it is someone else's
         // (the session stays, for the owner's).
         if (this.holdsBack(p)) return;
@@ -928,8 +1173,11 @@ export class Bridge {
       if (turn.cancelled) {
         this.send({ t: "done", seq: p.seq, stop: "cancelled", record: turn.record.fit(this.limits.turn_bytes - 1024) });
       } else {
-        this.send({ t: "error", seq: p.seq, error: cut(err.message, 1500) });
-        warn("the agent could not answer:", err.message);
+        // An agent not signed in on this computer says so (ACP's
+        // auth_required, -32000): the owner is told what to run.
+        const signIn = err.code === -32000 || /auth/i.test(err.message) ? ` (${this.known.name} is not signed in on this computer: ${signInWords(this.known)}, then send again)` : "";
+        this.send({ t: "error", seq: p.seq, error: cut(err.message + signIn, 1500) });
+        warn("the agent could not answer:", err.message + signIn);
       }
     } finally {
       clearTimeout(turn.timer);
@@ -940,12 +1188,27 @@ export class Bridge {
   // What the agent streams: kept for the record, and passed on in batches (at
   // most one message a tenth of a second, each within the room's size).
   onUpdate(params) {
-    // A session that takes a mode that does not ask (the owner's answer to
-    // the plan, "auto mode"): from now on not sure, and the room is told.
+    // A Claude Code session that takes a mode that does not ask (the owner's
+    // answer to the plan, "auto mode"): from now on not sure, and the room is
+    // told. (Another agent's modes are its own: each conversation's settings
+    // say, below.)
     const mode = params.update?.sessionUpdate === "current_mode_update" ? String(params.update.currentModeId ?? "").toLowerCase() : null;
-    if (mode !== null && !ASKING_MODES.has(mode)) {
+    if (this.agentId === "claude" && mode !== null && !ASKING_MODES.has(mode)) {
       this.loosened = true;
       this.sayAsks();
+    }
+    // What the session may be set to, changed by the agent (any time).
+    const u0 = params?.update;
+    if (u0 && (u0.sessionUpdate === "config_option_update" || u0.sessionUpdate === "current_mode_update")) {
+      const sid = [...this.opts].find(([, o]) => o.acp === params.sessionId)?.[0];
+      const o = sid !== undefined ? this.opts.get(sid) : null;
+      if (o) {
+        if (Array.isArray(u0.configOptions)) this.gotOptions(sid, o.acp, optionsOf({ configOptions: u0.configOptions }));
+        else if (typeof u0.currentModeId === "string") {
+          const mode = o.options.find((x) => x.id === "mode" || x.category === "mode");
+          if (mode) { mode.current = u0.currentModeId; this.gotOptions(sid, o.acp, o); }
+        }
+      }
     }
     const turn = this.turn;
     if (!turn || params.sessionId !== turn.acp) return;
@@ -1042,11 +1305,13 @@ export class Bridge {
     log("stopped by the page");
   }
 
+  // Resolves once the agent (and what it started) is gone.
   stop() {
     this.stopped = true;
     try { this.ws?.close(1000, "bridge stopped"); } catch { /* closed */ }
-    this.agent?.stop();
+    const gone = Promise.resolve(this.agent?.stop());
     this.panel.stop();
+    return gone;
   }
 }
 
@@ -1084,6 +1349,9 @@ async function main() {
   } else if (args.agent === "claude" && !findClaude()) {
     warn("Claude Code is not installed here (https://docs.claude.com/en/docs/claude-code): install it and sign in, then run this again");
     return 2;
+  } else if (!agentCommand(AGENTS[args.agent])) {
+    warn(`${AGENTS[args.agent].name} is not installed here (its CLI, ${AGENTS[args.agent].local?.[0]}, is not on the PATH): install it, ${signInWords(AGENTS[args.agent])}, then run this again`);
+    return 2;
   }
   const env = { ...process.env };
   delete env.FOLDRENDER_TOKEN;
@@ -1093,14 +1361,14 @@ async function main() {
   const done = async () => {
     const ws = bridge.ws;
     const closed = ws ? new Promise((r) => { ws.addEventListener("close", r); setTimeout(r, 1500); }) : null;
-    bridge.stop();
+    const gone = bridge.stop();
     if (closed) await closed;
+    await gone;
     process.exit(0);
   };
-  process.on("SIGINT", done);
-  process.on("SIGTERM", done);
+  stopOnSignals(done);
   const code = await bridge.run();
-  bridge.stop();
+  await bridge.stop();
   return code;
 }
 

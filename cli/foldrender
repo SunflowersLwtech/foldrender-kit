@@ -28,11 +28,11 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.15.3
+FR_CLI_VERSION=0.15.4
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=78493e8dc52274c146731ba9cd9446fc5a829cfc71fcb4932f4dc6a1b9468fa0
+FR_BRIDGE_SHA256=a5a25ad63f2b9a5a82f34c0e52c6747ebdda1ac0c2b211afed3fa50328698aac
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -2778,7 +2778,7 @@ cmd_bridge() {
     esac
   done
   [ -n "$target" ] || die 2 "which page? foldrender bridge --page PAGE"
-  case "$agent" in claude) ;; *) die 2 "unknown agent: $agent (one of: claude)" ;; esac
+  case "$agent" in claude|codex|gemini|grok|devin|pi) ;; *) die 2 "unknown agent: $agent (one of: claude, codex, gemini, grok, devin, pi)" ;; esac
   [ -d "$dir" ] || die 2 "--dir $dir is not a folder"
   require_token
   command -v node >/dev/null 2>&1 || die 2 "the bridge needs Node 22 or later (https://nodejs.org); it is not installed"
@@ -2984,16 +2984,17 @@ foldrender answers --inbox | --ack ID,ID --to NAME
 EOF
     ;;
     bridge) cat <<'EOF'
-foldrender bridge --page PAGE [--dir DIR] [--agent claude]
+foldrender bridge --page PAGE [--dir DIR] [--agent claude|codex|gemini|grok|devin|pi]
   Connects a coding agent on this computer to PAGE's agent sidebar, and stays
   connected until stopped (Ctrl-C). The page's owner and its collaborators talk
   with the agent beside the page, in a browser; it reads the page with
   foldrender read, works in DIR, and asks before it acts as its own settings
   say. Its questions go to the page, where only you (the owner, who runs it)
-  answer them. Unless Claude Code is sure to ask you first (its mode is
-  default or dontAsk; no allow rule but reading inside DIR, no other folder,
-  no PreToolUse or PermissionRequest hook, no self-running sandbox, no
-  plugin), what your
+  answer them. Unless the agent is sure to ask you first (Claude Code: its
+  mode is default or dontAsk; no allow rule but reading inside DIR, no other
+  folder, no PreToolUse or PermissionRequest hook, no self-running sandbox,
+  no plugin; Codex: its read-only mode; pi never asks; Gemini, Grok and
+  Devin are not known), what your
   collaborators say waits for you to hand it to the agent; it says so on
   start. Messages sent while the bridge is away wait for it. The page's
   Markdown panel (its plan) is kept in DIR/.foldrender/PAGE/plan.md: the
@@ -3004,8 +3005,15 @@ foldrender bridge --page PAGE [--dir DIR] [--agent claude]
   computer) takes over from the first. FoldRender runs no model: the agent
   runs here, signed in as you.
   --dir DIR            the folder the agent works in (default: this one)
-  --agent claude       the agent (Claude Code, through its ACP adapter,
-                       @agentclientprotocol/claude-agent-acp; fetched with npx)
+  --agent NAME         the agent, started as the ACP registry starts it:
+                       claude  Claude Code (default; its ACP adapter, via npx)
+                       codex   Codex (codex-acp, via npx; signed in: codex login)
+                       gemini  Gemini CLI (via npx, --acp; signed in once)
+                       grok    Grok Build (grok agent stdio when installed)
+                       devin   Devin (devin acp; its CLI installed)
+                       pi      pi (pi-acp, via npx; its own model settings)
+  The sidebar shows what the agent says its session may be set to (its
+  modes, its models); only you change them, and only to one it offers.
   Needs Node 22 or later and the agent installed and signed in. The bridge
   program is fetched once from the site and checked against this version.
 EOF
