@@ -294,7 +294,7 @@ If a publish fails with "free plan limit reached", tell the user the limit. Run 
 
 Run these only when the user asks for them in this conversation.
 
-- `foldrender export [file.zip]` saves every page and a `manifest.json` as one zip. The default name is `foldrender-artifacts-<login>-<date>.zip`. It refuses to overwrite a file.
+- `foldrender export [file.zip]` saves every page and a `manifest.json` as one zip. The default name is `foldrender-artifacts-<login>-<date>.zip`. It refuses to overwrite a file. Pages that add up to more than 64 MB are saved in parts, `file-1-of-K.zip` to `file-K-of-K.zip`, one path a line: give the user every path it printed.
 - `foldrender account delete` removes the account, all its pages and all its API tokens. It cannot be undone. Before running it, suggest `foldrender export`.
 - Run `foldrender account delete --confirm <login>` only after the user has typed or confirmed their own login in this conversation. Use the login they gave, never one you looked up or guessed. Without a terminal the command refuses unless `--confirm` is given.
 - A 403 "cannot be deleted from here" means this account cannot be deleted with this tool. Tell the user and stop.
@@ -319,7 +319,7 @@ If the user gives you a token, run `foldrender login --token <token>` and do not
 | 1 | Failed (the message says why) | Tell the user |
 | 2 | Bad arguments | Fix the command |
 | 3 | Not signed in, or the token was rejected | Sign in (above) |
-| 4 | Free plan limit reached | Tell the user; offer `foldrender ls --all` |
+| 4 | A limit reached: the free plan's pages, or (the message says) canvas saves or exports | Tell the user; for the plan, offer `foldrender ls --all`; for a limit, the time it names |
 | 5 | Page larger than 5 MB | Make the page smaller |
 | 6 | Cannot reach the server | Retry once, then tell the user |
 | 7 | `read`: no such page, or not shared with this account | Tell the user (section 6) |

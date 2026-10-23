@@ -20,19 +20,19 @@
 #   FOLDRENDER_NO_UPDATE_NOTE  Set to 1 to never say that a newer CLI is out.
 #
 # Exit codes: 0 ok, 1 failed, 2 bad usage, 3 not signed in or token rejected,
-# 4 free-plan limit reached, 5 page too large, 6 network failure,
-# 7 no such page, or not visible to this account (read), 8 page expired (read),
-# 9 too large to read as text, 10 an edit did not apply, 11 no new answer
-# before --timeout (answers --wait), 12 the id or address asked for is another
-# page's (publish).
+# 4 a limit reached (the free plan's pages, canvas saves, exports a day),
+# 5 page too large, 6 network failure, 7 no such page, or not visible to this
+# account (read), 8 page expired (read), 9 too large to read as text, 10 an
+# edit did not apply, 11 no new answer before --timeout (answers --wait), 12
+# the id or address asked for is another page's (publish).
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.15.1
+FR_CLI_VERSION=0.15.2
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=726efab59d71351f055f1ad98913f1826af4d5b18795ae71027b95383c8c5e63
+FR_BRIDGE_SHA256=be01d9496f5962f6979140eff51f766be7e3ec7e62f7dc1cd927f92f1835a65a
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -177,7 +177,13 @@ fail_http() {
       fi
       die 1 "not allowed ($msg)" ;;
     404) die 1 "not found ($msg)" ;;
-    413) die 5 "the page is larger than 5 MB" ;;
+    413)
+      # A body over the cap (a publish or an edit) is a page over 5 MB; any
+      # other 413 says its own reason.
+      case "$msg" in
+        *"body exceeds"*|*"html exceeds"*|"request too large"|"no message") die 5 "the page is larger than 5 MB" ;;
+      esac
+      die 5 "too large: $msg" ;;
     *) die 1 "the server returned HTTP $STATUS ($msg)" ;;
   esac
 }
@@ -683,11 +689,108 @@ json_number() {
   sed -n "s/.*\"$1\" *: *\([0-9][0-9]*\).*/\1/p" "$TMP/body" | head -n 1
 }
 
-# export [FILE.zip]: every page and a manifest in one zip. The default name is
-# foldrender-artifacts-<login>-<date>.zip. Refuses to overwrite.
+# size_text BYTES: a size as the server and the manager write it (a MB is
+# 1,048,576 bytes).
+size_text() {
+  awk -v n="$1" 'BEGIN {
+    if (n < 1024) { printf "%d bytes", n; exit }
+    if (n < 1048576) { printf "%d KB", int(n / 1024 + 0.5); exit }
+    s = sprintf("%.1f", n / 1048576); sub(/\.0$/, "", s); printf "%s MB", s
+  }'
+}
+
+# export_get PATH: an export request (a plan or a zip), the heavy kind the
+# server allows 10 of a minute: a 429 that asks to wait 2 minutes or less is
+# waited out and asked again, up to 5 times. A longer one (a daily limit,
+# Retry-After in hours) is not waited for: it is left in STATUS for the caller,
+# which says the server's sentence (exit 4). A zip may take a while to come
+# down, so up to an hour.
+export_get() {
+  local try=1 wait
+  while :; do
+    api_auth GET "$1" --max-time 3600
+    [ "$STATUS" = 429 ] || return 0
+    wait="$(header_value retry-after)"
+    case "$wait" in ''|*[!0-9]*) wait=60 ;; esac
+    { [ "$wait" -le 120 ] && [ "$try" -lt 5 ]; } || return 0
+    [ "$wait" -ge 1 ] || wait=1
+    note "too many exports in a minute; asking again in ${wait}s"
+    sleep "$wait"
+    try=$((try + 1))
+  done
+}
+
+# export_zip FILE: the zip in the last answer, written to FILE; 1 when the
+# answer is not one, with EXPORT_ERR saying why and EXPORT_CODE the exit code:
+# a 413 (the pages grew past one download since they were counted) and a 429
+# (a limit not waited for) give the server's own sentence; any other refusal
+# leaves EXPORT_ERR empty, for fail_http.
+export_zip() {
+  EXPORT_CODE=1
+  case "$STATUS" in
+    2??) ;;
+    413) EXPORT_ERR="$(error_text) Run foldrender export again."; return 1 ;;
+    429) EXPORT_ERR="$(error_text)"; EXPORT_CODE=4; return 1 ;;
+    *) EXPORT_ERR=""; return 1 ;;
+  esac
+  [ "$(head -c 2 "$TMP/body")" = "PK" ] || { EXPORT_ERR="the server did not return a zip file"; return 1; }
+  mkdir -p "$(dirname "$1")"
+  cp "$TMP/body" "$1.part" || die 1 "could not write $1"
+  mv -f "$1.part" "$1" || die 1 "could not write $1"
+}
+
+# export_plan: the plan in the last answer, as PLAN_N parts, PLAN_FP (what the
+# listing was) and per part P_PAGES, P_BYTES, P_AFTER, P_TO ("-" for an open
+# end) and P_FP; 1 when it is not a plan.
+export_plan() {
+  local k pages bytes after to fp url i=0
+  PLAN_N="$(field parts)"
+  PLAN_FP="$(field fingerprint)"
+  case "$PLAN_N" in ''|*[!0-9]*|0) return 1 ;; esac
+  grep '^part=' "$TMP/body" | tr -d '\r' > "$TMP/parts"
+  [ "$(grep -c . "$TMP/parts")" = "$PLAN_N" ] || return 1
+  P_PAGES=(); P_BYTES=(); P_AFTER=(); P_TO=(); P_FP=()
+  while IFS="$(printf '\t')" read -r k pages bytes after to fp url <&3; do
+    i=$((i + 1))
+    [ "$k" = "part=$i" ] || return 1
+    case "$pages/$bytes" in */|/*|*[!0-9/]*) return 1 ;; esac
+    # Each part is a range of page ids, "-" for an open end.
+    case "$after/$to" in /*|*/|*[!a-z0-9/-]*) return 1 ;; esac
+    P_PAGES+=("$pages"); P_BYTES+=("$bytes"); P_AFTER+=("$after"); P_TO+=("$to"); P_FP+=("$fp")
+  done 3< "$TMP/parts"
+}
+
+# export_abort CODE MESSAGE: an export that cannot finish leaves nothing behind:
+# the parts it saved are removed (EXPORT_FILES), then it exits. With no
+# message, the last answer says why (fail_http).
+export_abort() {
+  if [ "${#EXPORT_FILES[@]}" -gt 0 ]; then
+    rm -f "${EXPORT_FILES[@]}"
+    note "removed the ${#EXPORT_FILES[@]} part(s) saved before"
+  fi
+  [ -z "$2" ] || die "$1" "$2"
+  fail_http
+}
+
+# export [FILE.zip]: every page and a manifest in one zip; pages that add up to
+# more than one download holds (64 MB), in parts FILE-1-of-K.zip ..., each
+# with the manifest of its own pages. The default name is
+# foldrender-artifacts-<login>-<date>.zip. Refuses to overwrite. Prints each
+# path it saved, one a line, once the set is whole.
+#
+# Pages can change while the parts are saved. Each zip says what the whole
+# listing was when it was made (X-FR-Export-Plan) and what its own pages were
+# (X-FR-Export-Part). When the whole is no longer the plan's, the plan is asked
+# for again with the same cuts: with the same ranges, each part saved whose
+# pages are no longer those it saved is saved again; with other ranges (a part
+# grew past the limit), the parts saved are removed and saved again in the new
+# parts. After 3 such rounds it stops and removes what it saved. It never ends
+# with a set that misses a page the account had when its last part was saved.
 cmd_export() {
   [ $# -le 1 ] || die 2 "usage: foldrender export [FILE.zip]"
-  local target="${1:-}" login=""
+  local target="${1:-}" login="" i k q name mplan cuts same rounds=0 start=1
+  local saved=() old_after=() old_to=()
+  EXPORT_FILES=()
   require_token
   if [ -z "$target" ]; then
     api_auth GET /api/me
@@ -697,13 +800,90 @@ cmd_export() {
     target="foldrender-artifacts-$login-$(date +%Y-%m-%d).zip"
   fi
   [ ! -e "$target" ] || die 1 "$target already exists; choose another name"
-  api_auth GET /api/me/export
+  # The plan: the parts the pages are downloaded in (GET /api/me/export?plan=1).
+  export_get "/api/me/export?plan=1"
+  [ "$STATUS" != 429 ] || die 4 "$(error_text)"
   expect_2xx
-  [ "$(head -c 2 "$TMP/body")" = "PK" ] || die 1 "the server did not return a zip file"
-  mkdir -p "$(dirname "$target")"
-  cp "$TMP/body" "$target.part" || die 1 "could not write $target"
-  mv -f "$target.part" "$target" || die 1 "could not write $target"
-  printf '%s\n' "$target"
+  if [ "$(head -c 2 "$TMP/body")" = "PK" ]; then
+    # A server from before parts answers the plan with the whole zip.
+    export_zip "$target" || die 1 "$EXPORT_ERR"
+    printf '%s\n' "$target"
+    return 0
+  fi
+  export_plan || die 1 "the server did not return an export plan"
+  if [ "$PLAN_N" = 1 ]; then
+    export_get /api/me/export
+    export_zip "$target" || { [ -z "$EXPORT_ERR" ] || die "$EXPORT_CODE" "$EXPORT_ERR"; fail_http; }
+    printf '%s\n' "$target"
+    return 0
+  fi
+  while :; do
+    if [ -n "$start" ]; then
+      i=1
+      while [ "$i" -le "$PLAN_N" ]; do
+        name="${target%.zip}-$i-of-$PLAN_N.zip"
+        [ ! -e "$name" ] || export_abort 1 "$name already exists; choose another name"
+        i=$((i + 1))
+      done
+      note "your pages add up to $(size_text "$(field bytes)"), more than one download holds ($(size_text "$(field limit)")): saving them in $PLAN_N parts"
+      start=""
+    fi
+    mplan=""
+    i=0
+    while [ "$i" -lt "$PLAN_N" ]; do
+      k=$((i + 1))
+      if [ -z "${saved[$i]:-}" ]; then
+        name="${target%.zip}-$k-of-$PLAN_N.zip"
+        q="part=$k&of=$PLAN_N"
+        [ "${P_AFTER[$i]}" = - ] || q="$q&after=${P_AFTER[$i]}"
+        [ "${P_TO[$i]}" = - ] || q="$q&to=${P_TO[$i]}"
+        export_get "/api/me/export?$q"
+        export_zip "$name" || export_abort "$EXPORT_CODE" "$EXPORT_ERR"
+        case " ${EXPORT_FILES[*]-} " in *" $name "*) ;; *) EXPORT_FILES+=("$name") ;; esac
+        saved[$i]="$(header_value x-fr-export-part)"
+        [ -n "${saved[$i]}" ] || saved[$i]="${P_FP[$i]}"
+        note "part $k of $PLAN_N: ${P_PAGES[$i]} pages, $(size_text "${P_BYTES[$i]}")"
+        mplan="$(header_value x-fr-export-plan)"
+        # The listing is no longer the plan's: see below which parts it moved.
+        [ -z "$mplan" ] || [ "$mplan" = "$PLAN_FP" ] || break
+        mplan=""
+      fi
+      i=$((i + 1))
+    done
+    [ -n "$mplan" ] || break
+    # The pages changed while the parts were saved: the plan again, its cuts kept.
+    rounds=$((rounds + 1))
+    [ "$rounds" -le 3 ] || export_abort 1 "your pages kept changing while the parts were being saved. Run foldrender export again."
+    old_after=("${P_AFTER[@]}"); old_to=("${P_TO[@]}")
+    cuts="$(printf '%s\n' "${P_TO[@]}" | grep -v '^-$' | paste -sd , -)"
+    export_get "/api/me/export?plan=1${cuts:+&cuts=$cuts}"
+    [ "$STATUS" != 429 ] || export_abort 4 "$(error_text)"
+    case "$STATUS" in 2??) ;; *) export_abort ;; esac
+    export_plan || export_abort 1 "the server did not return an export plan"
+    same=1
+    [ "${#old_to[@]}" = "$PLAN_N" ] || same=""
+    i=0
+    while [ -n "$same" ] && [ "$i" -lt "$PLAN_N" ]; do
+      [ "${old_after[$i]}" = "${P_AFTER[$i]}" ] && [ "${old_to[$i]}" = "${P_TO[$i]}" ] || same=""
+      i=$((i + 1))
+    done
+    if [ -n "$same" ]; then
+      i=0
+      while [ "$i" -lt "$PLAN_N" ]; do
+        if [ -n "${saved[$i]:-}" ] && [ "${saved[$i]}" != "${P_FP[$i]}" ]; then
+          note "part $((i + 1)) changed while the parts were being saved; saving it again"
+          saved[$i]=""
+        fi
+        i=$((i + 1))
+      done
+    else
+      [ "${#EXPORT_FILES[@]}" -eq 0 ] || rm -f "${EXPORT_FILES[@]}"
+      EXPORT_FILES=(); saved=()
+      note "your pages changed while the parts were being saved; saving them again, in $PLAN_N parts"
+      start=1
+    fi
+  done
+  printf '%s\n' "${EXPORT_FILES[@]}"
 }
 
 # account delete [--confirm LOGIN]: deletes the account with its pages and API
@@ -2851,6 +3031,13 @@ EOF
 foldrender export [FILE.zip]
   Saves every page of the account and a manifest.json as one zip (default:
   foldrender-artifacts-LOGIN-DATE.zip) and prints its path. Never overwrites.
+  Pages that add up to more than one download holds (64 MB) are saved in
+  parts, FILE-1-of-K.zip to FILE-K-of-K.zip, each with a manifest.json of its
+  own pages; it prints each path, one a line, once the set is whole, and says
+  on stderr how many pages and how much each holds. If pages change while the
+  parts are saved, each part that changed is saved again. A part that fails,
+  or a daily export limit (exit 4, said at once), removes the parts saved
+  before it, so a set on disk is always whole.
 EOF
     ;;
     login|logout|whoami) cat <<'EOF'
@@ -2875,7 +3062,7 @@ EOF
     ;;
     exit) cat <<'EOF'
 Exit codes: 0 ok, 1 failed, 2 bad usage, 3 not signed in or token rejected,
-4 plan limit reached (or a canvas save limit), 5 page too large, 6 network
+4 plan limit reached (or a canvas save or export limit), 5 page too large, 6 network
 failure, 7 no such page or not visible to this account, 8 page expired, 9 too
 large to read as text (use --html), 10 an edit did not apply (old text missing
 or not unique, the page moved on from --base, or a canvas edit was refused),

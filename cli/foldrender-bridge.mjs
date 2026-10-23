@@ -35,7 +35,7 @@ import { delimiter, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
-export const BRIDGE_VERSION = "0.15.1";
+export const BRIDGE_VERSION = "0.15.2";
 export const PROTOCOL = "fr-agent.1";
 
 // The agents this bridge starts, each through its ACP adapter, at a pinned
