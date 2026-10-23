@@ -28,11 +28,11 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.15.4
+FR_CLI_VERSION=0.15.5
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=a5a25ad63f2b9a5a82f34c0e52c6747ebdda1ac0c2b211afed3fa50328698aac
+FR_BRIDGE_SHA256=05c4900e24f9d60a5254d857adcffcd26d2c7fd8f9c737e738d8e291dfe139e4
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -2767,11 +2767,13 @@ cmd_desk() {
 # against FR_BRIDGE_SHA256 and kept in the cache folder; the sign-in goes to it
 # in the environment, never on its command line.
 cmd_bridge() {
-  local target="" agent="claude" dir="$PWD" node_major file cache url got
+  local target="" agent="claude" dir="$PWD" session="" channel="" node_major file cache url got
   while [ $# -gt 0 ]; do
     case "$1" in
       --page) need $# "$1"; target="$2"; shift 2 ;;
       --agent) need $# "$1"; agent="$2"; shift 2 ;;
+      --session) need $# "$1"; session="$2"; shift 2 ;;
+      --channel) channel=1; shift ;;
       --dir) need $# "$1"; dir="$2"; shift 2 ;;
       -*) die 2 "unknown option: $1" ;;
       *) [ -z "$target" ] || die 2 "bridge takes one page"; target="$1"; shift ;;
@@ -2804,7 +2806,47 @@ cmd_bridge() {
     fi
   fi
   export FOLDRENDER_TOKEN="$TOKEN"
+  if [ -n "$channel" ]; then
+    exec node "$file" --api "$API" --page "$PAGE_ID" --channel --dir "$dir"
+  fi
+  if [ -n "$session" ]; then
+    exec node "$file" --api "$API" --page "$PAGE_ID" --session "$session" --dir "$dir"
+  fi
   exec node "$file" --api "$API" --page "$PAGE_ID" --agent "$agent" --dir "$dir"
+}
+
+# foldrender reply --page PAGE [--to N] TEXT|-: a terminal session's answer to
+# a message in PAGE's agent sidebar (the bridge, --session, said how).
+cmd_reply() {
+  local target="" to="" text="" got_text=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --page) need $# "$1"; target="$2"; shift 2 ;;
+      --to)
+        need $# "$1"
+        case "$2" in ''|*[!0-9]*) die 2 "--to takes a message's number (the bridge's message says it)" ;; esac
+        to="$2"; shift 2 ;;
+      -) text="$(cat)"; got_text=1; shift ;;
+      -*) die 2 "unknown option: $1" ;;
+      *) [ -z "$got_text" ] || die 2 "reply takes one text (quote it)"; text="$1"; got_text=1; shift ;;
+    esac
+  done
+  [ -n "$target" ] || die 2 "which page? foldrender reply --page PAGE [--to N] TEXT"
+  [ -n "$got_text" ] && [ -n "$text" ] || die 2 "what is the answer? foldrender reply --page PAGE [--to N] TEXT (or - for standard input)"
+  page_id "$target"
+  printf '%s' "$text" > "$TMP/reply.txt"
+  { printf '{"text":'; json_str "$TMP/reply.txt"; [ -z "$to" ] || printf ',"to":%s' "$to"; printf '}'; } > "$TMP/reply.json"
+  ACCEPT="application/json"
+  api_auth POST "/api/artifacts/$PAGE_ID/agent/reply" -H "Content-Type: application/json" --data-binary "@$TMP/reply.json"
+  ACCEPT="text/plain"
+  case "$STATUS" in
+    2??) printf 'replied in the sidebar (to message %s)\n' "$(json_get raw to 2>/dev/null || printf '?')" ;;
+    404) die 7 "$(json_get str error 2>/dev/null || error_text)" ;;
+    409) die 1 "$(json_get str error 2>/dev/null || error_text): run foldrender bridge --page $PAGE_ID --session NAME" ;;
+    413) die 5 "$(json_get str error 2>/dev/null || error_text)" ;;
+    429) die 4 "$(json_get str error 2>/dev/null || error_text)" ;;
+    *) fail_http ;;
+  esac
 }
 
 # sha256_of FILE: its sha256, in hex (sha256sum, or shasum on a Mac).
@@ -2829,7 +2871,7 @@ foldrender publishes HTML pages as links and reads pages back as text.
   canvas edit CANVAS   add or remove cards, notes and connectors in one step
   answers PAGE         answers to the page's questions (data-fr-choice); --wait
   desk ...             your desk: agents ask and report, you answer (help desk)
-  bridge --page PAGE   connect Claude Code here to the page's agent sidebar
+  bridge --page PAGE   connect an agent (or --session NAME) to the page's sidebar
   rm PAGE... / open PAGE   delete pages / print a page's address and open it
   login / logout / whoami / export [FILE] / account delete / version
 
@@ -2985,6 +3027,8 @@ EOF
     ;;
     bridge) cat <<'EOF'
 foldrender bridge --page PAGE [--dir DIR] [--agent claude|codex|gemini|grok|devin|pi]
+foldrender bridge --page PAGE --session NAME [--mesh-cli PATH]
+foldrender bridge --page PAGE --channel
   Connects a coding agent on this computer to PAGE's agent sidebar, and stays
   connected until stopped (Ctrl-C). The page's owner and its collaborators talk
   with the agent beside the page, in a browser; it reads the page with
@@ -3014,8 +3058,30 @@ foldrender bridge --page PAGE [--dir DIR] [--agent claude|codex|gemini|grok|devi
                        pi      pi (pi-acp, via npx; its own model settings)
   The sidebar shows what the agent says its session may be set to (its
   modes, its models); only you change them, and only to one it offers.
+  --session NAME       instead of an agent: a session already open in a
+                       terminal on the mesh (claude-mesh: this machine's
+                       ~/.claude-mesh and its CLI, mesh-cli.mjs, found by
+                       --mesh-cli or MESH_CLI). Text only: what is said goes
+                       into that session as a message (who, which page, and
+                       that it is a web page's text, not instructions), and
+                       it answers with foldrender reply. While the session is
+                       not open, the bridge stays out and messages wait.
+  --channel            run by Claude Code as a channel (MCP server; a research
+                       preview): claude mcp add foldrender -- foldrender
+                       bridge --page PAGE --channel, then claude
+                       --dangerously-load-development-channels server:foldrender.
+                       Messages arrive in that session as channel events; it
+                       answers with the reply tool. Text only.
   Needs Node 22 or later and the agent installed and signed in. The bridge
   program is fetched once from the site and checked against this version.
+EOF
+    ;;
+    reply) cat <<'EOF'
+foldrender reply --page PAGE [--to N] TEXT|-
+  A terminal session's answer in PAGE's agent sidebar, where the session is
+  connected by foldrender bridge --page PAGE --session NAME (each message it
+  gets says the command, with --to the message it answers; - reads the answer
+  from standard input). Text only, the page's owner's (this sign-in's).
 EOF
     ;;
     choices) cat <<'EOF'
@@ -3225,6 +3291,7 @@ main() {
     answers) cmd_answers "$@" ;;
     desk) cmd_desk "$@" ;;
     bridge) cmd_bridge "$@" ;;
+    reply) cmd_reply "$@" ;;
     rm|delete) cmd_rm "$@" ;;
     open) cmd_open "$@" ;;
     version|--version) printf 'foldrender %s\n' "$FR_CLI_VERSION" ;;
