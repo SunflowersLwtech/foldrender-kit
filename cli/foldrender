@@ -28,11 +28,11 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.15.5
+FR_CLI_VERSION=0.15.6
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=05c4900e24f9d60a5254d857adcffcd26d2c7fd8f9c737e738d8e291dfe139e4
+FR_BRIDGE_SHA256=06a4e13ad32069b44f7a24e81770e5441be54955ca2a23685165f704e6921434
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -3037,10 +3037,12 @@ foldrender bridge --page PAGE --channel
   answer them. Unless the agent is sure to ask you first (Claude Code: its
   mode is default or dontAsk; no allow rule but reading inside DIR, no other
   folder, no PreToolUse or PermissionRequest hook, no self-running sandbox,
-  no plugin; Codex: its read-only mode; pi never asks; Gemini, Grok and
-  Devin are not known), what your
-  collaborators say waits for you to hand it to the agent; it says so on
-  start. Messages sent while the bridge is away wait for it. The page's
+  no plugin, nothing in what the organisation or an MDM puts on this computer
+  (a managed settings file, its drop-ins, a macOS or Windows policy, or what
+  its admin console delivers); Codex: its read-only mode; pi never asks;
+  Gemini, Grok and Devin are not known), what your collaborators say waits for
+  you to hand it to the agent; it says so on start. Messages sent while the
+  bridge is away wait for it. The page's
   Markdown panel (its plan) is kept in DIR/.foldrender/PAGE/plan.md: the
   agent's edit there is written back to the panel, and if someone changed the
   panel meanwhile, the people on the page choose which text stays; the text

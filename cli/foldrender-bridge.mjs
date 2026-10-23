@@ -29,13 +29,13 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, unwatchFile, watchFile, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unwatchFile, watchFile, writeFileSync } from "node:fs";
 import { hostname, homedir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
-export const BRIDGE_VERSION = "0.15.5";
+export const BRIDGE_VERSION = "0.15.6";
 export const PROTOCOL = "fr-agent.1";
 
 // The agents this bridge starts, as the ACP registry
@@ -278,6 +278,19 @@ export function optionsOf(r) {
 // that cannot be read is not known, so not sure. Read as Claude Code reads
 // them: the organisation's managed settings, the folder's local, its shared,
 // the user's.
+//
+// What reaches a machine as policy is not only that file. Claude Code reads it
+// from four places and takes the highest that carries a policy key, or all of
+// them when the organisation sets managedSourcesBehavior "merge": settings its
+// admin console delivers and it caches locally (applied at startup, from
+// ~/.claude/remote-settings.json); an MDM or OS-level policy (macOS's
+// com.anthropic.claudecode managed preferences, Windows's
+// HKLM\SOFTWARE\Policies\ClaudeCode "Settings" value); managed-settings.json
+// with its managed-settings.d/*.json drop-ins in a system folder; and the
+// user-writable HKCU value on Windows. A rule the agent acts under can come
+// from any of them, so all are read here, and any of them that would let it act
+// unasked holds the message. That is stricter than Claude Code (it applies one
+// source, and reads HKCU only when no admin source is present); never looser.
 const IN_FOLDER = /^(Read|Glob|Grep|LS|NotebookRead)\((.+)\)$/;
 export const ASKING_MODES = new Set(["default", "manual", "dontask"]);
 function inFolder(path) {
@@ -291,21 +304,112 @@ function readsHere(rule) {
   const m = IN_FOLDER.exec(r);
   return Boolean(m) && inFolder(m[2]);
 }
-export function managedSettingsFiles(platform = process.platform) {
-  if (platform === "darwin") return ["/Library/Application Support/ClaudeCode/managed-settings.json"];
-  if (platform === "win32") return ["C:\\Program Files\\ClaudeCode\\managed-settings.json", "C:\\ProgramData\\ClaudeCode\\managed-settings.json"];
-  return ["/etc/claude-code/managed-settings.json"];
+export function managedSettingsDir(platform = process.platform) {
+  if (platform === "darwin") return "/Library/Application Support/ClaudeCode";
+  if (platform === "win32") return "C:\\Program Files\\ClaudeCode";
+  return "/etc/claude-code";
 }
-export function claudeAsks(dir, env = process.env, sessionMode = null, managed = managedSettingsFiles()) {
+// The policy this machine carries, one entry per source: { from, settings } for
+// one it has, { from, unreadable: true } for one it cannot read, and nothing for
+// one it does not have. `run` runs a system command (defaults, plutil, reg) and
+// is given for the tests; a policy helper is never run: what it would say is not
+// known, so it is unreadable.
+function runCommand(command, args, input) {
+  const r = spawnSync(command, args, { input, encoding: "utf8", timeout: 5000, maxBuffer: 4 * 1024 * 1024, windowsHide: true });
+  return { code: r.status, out: r.stdout || "", err: r.stderr || (r.error ? String(r.error.message) : "") };
+}
+function policyOf(settings) {
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) return { unreadable: true };
+  // A helper's output replaces its source's policy, and is not readable here.
+  if (settings.policyHelper) return { unreadable: true };
+  return { settings };
+}
+function managedSettingsFiles(dir, read) {
+  const out = [];
+  const one = (path) => {
+    let text = null;
+    try { text = read(path); } catch (err) { if (err?.code === "ENOENT" || err?.code === "ENOTDIR") return; return out.push({ from: path, unreadable: true }); }
+    let settings = null;
+    try { settings = JSON.parse(text); } catch { return out.push({ from: path, unreadable: true }); }
+    out.push({ from: path, ...policyOf(settings) });
+  };
+  one(join(dir, "managed-settings.json"));
+  // The drop-ins Claude Code merges after it, in this order (docs: Split a
+  // file-based policy across teams).
+  let names = [];
+  try { names = readdirSync(join(dir, "managed-settings.d")); } catch (err) { if (err?.code !== "ENOENT" && err?.code !== "ENOTDIR") out.push({ from: join(dir, "managed-settings.d"), unreadable: true }); }
+  for (const name of names.filter((n) => !n.startsWith(".") && n.endsWith(".json")).sort()) one(join(dir, "managed-settings.d", name));
+  return out;
+}
+// A JSON document a registry value holds, or a plist turned into one.
+function jsonOf(text) {
+  try { return JSON.parse(text); } catch { return undefined; }
+}
+export function managedSources({ platform = process.platform, env = process.env, run = runCommand, read = (path) => readFileSync(path, "utf8"), systemDir = managedSettingsDir(platform) } = {}) {
   const home = env.HOME || env.USERPROFILE || homedir();
   const config = env.CLAUDE_CONFIG_DIR || join(home, ".claude");
-  const files = [...[].concat(managed), join(dir, ".claude", "settings.local.json"), join(dir, ".claude", "settings.json"), join(config, "settings.json")];
+  const out = [];
+  // Settings the admin console delivers: Claude Code caches them here and
+  // applies the cache at startup.
+  const cache = join(config, "remote-settings.json");
+  let cached = null;
+  try { cached = read(cache); } catch (err) { if (err?.code !== "ENOENT" && err?.code !== "ENOTDIR") out.push({ from: cache, unreadable: true }); }
+  if (cached !== null) {
+    const settings = jsonOf(cached);
+    out.push(settings === undefined ? { from: cache, unreadable: true } : { from: cache, ...policyOf(settings) });
+  }
+  if (platform === "darwin") {
+    // The managed preferences domain, as the plist Claude Code reads it.
+    const from = "com.anthropic.claudecode";
+    const exported = run("defaults", ["export", from, "-"]);
+    if (exported.code === 0) {
+      const json = run("plutil", ["-convert", "json", "-o", "-", "-"], exported.out);
+      const settings = json.code === 0 ? jsonOf(json.out) : undefined;
+      out.push(settings === undefined ? { from, unreadable: true } : { from, ...policyOf(settings) });
+    } else if (!/does not exist|Domain .* not found|Could not find/i.test(exported.err)) out.push({ from, unreadable: true });
+    // A configuration profile installs its payload as a plist of its own; a
+    // Forced/MCX value is not the user's preference, so `defaults export` may not
+    // print it. Both files are read (the machine's, then the user's, as macOS
+    // installs them); a file that is not there is not a source.
+    const user = env.USER || env.LOGNAME || "";
+    for (const path of [`/Library/Managed Preferences/${from}.plist`, ...(user ? [`/Library/Managed Preferences/${user}/${from}.plist`] : [])]) {
+      const json = run("plutil", ["-convert", "json", "-o", "-", path]);
+      if (json.code !== 0) {
+        if (!/does not exist|No such file|Could not find/i.test(json.err)) out.push({ from: path, unreadable: true });
+        continue;
+      }
+      const settings = jsonOf(json.out);
+      out.push(settings === undefined ? { from: path, unreadable: true } : { from: path, ...policyOf(settings) });
+    }
+  }
+  out.push(...managedSettingsFiles(systemDir, read));
+  if (platform === "win32") {
+    for (const hive of ["HKLM", "HKCU"]) {
+      const from = `${hive}\\SOFTWARE\\Policies\\ClaudeCode`;
+      const r = run("reg", ["query", from, "/v", "Settings"]);
+      if (r.code !== 0) { if (!/unable to find|not exist|cannot find/i.test(r.err)) out.push({ from, unreadable: true }); continue; }
+      // "    Settings    REG_SZ    {json}"... the value after the type, whole.
+      const value = r.out.split("\n").map((line) => /^\s+Settings\s+(REG_SZ|REG_EXPAND_SZ)\s+(.*)$/.exec(line.replace(/\r$/, ""))).find(Boolean)?.[2];
+      const settings = value === undefined ? undefined : jsonOf(value);
+      out.push(settings === undefined ? { from, unreadable: true } : { from, ...policyOf(settings) });
+    }
+  }
+  return out;
+}
+export function claudeAsks(dir, env = process.env, sessionMode = null, managed = managedSources({ env })) {
+  const home = env.HOME || env.USERPROFILE || homedir();
+  const config = env.CLAUDE_CONFIG_DIR || join(home, ".claude");
+  const asSource = (m) => (typeof m === "string" ? { from: m } : m);
+  const files = [...[].concat(managed).map(asSource), ...[join(dir, ".claude", "settings.local.json"), join(dir, ".claude", "settings.json"), join(config, "settings.json")].map(asSource)];
   let mode = null;
   for (const f of files) {
-    let settings = null;
-    try { settings = JSON.parse(readFileSync(f, "utf8")); } catch (err) {
-      if (err?.code === "ENOENT" || err?.code === "ENOTDIR") continue;
-      return false;
+    if (f.unreadable) return false;
+    let settings = f.settings;
+    if (settings === undefined) {
+      try { settings = JSON.parse(readFileSync(f.from, "utf8")); } catch (err) {
+        if (err?.code === "ENOENT" || err?.code === "ENOTDIR") continue;
+        return false;
+      }
     }
     if (!settings || typeof settings !== "object") return false;
     const p = settings.permissions && typeof settings.permissions === "object" ? settings.permissions : {};
@@ -801,8 +905,8 @@ export class Bridge {
   // closed, as AgentProcess has: the app's own ACP client).
   // `session` ({name, deliver(text, as), alive()}): a terminal session's bridge
   // (meshSession below), which carries text only: no agent is started here.
-  constructor({ api, page, agent, dir, token, command, fetchImpl = fetch, WebSocketImpl = globalThis.WebSocket, env = process.env, authHeaders = null, agentFactory = null, known = null, session = null, claudeManaged = managedSettingsFiles() }) {
-    Object.assign(this, { api, page, agentId: session ? "session" : agent, dir, token, command, fetchImpl, WebSocketImpl, env, authHeaders, agentFactory, session, claudeManaged });
+  constructor({ api, page, agent, dir, token, command, fetchImpl = fetch, WebSocketImpl = globalThis.WebSocket, env = process.env, authHeaders = null, agentFactory = null, known = null, session = null, claudeManaged = null, managedTtlMs = 60_000, managedRead = (e) => managedSources({ env: e }) }) {
+    Object.assign(this, { api, page, agentId: session ? "session" : agent, dir, token, command, fetchImpl, WebSocketImpl, env, authHeaders, agentFactory, session, claudeManaged, managedTtlMs, managedRead, managedAt: 0, managedCache: null });
     this.known = session ? { name: `Terminal session ${session.name}`, adapter: "session" } : known || AGENTS[agent];
     // How the agent starts (a test's command, the app's client, its CLI, or its package).
     this.how = session ? { command: null, version: "text" } : command ? { command, version: "custom" } : agentFactory ? { command: null, version: "app" } : agentCommand(this.known, env);
@@ -840,10 +944,23 @@ export class Bridge {
   asksFor(options) {
     if (this.loosened) return false;
     const mode = (options || []).find((x) => x.id === "mode" || x.category === "mode")?.current || null;
-    if (this.agentId === "claude") return claudeAsks(this.dir, this.env, mode || (this.agentFactory ? "default" : null), this.claudeManaged);
+    if (this.agentId === "claude") return claudeAsks(this.dir, this.env, mode || (this.agentFactory ? "default" : null), this.managedPolicy());
     if (this.agentId === "pi") return false;
     if (this.agentId === "codex" && mode) return mode === "read-only";
     return null;
+  }
+  // The policy that reaches this machine, read again before each turn (Claude
+  // Code polls the console hourly and the OS policy every half hour, so an
+  // organisation's new rule arrives while the bridge runs): a copy at most a
+  // minute old, and nothing at all when the caller gave its own (`claudeManaged`,
+  // as the tests do). A read that throws is not known, never "asks".
+  managedPolicy() {
+    if (this.claudeManaged !== null) return this.claudeManaged;
+    if (!this.managedCache || Date.now() - this.managedAt >= this.managedTtlMs) {
+      this.managedAt = Date.now();
+      try { this.managedCache = this.managedRead(this.env); } catch { this.managedCache = [{ from: "the machine's policy", unreadable: true }]; }
+    }
+    return this.managedCache;
   }
   // For a new conversation: as the bridge's defaults are set.
   asksNow() {
