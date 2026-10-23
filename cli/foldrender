@@ -28,11 +28,11 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.15.7
+FR_CLI_VERSION=0.15.8
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=78c8ba5c8f530f0c6b71e2af8925e85e92b82ba920def37486f047a457f128f2
+FR_BRIDGE_SHA256=36b39955768d27768e4c56384bb1361e806a1c7b987742f88f67c37826a06f1a
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -2767,12 +2767,13 @@ cmd_desk() {
 # against FR_BRIDGE_SHA256 and kept in the cache folder; the sign-in goes to it
 # in the environment, never on its command line.
 cmd_bridge() {
-  local target="" agent="claude" dir="$PWD" session="" channel="" node_major file cache url got
+  local target="" agent="claude" dir="$PWD" session="" channel="" mesh_cli="" node_major file cache url got
   while [ $# -gt 0 ]; do
     case "$1" in
       --page) need $# "$1"; target="$2"; shift 2 ;;
       --agent) need $# "$1"; agent="$2"; shift 2 ;;
       --session) need $# "$1"; session="$2"; shift 2 ;;
+      --mesh-cli) need $# "$1"; mesh_cli="$2"; shift 2 ;;
       --channel) channel=1; shift ;;
       --dir) need $# "$1"; dir="$2"; shift 2 ;;
       -*) die 2 "unknown option: $1" ;;
@@ -2780,7 +2781,8 @@ cmd_bridge() {
     esac
   done
   [ -n "$target" ] || die 2 "which page? foldrender bridge --page PAGE"
-  case "$agent" in claude|codex|gemini|grok|devin|pi) ;; *) die 2 "unknown agent: $agent (one of: claude, codex, gemini, grok, devin, pi)" ;; esac
+  case "$agent" in claude|codex|gemini|antigravity|grok|devin|pi) ;; *) die 2 "unknown agent: $agent (one of: claude, codex, gemini, antigravity, grok, devin, pi)" ;; esac
+  [ -z "$mesh_cli" ] || [ -n "$session" ] || die 2 "--mesh-cli goes with --session NAME (the mesh's CLI that session's messages are sent with)"
   [ -d "$dir" ] || die 2 "--dir $dir is not a folder"
   require_token
   command -v node >/dev/null 2>&1 || die 2 "the bridge needs Node 22 or later (https://nodejs.org); it is not installed"
@@ -2810,6 +2812,9 @@ cmd_bridge() {
     exec node "$file" --api "$API" --page "$PAGE_ID" --channel --dir "$dir"
   fi
   if [ -n "$session" ]; then
+    if [ -n "$mesh_cli" ]; then
+      exec node "$file" --api "$API" --page "$PAGE_ID" --session "$session" --mesh-cli "$mesh_cli" --dir "$dir"
+    fi
     exec node "$file" --api "$API" --page "$PAGE_ID" --session "$session" --dir "$dir"
   fi
   exec node "$file" --api "$API" --page "$PAGE_ID" --agent "$agent" --dir "$dir"
@@ -3026,7 +3031,7 @@ foldrender answers --inbox | --ack ID,ID --to NAME
 EOF
     ;;
     bridge) cat <<'EOF'
-foldrender bridge --page PAGE [--dir DIR] [--agent claude|codex|gemini|grok|devin|pi]
+foldrender bridge --page PAGE [--dir DIR] [--agent claude|codex|gemini|antigravity|grok|devin|pi]
 foldrender bridge --page PAGE --session NAME [--mesh-cli PATH]
 foldrender bridge --page PAGE --channel
   Connects a coding agent on this computer to PAGE's agent sidebar, and stays
@@ -3040,7 +3045,7 @@ foldrender bridge --page PAGE --channel
   no plugin, nothing in what the organisation or an MDM puts on this computer
   (a managed settings file, its drop-ins, a macOS or Windows policy, or what
   its admin console delivers); Codex: its read-only mode; pi never asks;
-  Gemini, Grok and Devin are not known), what your collaborators say waits for
+  Gemini, Antigravity, Grok and Devin are not known), what your collaborators say waits for
   you to hand it to the agent; it says so on start. Messages sent while the
   bridge is away wait for it. The page's
   Markdown panel (its plan) is kept in DIR/.foldrender/PAGE/plan.md: the
@@ -3062,7 +3067,13 @@ foldrender bridge --page PAGE --channel
   --agent NAME         the agent, started as the ACP registry starts it:
                        claude  Claude Code (default; its ACP adapter, via npx)
                        codex   Codex (codex-acp, via npx; signed in: codex login)
-                       gemini  Gemini CLI (via npx, --acp; signed in once)
+                       gemini  Gemini CLI (via npx, --acp; a Gemini API key or
+                               Vertex: Google no longer lets a personal
+                               account's sign-in use it)
+                       antigravity  Google Antigravity (agy_acp_server, Google's
+                               download, on the PATH; a Google account's
+                               sign-in, auth.type oauth-personal in
+                               ~/.gemini/antigravity-acp/settings.json)
                        grok    Grok Build (grok agent stdio when installed)
                        devin   Devin (devin acp; its CLI installed)
                        pi      pi (pi-acp, via npx; its own model settings)

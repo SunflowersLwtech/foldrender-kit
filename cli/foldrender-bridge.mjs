@@ -22,20 +22,21 @@
 //                        on the command line)
 //   --api URL            FoldRender's API (https://foldrender.dev/artifacts)
 //   --page ID            the page
-//   --agent NAME         claude, codex, gemini, grok, devin or pi (AGENTS below)
+//   --agent NAME         claude, codex, gemini, antigravity, grok, devin or pi
+//                        (AGENTS below)
 //   --dir DIR            the folder the agent works in (default: here)
 //   FOLDRENDER_ACP_COMMAND  a JSON array: start this instead of the agent's
 //                        adapter (the tests' stand-in agent)
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unwatchFile, watchFile, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, statSync, unwatchFile, watchFile, writeFileSync } from "node:fs";
 import { hostname, homedir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
-export const BRIDGE_VERSION = "0.15.7";
+export const BRIDGE_VERSION = "0.15.8";
 export const PROTOCOL = "fr-agent.1";
 
 // The agents this bridge starts, as the ACP registry
@@ -66,6 +67,20 @@ export const AGENTS = {
     adapter: "@google/gemini-cli@0.65.0",
     command: ["npx", "--yes", "@google/gemini-cli@0.65.0", "--acp"],
     signIn: ["gemini", "and sign in"],
+  },
+  // Google's agent now: Gemini CLI answers a Google account's personal sign-in
+  // with "This client is no longer supported for Gemini Code Assist for
+  // individuals ... migrate to the Antigravity suite" (2026-10-23), so a
+  // Google account's free tier reaches Gemini through this. Its ACP server is
+  // a download of Google's per platform (the registry's agy-acp-server), not
+  // a package: on the PATH, it is used. It signs in with Google in a browser
+  // the first time, once its auth.type is set (signIn).
+  antigravity: {
+    name: "Google Antigravity",
+    adapter: "antigravity-acp@1.4.1",
+    local: process.platform === "win32" ? ["agy_acp_server.exe"] : process.platform === "linux" ? ["agy_acp_server.par", "--uid="] : ["agy_acp_server.par"],
+    signInText: 'put "auth": {"type": "oauth-personal"} in ~/.gemini/antigravity-acp/settings.json there; the next message opens a browser to sign in with Google',
+    install: "download Google's agy-acp-server for this computer (the ACP registry's antigravity-acp: https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json) and put agy_acp_server on the PATH",
   },
   grok: {
     name: "Grok Build",
@@ -135,6 +150,7 @@ const debug = (dir, line) => { if (DEBUG) process.stderr.write(`[acp ${dir}] ${c
 // How to sign an agent in on this computer, in words: its command, and what
 // to do in it when the command alone does not sign in.
 export function signInWords(known) {
+  if (known.signInText) return known.signInText;
   const [cmd, then] = known.signIn;
   return `run \`${cmd}\` in a terminal there once${then ? ` ${then}` : ""}`;
 }
@@ -669,6 +685,9 @@ export function slim(u) {
   return out;
 }
 
+// An object's fields that are set (an update's absent ones say nothing).
+const defined = (o) => Object.fromEntries(Object.entries(o || {}).filter(([, v]) => v !== undefined && v !== null));
+
 // What someone wrote, line by line behind "| ": a message cannot pass part of
 // itself off as another person's (a line "@owner wrote:" in it is still
 // quoted), and who wrote it is said on the line before, from the room.
@@ -930,7 +949,8 @@ export class PanelSync {
 // ---------- which agent session each conversation is in ----------
 
 // The agent's own session for each of the page's conversations on this
-// computer, and the last message it was given; for a terminal session's
+// computer, the last message it was given, and what the owner set it to in
+// the sidebar (its mode, its model: `set`); for a terminal session's
 // bridge, which session (its id on the mesh) was given each conversation. A
 // bridge started again, or an agent that stopped, takes that session up again
 // (ACP's session/load or session/resume, when the agent offers one) instead of
@@ -969,7 +989,8 @@ export class SessionStore {
   set(key, sid, entry, now = Date.now()) {
     const d = this.read();
     const all = d.by[key] && typeof d.by[key] === "object" ? d.by[key] : {};
-    all[sid] = { ...entry, at: now };
+    const was = all[sid] && typeof all[sid] === "object" ? all[sid] : {};
+    all[sid] = { ...was, ...entry, at: now };
     d.by[key] = all;
     const since = now - STORE_DAYS * 86400000;
     for (const k of Object.keys(d.by)) {
@@ -989,6 +1010,48 @@ export class SessionStore {
     }
   }
 }
+
+// pi's own reason for a turn that ended without a word: its ACP adapter
+// keeps a failed model call to itself (the turn ends as end_turn, nothing
+// said), but pi writes it in the session's file, which the adapter's own map
+// names (~/.pi/pi-acp/session-map.json). Read only, the end of that file only,
+// and only the error's text of its last answer; null when there is none.
+export function piLastError(acp, env = process.env) {
+  const home = env.HOME || env.USERPROFILE || homedir();
+  let file = null;
+  try { file = JSON.parse(readFileSync(join(home, ".pi", "pi-acp", "session-map.json"), "utf8"))?.sessions?.[acp]?.sessionFile ?? null; } catch { return null; }
+  if (typeof file !== "string" || !file) return null;
+  let tail = "";
+  try {
+    const fd = openSync(file, "r");
+    try {
+      const size = fstatSync(fd).size;
+      const n = Math.min(size, 65536);
+      const buf = Buffer.alloc(n);
+      readSync(fd, buf, 0, n, size - n);
+      tail = buf.toString("utf8");
+    } finally { closeSync(fd); }
+  } catch { return null; }
+  for (const line of tail.trim().split("\n").reverse()) {
+    let e = null;
+    try { e = JSON.parse(line); } catch { continue; }
+    const m = e?.message;
+    if (m?.role !== "assistant") continue;
+    return m.stopReason === "error" && m.errorMessage ? cut(String(m.errorMessage).replace(/\s+/g, " ").trim(), 400) : null;
+  }
+  return null;
+}
+
+// An agent's refusal in words: its message, and the detail it puts in the
+// error's data (Antigravity says there which sign-in to choose), once.
+export function agentError(err) {
+  const msg = String(err?.message ?? err ?? "");
+  const d = err?.data;
+  const detail = typeof d === "string" ? d : typeof d?.message === "string" ? d.message : typeof d?.details === "string" ? d.details : "";
+  return detail && !msg.includes(detail.trim()) ? `${msg}: ${cut(detail.trim(), 400)}` : msg;
+}
+// Words of an agent's refusal that are about signing in.
+const SIGN_IN_WORDS = /\bauth|sign.?in|log.?in|credential|api.?key|unauthori[sz]ed|not logged/i;
 
 // An agent's answer that the session it was asked about is not open there
 // (pi keeps one session open at a time: opening another closes the rest, and
@@ -1343,6 +1406,12 @@ export class Bridge {
     }
     if (Array.isArray(r?.configOptions)) this.gotOptions(sid, o.acp, optionsOf(r));
     else { sel.current = value; this.gotOptions(sid, o.acp, o); }
+    // Kept for the conversation: a session taken up again (or begun anew for
+    // it) is set the same way, as Lody hands its sessions their config.
+    if (!this.session) {
+      const kept = this.store.get(this.agentId, sid);
+      this.store.set(this.agentId, sid, { set: { ...(kept?.set || {}), [id]: value } });
+    }
     log(`${by ? `@${by}` : "the page"} set ${sel.name} to ${sel.options.find((x) => x.value === value)?.name || value}`);
   }
   // Whether the session's mode lets the agent act without asking (Claude
@@ -1479,6 +1548,16 @@ export class Bridge {
       for (const [id, value] of [...this.pending]) await this.setOption(p.sid, id, value, null).catch((err) => warn("a setting was not changed:", err.message));
       this.pending.clear();
     }
+    // What the owner set this conversation to (its mode, its model), where the
+    // session it is in now is not set so: an agent's load gives its default
+    // (Codex's does), and a new session has its own. Only to one of the
+    // session's own options.
+    const chosen = saved?.set && typeof saved.set === "object" ? saved.set : {};
+    for (const [id, value] of Object.entries(chosen)) {
+      const sel = this.opts.get(p.sid)?.options.find((x) => x.id === id);
+      if (!sel || sel.current === value || !sel.options.some((x) => x.value === value)) continue;
+      await this.setOption(p.sid, id, value, null).catch((err) => warn("a setting was not set again:", err.message));
+    }
     // ...and so not for this message either, if it is someone else's (the
     // session stays, for the owner's).
     if (this.holdsBack(p)) return null;
@@ -1515,7 +1594,7 @@ export class Bridge {
     // an "always allow" there): the room told if it is no longer sure.
     this.sayAsks();
     if (this.holdsBack(p)) return;
-    const turn = { seq: p.seq, sid: p.sid, acp: null, record: new TurnRecord(), pending: new Map(), batch: [], timer: null, cancelled: false };
+    const turn = { seq: p.seq, sid: p.sid, acp: null, record: new TurnRecord(), pending: new Map(), batch: [], timer: null, cancelled: false, calls: new Map() };
     this.turn = turn;
     this.send({ t: "started", seq: p.seq });
     log(`@${p.by}: ${cut(String(p.text).split("\n")[0], 100)}`);
@@ -1566,6 +1645,14 @@ export class Bridge {
       await this.panel.push();
       this.flush(turn);
       const stop = turn.cancelled ? "cancelled" : String(answer?.stopReason || "end_turn");
+      // Nothing said at all: the agent's own reason, where it keeps one (pi).
+      if (!turn.cancelled && this.agentId === "pi" && !turn.record.parts.some((x) => x.k !== "note")) {
+        const why = piLastError(acp, this.env);
+        if (why) {
+          turn.record.parts.push({ k: "note", code: "agent-error", text: why });
+          warn(`${this.known.name} ended without a word; its own error: ${why}`);
+        }
+      }
       this.send({ t: "done", seq: p.seq, stop, record: turn.record.fit(this.limits.turn_bytes - 1024) });
       log(`done (${stop})`);
     } catch (err) {
@@ -1574,11 +1661,15 @@ export class Bridge {
       if (turn.cancelled) {
         this.send({ t: "done", seq: p.seq, stop: "cancelled", record: turn.record.fit(this.limits.turn_bytes - 1024) });
       } else {
+        // What the agent said, with the detail it gives beside it.
+        const said = agentError(err);
         // An agent not signed in on this computer says so (ACP's
-        // auth_required, -32000): the owner is told what to run.
-        const signIn = err.code === -32000 || /auth/i.test(err.message) ? ` (${this.known.name} is not signed in on this computer: ${signInWords(this.known)}, then send again)` : "";
-        this.send({ t: "error", seq: p.seq, error: cut(err.message + signIn, 1500) });
-        warn("the agent could not answer:", err.message + signIn);
+        // auth_required, -32000, and words about signing in): the owner is
+        // told what to run. Another answer with that code (Gemini CLI's
+        // "no longer supported" for a personal account) is passed on as said.
+        const signIn = (err.code === -32000 || /auth/i.test(err.message)) && SIGN_IN_WORDS.test(said) ? ` (${this.known.name} is not signed in on this computer: ${signInWords(this.known)}, then send again)` : "";
+        this.send({ t: "error", seq: p.seq, error: cut(said + signIn, 1500) });
+        warn("the agent could not answer:", said + signIn);
       }
     } finally {
       clearTimeout(turn.timer);
@@ -1621,6 +1712,12 @@ export class Bridge {
     turn.record.add(u);
     const s = slim(u);
     if (!s) return;
+    // Each tool call as it stands now, for a question that names it by its id
+    // alone (ACP's toolCall there is an update: Devin sends only the id).
+    if ((s.sessionUpdate === "tool_call" || s.sessionUpdate === "tool_call_update") && s.toolCallId !== undefined) {
+      const id = String(s.toolCallId);
+      turn.calls.set(id, { ...(turn.calls.get(id) || {}), ...defined(s) });
+    }
     const lastU = turn.batch.at(-1);
     if (lastU && (s.sessionUpdate === "agent_message_chunk" || s.sessionUpdate === "agent_thought_chunk") && lastU.sessionUpdate === s.sessionUpdate && lastU.content?.type === "text" && s.content?.type === "text") {
       lastU.content = { type: "text", text: lastU.content.text + s.content.text };
@@ -1661,7 +1758,8 @@ export class Bridge {
     const options = Array.isArray(params.options) ? params.options : [];
     if (!turn || params.sessionId !== turn.acp) return Promise.resolve({ outcome: { outcome: "cancelled" } });
     const req = `p${this.nextReq++}`;
-    const call = params.toolCall || {};
+    // The call it asks about, with what the turn already said of it.
+    const call = { ...(turn.calls.get(String(params.toolCall?.toolCallId ?? "")) || {}), ...defined(params.toolCall || {}) };
     this.flush(turn);
     return new Promise((ok) => {
       const timer = setTimeout(() => this.answer(turn, req, turn.pending.get(req), null, null), this.limits.permission_s * 1000);
@@ -1913,7 +2011,7 @@ async function main() {
     warn("Claude Code is not installed here (https://docs.claude.com/en/docs/claude-code): install it and sign in, then run this again");
     return 2;
   } else if (!agentCommand(AGENTS[args.agent])) {
-    warn(`${AGENTS[args.agent].name} is not installed here (its CLI, ${AGENTS[args.agent].local?.[0]}, is not on the PATH): install it, ${signInWords(AGENTS[args.agent])}, then run this again`);
+    warn(`${AGENTS[args.agent].name} is not installed here (its CLI, ${AGENTS[args.agent].local?.[0]}, is not on the PATH): ${AGENTS[args.agent].install || "install it"}, ${signInWords(AGENTS[args.agent])}, then run this again`);
     return 2;
   }
   const env = { ...process.env };
