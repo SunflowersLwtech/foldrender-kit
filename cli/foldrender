@@ -28,11 +28,11 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.15.0
+FR_CLI_VERSION=0.15.1
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=d3c5790e8537d73f61a7456fc997fcf77f17c7b072d5f414d45beedaa25c01c4
+FR_BRIDGE_SHA256=726efab59d71351f055f1ad98913f1826af4d5b18795ae71027b95383c8c5e63
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -2741,7 +2741,12 @@ foldrender bridge --page PAGE [--dir DIR] [--agent claude]
   with the agent beside the page, in a browser; it reads the page with
   foldrender read, works in DIR, and asks before it acts as its own settings
   say. Its questions go to the page, where only you (the owner, who runs it)
-  answer them. Messages sent while the bridge is away wait for it. The page's
+  answer them. Unless Claude Code is sure to ask you first (its mode is
+  default or dontAsk; no allow rule but reading inside DIR, no other folder,
+  no PreToolUse or PermissionRequest hook, no self-running sandbox, no
+  plugin), what your
+  collaborators say waits for you to hand it to the agent; it says so on
+  start. Messages sent while the bridge is away wait for it. The page's
   Markdown panel (its plan) is kept in DIR/.foldrender/PAGE/plan.md: the
   agent's edit there is written back to the panel, and if someone changed the
   panel meanwhile, the people on the page choose which text stays; the text
