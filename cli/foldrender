@@ -28,11 +28,11 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.15.2
+FR_CLI_VERSION=0.15.3
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=be01d9496f5962f6979140eff51f766be7e3ec7e62f7dc1cd927f92f1835a65a
+FR_BRIDGE_SHA256=78493e8dc52274c146731ba9cd9446fc5a829cfc71fcb4932f4dc6a1b9468fa0
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -170,7 +170,10 @@ fail_http() {
   local msg
   msg="$(error_text)"
   case "$STATUS" in
-    401) die 3 "not signed in, or the token was rejected ($msg). Run: foldrender login" ;;
+    401)
+      # The server's words, unless they say only what this sentence says.
+      case "$msg" in *"token was rejected"*|unauthorized|"no message") msg="" ;; esac
+      die 3 "not signed in, or the token was rejected${msg:+ ($msg)}. Run: foldrender login" ;;
     403)
       if grep -q quota_exceeded "$TMP/body"; then
         die 4 "free plan limit reached: 10 pages, each kept for 30 days. See your pages with: foldrender list"
@@ -1344,45 +1347,110 @@ cmd_undo() {
   restore_version "$1" "$vid"
 }
 
+# share PAGE... [+login ...] [-login ...] [--private|--shared|--link|--public]
+# [--reset-link] [--collab|--no-collab] [--copy|--no-copy]: who can open the
+# pages, said after each in the words of the site's Share panel (src/access.js).
+# People are added and removed as the panel does it (accessChange there): on a
+# page open to anyone with the link, or public, the list is kept and who can open
+# the page does not change; on a private page the first person added makes it
+# shared ("Only people added"), and on a shared page the last one removed makes
+# it private again. --shared asks for "Only people added" itself. +login with
+# --private is refused: private is the owner alone.
 cmd_share() {
-  local targets=() vis="" adds="" removes="" arg json reset="" as_json="" t
+  local targets=() vis="" adds="" removes="" arg json reset="" as_json="" t collab="" copy="" now visit
   for arg in "$@"; do
     case "$arg" in
       --public) vis=public ;;
       --link) vis=link ;;
       --private) vis=private ;;
+      --shared) vis=shared ;;
       --reset-link) reset=1 ;;
+      --collab) collab=true ;;
+      --no-collab) collab=false ;;
+      --copy) copy=true ;;
+      --no-copy) copy=false ;;
       --json) as_json=1 ;;
       --*) die 2 "unknown option: $arg" ;;
       +?*) check_logins "${arg#+}"; adds="${adds:+$adds,}${arg#+}" ;;
       -?*) check_logins "${arg#-}"; removes="${removes:+$removes,}${arg#-}" ;;
       ?*) targets+=("$arg") ;;
-      *) die 2 "expected a page, +login, -login, --public, --link, --private or --reset-link" ;;
+      *) die 2 "expected a page, +login, -login, --private, --shared, --link, --public, --reset-link, --collab or --copy" ;;
     esac
   done
-  [ ${#targets[@]} -gt 0 ] || die 2 "usage: foldrender share PAGE... [+login ...] [-login ...] [--public|--link|--private] [--reset-link]"
-  [ -n "$adds$removes$vis$reset" ] || die 2 "nothing to change: give +login, -login, --public, --link, --private or --reset-link"
+  [ ${#targets[@]} -gt 0 ] || die 2 "usage: foldrender share PAGE... [+login ...] [-login ...] [--private|--shared|--link|--public] [--reset-link] [--collab|--no-collab] [--copy|--no-copy]"
+  [ -n "$adds$removes$vis$reset$collab$copy" ] || die 2 "nothing to change: give +login, -login, --private, --shared, --link, --public, --reset-link, --collab or --copy"
+  if [ -n "$adds" ] && [ "$vis" = private ]; then
+    die 2 "--private is you alone, so +login would let nobody in. To share with the people you name: foldrender share PAGE +login"
+  fi
 
   json=""
-  [ -z "$vis" ] || json="\"visibility\":\"$vis\""
-  [ -z "$reset" ] || json="${json:+$json,}\"reset_link\":true"
+  [ -z "$reset" ] || json="\"reset_link\":true"
   [ -z "$adds" ] || json="${json:+$json,}\"share_add\":$(json_array "$adds")"
   [ -z "$removes" ] || json="${json:+$json,}\"share_remove\":$(json_array "$removes")"
-  [ -z "$as_json" ] || ACCEPT="application/json"
+  [ -z "$collab" ] || json="${json:+$json,}\"collab\":$collab"
+  [ -z "$copy" ] || json="${json:+$json,}\"copy\":$copy"
+  ACCEPT="application/json"
   for t in "${targets[@]}"; do
     page_id "$t"
     check_slug "$PAGE_ID"
-    api_auth PATCH "/api/artifacts/$PAGE_ID" -H "Content-Type: application/json" --data "{$json}"
+    visit="$vis"
+    # People added with no access asked for: a page open to the link, or public,
+    # stays so (the server would make it shared with them alone).
+    if [ -n "$adds" ] && [ -z "$visit" ]; then
+      api_auth GET "/api/artifacts/$PAGE_ID?format=meta"
+      [ "$STATUS" != 404 ] || die 7 "no page named $PAGE_ID among yours"
+      expect_2xx
+      now="$(json_get str visibility 2>/dev/null)"
+      case "$now" in link|public) visit="$now" ;; esac
+    fi
+    api_auth PATCH "/api/artifacts/$PAGE_ID" -H "Content-Type: application/json" \
+      --data "{${visit:+\"visibility\":\"$visit\"}${visit:+${json:+,}}$json}"
     [ "$STATUS" != 404 ] || die 7 "no page named $PAGE_ID among yours"
     expect_2xx
+    # Shared with nobody (the last person removed, or --shared on an empty
+    # list): the page is its owner's alone, which the panel calls private.
+    if [ "$(json_get str visibility)" = shared ] && [ "$(json_get len share)" = 0 ]; then
+      api_auth PATCH "/api/artifacts/$PAGE_ID" -H "Content-Type: application/json" --data '{"visibility":"private"}'
+      expect_2xx
+    fi
     if [ -n "$as_json" ]; then
       cat "$TMP/body"
       printf '\n'
     else
-      read_page_url
-      printf '%s\n' "$PAGE_URL"
+      json_get str page_url 2>/dev/null || json_get str url
+      printf '\n'
     fi
+    say_access "$t" "$collab" "$copy"
   done
+}
+
+# say_access PAGE COLLAB COPY: on stderr, who can open the page just written
+# (the body), as the site's Share panel says it, and collaboration and copies
+# when they were asked to change.
+say_access() {
+  local who names
+  case "$(json_get str visibility 2>/dev/null)" in
+    public) who="Public" ;;
+    link) who="Anyone with the link" ;;
+    shared)
+      names="$(json_get raw share 2>/dev/null | tr -d '[]" ' | sed 's/,/, /g')"
+      if [ -n "$names" ]; then who="Only people added ($names)"; else who="Only you"; fi ;;
+    *) who="Only you" ;;
+  esac
+  note "$1: who can open it: $who"
+  case "$(json_get str visibility 2>/dev/null)" in
+    link|public)
+      names="$(json_get raw share 2>/dev/null | tr -d '[]" ' | sed 's/,/, /g')"
+      [ -z "$names" ] || note "$1: people added ($names) are kept for when it is Only people added: foldrender share $1 --shared" ;;
+  esac
+  case "$2" in
+    true) note "$1: collaboration on: readers who sign in can write on it" ;;
+    false) note "$1: collaboration off: their ink stays, seen by you alone" ;;
+  esac
+  case "$3" in
+    true) note "$1: readers can copy this page" ;;
+    false) note "$1: copies of this page are off" ;;
+  esac
 }
 
 # ls [WORDS...]: your pages, newest first, one line each: the newest 20 unless
@@ -1585,7 +1653,8 @@ read_fail() {
   msg="$(error_text)"
   case "$STATUS" in
     401)
-      [ -z "$TOKEN" ] || die 3 "the token was rejected ($msg). Run: foldrender login"
+      case "$msg" in *"token was rejected"*|unauthorized|"no message") msg="" ;; esac
+      [ -z "$TOKEN" ] || die 3 "the token was rejected${msg:+ ($msg)}. Run: foldrender login"
       die 3 "$1 is not public. Sign in to read it: foldrender login" ;;
     404)
       [ -z "$TOKEN" ] || die 7 "no page named $1, or it is not shared with the account you are signed in as (see: foldrender whoami)"
@@ -2966,9 +3035,9 @@ written. Answers come back with foldrender answers PAGE (and in read).
                         shows once answered; data-fr-topic, data-fr-set group them
   <meta name="fr-choice-notify" content="NAME">  whom to tell of new answers
 Up to 50 questions a page, 20 options each. Answering needs a person signed
-in on the page (the owner, or a collaborator: Share > Collaborate); a token
-never answers. To let someone else answer, share the page with them and turn
-on Collaborate.
+in on the page (the owner, or a collaborator); a token never answers. To let
+someone else answer: foldrender share PAGE +LOGIN --collab (or the page's
+Share > Collaborate).
 EOF
     ;;
     ls|list) cat <<'EOF'
@@ -2983,9 +3052,25 @@ foldrender ls --duplicates [--json]
 EOF
     ;;
     share) cat <<'EOF'
-foldrender share PAGE... [+LOGIN ...] [-LOGIN ...] [--public|--link|--private] [--reset-link]
-  Changes who can read the pages, without publishing them again; prints each
-  address. --reset-link gives a --link page a new key: the old link stops working.
+foldrender share PAGE... [+LOGIN ...] [-LOGIN ...] [--private|--shared|--link|--public]
+       [--reset-link] [--collab|--no-collab] [--copy|--no-copy]
+  Changes who can open the pages, without publishing them again; prints each
+  address, and on stderr who can open it, as the site's Share panel says it.
+  --private            Only you
+  +LOGIN / -LOGIN      add or remove GitHub logins, as the Share panel does: a
+                       private page becomes Only people added; a --link or
+                       --public page stays so, the people kept on its list; the
+                       last one removed makes a shared page private again
+  --shared             Only people added: the logins on its list, signed in
+  --link               Anyone with the link (it carries a key; listed nowhere)
+  --public             Public: anyone, and listed on .../artifacts/LOGIN/
+  --reset-link         a new key for a --link page: the old link stops working
+  --collab             readers who sign in can write on it (ink, notes, and
+                       answering its choices); --no-collab turns it off
+  --copy / --no-copy   whether readers may copy it to their own space
+  --json               the API's answer
+Examples: foldrender share plan +alice --collab
+          foldrender share plan --link
 EOF
     ;;
     canvas) cat <<'EOF'

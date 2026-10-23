@@ -92,11 +92,14 @@ foldrender restore <page> VERSION    put back that version
 ## 5. Change access or manage pages
 
 ```
-foldrender share <slug-or-url> +alice -bob     add or remove logins
+foldrender share <slug-or-url> +alice -bob     add or remove logins, as the Share panel does: a private page becomes only people added; a link or public page stays so, alice kept on its list
+foldrender share <slug-or-url> --shared        only the people added (their logins, signed in)
 foldrender share <slug-or-url> --link          anyone with the link (and its key)
 foldrender share <slug-or-url> --public        anyone, listed on the user's page
 foldrender share <slug-or-url> --private       owner only
 foldrender share <slug-or-url> --reset-link    a new key: the link handed out before stops working
+foldrender share <slug-or-url> --collab        readers who sign in can write on it and answer its choices (--no-collab: off)
+foldrender share <slug-or-url> --no-copy       readers cannot copy it to their space (--copy: they can)
 foldrender ls [WORDS]                          the user's 20 newest pages, each with its id and address (--all, --access A, --folder F)
 foldrender ls --duplicates                     the user's pages that have the same content, in groups, oldest first; deletes nothing. Ask the user before deleting any: pages can share content on purpose
 foldrender open <slug-or-url>                  open a page in the browser
@@ -219,7 +222,7 @@ The card has no colours of its own: it shows the page's. A page that declares a 
 - Up to 50 questions a page, 20 options each. `foldrender read` says when a block cannot be asked as written.
 - `<meta name="fr-choice-notify" content="NAME">` in `<head>` is only for a relay the user runs on their own (it passes answers on to NAME); FoldRender itself tells no one. `content="-"`: no one, for a trial page.
 
-Who answers: the page's owner, signed in, on the page (phone, tablet, desktop, the app), and on a page they shared with Collaborate turned on, those collaborators. The answer counts 6 seconds after the tap (they can undo it until then) and can be changed later; every change is kept. The pick and the note are kept apart: a new pick keeps the note, the note can be changed or removed on its own, and a note with no option picked is an answer too (read back as "a note only", never as "not the suggestion"). An answer can be withdrawn after its 6 seconds (read back as "(withdrawn)", and the question counts as not answered). A token never answers: do not try to answer for the user.
+Who answers: the page's owner, signed in, on the page (phone, tablet, desktop, the app), and on a page they shared with Collaborate turned on (`foldrender share PAGE --collab`), those collaborators. The answer counts 6 seconds after the tap (they can undo it until then) and can be changed later; every change is kept. The pick and the note are kept apart: a new pick keeps the note, the note can be changed or removed on its own, and a note with no option picked is an answer too (read back as "a note only", never as "not the suggestion"). An answer can be withdrawn after its 6 seconds (read back as "(withdrawn)", and the question counts as not answered). A token never answers: do not try to answer for the user.
 
 Nothing is sent to you when the user answers. When they want you to read their answers they give you the page's link (or say "I answered"); then read them as below.
 
