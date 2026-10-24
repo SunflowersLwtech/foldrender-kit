@@ -28,11 +28,11 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.15.8
+FR_CLI_VERSION=0.15.9
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=36b39955768d27768e4c56384bb1361e806a1c7b987742f88f67c37826a06f1a
+FR_BRIDGE_SHA256=7fa2ea73569cec4073e65267bc88ad10ecaffdc62fea464c1257456734645c51
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -3060,6 +3060,15 @@ foldrender bridge --page PAGE --channel
   told the conversation so far. Which session each conversation is in is kept
   in ~/.cache/foldrender/sessions (ids only). A terminal session (--session)
   that did not have the conversation gets it with the next message.
+  What people attach in the sidebar (at most 4 files a message, 4 MB each)
+  reaches the agent: an image as an image and a text file as its text, when
+  the agent takes them; every file but an image it takes is also saved in
+  DIR/.foldrender/PAGE/attachments/ and named in the message. The agent's
+  forms (a question with fields to fill) go to the page, where only you
+  answer them; its slash commands are listed when you type "/" in the box,
+  and yours is run as typed (anyone else's "/word" is a message). The title
+  the agent gives a conversation, and its usage (the context it holds, and
+  what it cost, which only you see), show in the sidebar.
   Only the page's owner runs a bridge on a page; a second one (another
   computer) takes over from the first. FoldRender runs no model: the agent
   runs here, signed in as you.
