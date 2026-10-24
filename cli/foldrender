@@ -28,11 +28,11 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.15.12
+FR_CLI_VERSION=0.15.13
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=bc4ee6c4394c4437a09f3a1fb080964bc7c2ecdd1b0dbaa440815b48ee2486e3
+FR_BRIDGE_SHA256=fec58092a6f4d9aa5042e286b458fffa61a18825760a116e3b394620838b751e
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -3093,7 +3093,9 @@ foldrender bridge --page PAGE --channel
   what it cost, which only you see), show in the sidebar.
   The bridge offers the agent ACP's file and terminal requests: a file in
   DIR is read or written as asked, a command runs in DIR, and what a command
-  prints shows in its line in the sidebar. A file or a command's folder
+  prints shows in its line in the sidebar (also for a command the agent runs
+  with its own tool, when it says what that printed, as pi does). A file or
+  a command's folder
   outside DIR (its links followed) is asked of you in the sidebar first.
   This fence is the bridge's own: an agent's own tools do not come through
   it, so it is no sandbox, and a command run in DIR can still reach anything

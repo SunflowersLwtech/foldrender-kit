@@ -1193,6 +1193,10 @@ export function commandLine(command, args, cwd, platform = process.platform) {
   return platform === "win32" ? ["cmd.exe", ["/c", command]] : ["/bin/sh", ["-c", command]];
 }
 
+// What the page is given of a command's output: its last 8,000 characters,
+// with its "…" (so that an update's own cut leaves it as it is).
+const shownOutput = (text) => (text.length > 8000 ? `…${text.slice(-7999)}` : text);
+
 // Commands the agent runs through this client: each in a process group of its
 // own, what it prints kept up to its limit (the newest, as ACP says), killed
 // with the bridge.
@@ -2250,7 +2254,7 @@ export class Bridge {
     // an "always allow" there): the room told if it is no longer sure.
     this.sayAsks();
     if (this.holdsBack(p)) return;
-    const turn = { seq: p.seq, sid: p.sid, acp: null, at: Date.now(), by: p.by || null, okBy: p.ok_by || null, record: new TurnRecord(), pending: new Map(), elicits: new Map(), batch: [], timer: null, cancelled: false, calls: new Map(), changes: new TurnChanges(this.fenceRoot()) };
+    const turn = { seq: p.seq, sid: p.sid, acp: null, at: Date.now(), by: p.by || null, okBy: p.ok_by || null, record: new TurnRecord(), pending: new Map(), elicits: new Map(), batch: [], timer: null, cancelled: false, calls: new Map(), ran: new Map(), named: new Set(), printed: new Map(), changes: new TurnChanges(this.fenceRoot()) };
     this.turn = turn;
     this.send({ t: "started", seq: p.seq });
     log(`@${p.by}: ${cut(String(p.text).split("\n")[0], 100)}`);
@@ -2396,7 +2400,7 @@ export class Bridge {
     if (!turn || params.sessionId !== turn.acp) return;
     // (The files it names, for what the turn changed; a command run here shows what it printed.)
     turn.changes.seen(params.update);
-    const u = this.withTerminals(params.update);
+    const u = this.withTerminals(params.update, turn);
     turn.record.add(u);
     const s = slim(u);
     if (!s) return;
@@ -2584,28 +2588,63 @@ export class Bridge {
       const { id, started } = this.terms.create({ ...params, cwd: f.path });
       try { await started; } catch (err) { this.terms.open.delete(id); throw err; }
       log(`the agent runs ${cut(what, 160)}${f.inside ? "" : ` in ${f.path}`}`);
+      if (this.turn?.acp === acp) this.ranFor(this.turn, what, this.terms.open.get(id));
       return { terminalId: id };
     }
     const t = this.terms.get(params.terminalId, acp);
     if (method === "terminal/output") return this.terms.output(t);
     if (method === "terminal/wait_for_exit") { const e = await t.exited; return { exitCode: e.exitCode, signal: e.signal }; }
     if (method === "terminal/kill") { await this.terms.kill(t); return {}; }
-    if (method === "terminal/release") { await this.terms.release(String(params.terminalId), t); return {}; }
+    if (method === "terminal/release") { this.keepShown(t); await this.terms.release(String(params.terminalId), t); return {}; }
     throw Object.assign(new Error(`this client does not offer ${method}`), { code: -32601 });
   }
 
+  // A command run here while one of the agent's tool calls that runs a
+  // command is open, when the agent does not name the terminal in that call
+  // (Devin's says only how it ended): the call is that one, by its command,
+  // or as the only one open; with more and none its command, none is guessed.
+  ranFor(turn, what, t) {
+    if (!t) return;
+    const command = (c) => (Array.isArray(c.rawInput?.command) ? c.rawInput.command.join(" ") : c.rawInput?.command);
+    const open = [...turn.calls].filter(([id, c]) => c.kind === "execute" && (c.status === undefined || c.status === "pending" || c.status === "in_progress") && !turn.ran.has(id) && !turn.named.has(id));
+    const same = open.filter(([, c]) => command(c) === what);
+    const call = same.length === 1 ? same[0] : same.length === 0 && open.length === 1 ? open[0] : null;
+    if (call) turn.ran.set(call[0], { t, text: "" });
+  }
+  // A command the agent releases: what its call shows of it is kept (the
+  // page's 8,000 characters), not the rest of what it printed.
+  keepShown(t) {
+    for (const r of this.turn?.ran?.values() || []) if (r.t === t) { r.text = shownOutput(this.terms.output(t).output); r.t = null; }
+  }
+
   // A tool call that shows one of the commands run here (ACP's terminal
-  // content): what it printed so far, as text the page can show.
-  withTerminals(u) {
-    if (!Array.isArray(u?.content) || !u.content.some((c) => c?.type === "terminal")) return u;
+  // content): what it printed so far, as text the page can show. A call that
+  // does not name it but ran it (ranFor) shows it too, before what it says.
+  // A command the agent runs with its own tool, when it says what that printed
+  // in the update's _meta (Zed's terminal_output, as pi sends it, piece by
+  // piece), shows that, gathered (its last 8,001 characters: enough to say
+  // when it was cut).
+  withTerminals(u, turn) {
+    const id = u?.toolCallId !== undefined && u?.toolCallId !== null ? String(u.toolCallId) : null;
+    const said = u?._meta?.terminal_output;
+    const theirs = said && typeof said.data === "string" && said.terminal_id !== undefined && said.terminal_id !== null && turn?.printed && !this.terms.open.has(String(said.terminal_id)) ? String(said.terminal_id) : null;
+    if (theirs !== null) turn.printed.set(theirs, ((turn.printed.get(theirs) || "") + said.data).slice(-8001));
+    if (theirs !== null && !Array.isArray(u.content)) return { ...u, content: [{ type: "content", content: { type: "text", text: shownOutput(turn.printed.get(theirs)) } }] };
+    if (!Array.isArray(u?.content) || !u.content.some((c) => c?.type === "terminal")) {
+      const ran = id !== null && !turn?.named?.has(id) ? turn?.ran?.get(id) : null;
+      const text = ran ? (ran.t ? shownOutput(this.terms.output(ran.t).output) : ran.text) : "";
+      if (!text) return u;
+      return { ...u, content: [{ type: "content", content: { type: "text", text } }, ...(Array.isArray(u.content) ? u.content : [])] };
+    }
+    if (id !== null) turn?.named?.add(id);
     return {
       ...u,
       content: u.content.map((c) => {
         const t = c?.type === "terminal" ? this.terms.open.get(String(c.terminalId ?? "")) : null;
+        const p = c?.type === "terminal" && !t ? turn?.printed?.get(String(c.terminalId ?? "")) : undefined;
+        if (p !== undefined) return { type: "content", content: { type: "text", text: shownOutput(p) } };
         if (!t) return c;
-        const text = this.terms.output(t).output;
-        // (8,000 characters with its "…", so that the update's own cut leaves it as it is.)
-        return { type: "content", content: { type: "text", text: text.length > 8000 ? `…${text.slice(-7999)}` : text } };
+        return { type: "content", content: { type: "text", text: shownOutput(this.terms.output(t).output) } };
       }),
     };
   }
