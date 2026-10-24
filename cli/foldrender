@@ -28,7 +28,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.15.11
+FR_CLI_VERSION=0.15.12
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -247,8 +247,9 @@ token_from() {
 # page_id TARGET: sets PAGE_ID to the id of the page TARGET names, and PAGE_K to
 # its link token when TARGET carries one. TARGET is an id, a link by id
 # (https://foldrender.dev/artifacts/-/<id>, or an old a.foldrender.dev/<id>), a library link
-# (...?open=<id>), or a page's address (https://foldrender.dev/artifacts/<owner>/
-# [<folder>/]<name>), which the API resolves to its id. Not run in a subshell,
+# (...?open=<id>), a page's address (https://foldrender.dev/artifacts/<owner>/
+# [<folder>/]<name>), or the desk app's (https://foldrender.dev/desk, the signed-in
+# account's desk), which the API resolves to its id. Not run in a subshell,
 # because a die inside $(...) would only end the subshell.
 page_id() {
   local path
@@ -258,19 +259,7 @@ page_id() {
     http://*/artifacts/-/*|https://*/artifacts/-/*) PAGE_ID="$(slug_from "$1")" ;;
     http://*/artifacts/*|https://*/artifacts/*)
       path="/artifacts/${1#*/artifacts/}"
-      path="${path%%[?#]*}"
-      if [ -n "$TOKEN" ]; then
-        api GET "/api/resolve?path=$(urlencode "$path")${PAGE_K:+&k=$PAGE_K}" -H "$(auth_header)"
-      else
-        api GET "/api/resolve?path=$(urlencode "$path")${PAGE_K:+&k=$PAGE_K}"
-      fi
-      case "$STATUS" in
-        200) PAGE_ID="$(sed -n 's/.*"id" *: *"\([^"]*\)".*/\1/p' "$TMP/body" | head -n 1)" ;;
-        401) die 3 "$1 is not public. Sign in to use it: foldrender login" ;;
-        404) die 7 "no page at $1, or it is not visible to this account" ;;
-        *) fail_http ;;
-      esac
-      [ -n "$PAGE_ID" ] || die 1 "the server did not say which page $1 is"
+      resolve_address "${path%%[?#]*}" "$1"
       ;;
     # Anything else on the site itself is not a page. foldrender.dev/<owner>/<repo>
     # (and /repos/..., /github.com/...) is the site's reader for a GitHub
@@ -279,6 +268,11 @@ page_id() {
     http://foldrender.dev/*|https://foldrender.dev/*|http://www.foldrender.dev/*|https://www.foldrender.dev/*)
       path="/${1#*://*/}"
       path="${path%%[?#]*}"
+      # The desk app: the signed-in account's own desk.
+      if [ "$path" = "/desk" ]; then
+        resolve_address /desk "$1"
+        return
+      fi
       case "$path" in
         /guides/*|/install/*|/assets/*|/fonts/*|/zh/*|/ms/*|/api/*|/i18n/*) path="" ;;
       esac
@@ -288,6 +282,24 @@ page_id() {
       ;;
     *) PAGE_ID="$(slug_from "$1")" ;;
   esac
+}
+
+# resolve_address PATH TARGET: sets PAGE_ID to the id of the page at PATH (an
+# address under /artifacts, or /desk), as the API resolves it for this account;
+# TARGET is what the user gave, for the messages.
+resolve_address() {
+  if [ -n "$TOKEN" ]; then
+    api GET "/api/resolve?path=$(urlencode "$1")${PAGE_K:+&k=$PAGE_K}" -H "$(auth_header)"
+  else
+    api GET "/api/resolve?path=$(urlencode "$1")${PAGE_K:+&k=$PAGE_K}"
+  fi
+  case "$STATUS" in
+    200) PAGE_ID="$(sed -n 's/.*"id" *: *"\([^"]*\)".*/\1/p' "$TMP/body" | head -n 1)" ;;
+    401) die 3 "$2 is not public. Sign in to use it: foldrender login" ;;
+    404) die 7 "no page at $2, or it is not visible to this account" ;;
+    *) fail_http ;;
+  esac
+  [ -n "$PAGE_ID" ] || die 1 "the server did not say which page $2 is"
 }
 
 # Percent-encodes every byte except unreserved characters.
@@ -2971,7 +2983,10 @@ foldrender desk COMMAND [--desk ID] [--json]
   you, what is running and where it is stuck, the machines and seats, what was
   done today and what happens next. Your agents write it; you answer each
   question on the page with a tap (6 seconds to undo), and they take your
-  answers from its inbox. Open it at its address, signed in (only you can).
+  answers from its inbox. Open it signed in (only you can): at
+  https://foldrender.dev/desk where your account has the desk app (init says
+  which), else at its page address. It is not one of your pages: ls does not
+  list it, and it takes no page's place or storage.
   init [--name desk] [--title T] [--lang en|zh]
                        make your desk (or say where it is); prints its address
   token add --role agent|feed --name NAME
@@ -2994,7 +3009,8 @@ foldrender desk COMMAND [--desk ID] [--json]
   feed SOURCE FILE.json|-   a snapshot: {"every_s": 60, "items": [{key, kind:
                        session|host|seat|alert|timer, title, product?, state?,
                        body?}]}; what it no longer names is removed
-  ls                   the desk as text (also: foldrender read DESK)
+  ls                   the desk as text (also: foldrender read DESK, or
+                       foldrender read https://foldrender.dev/desk)
   inbox [--all] [--after ID]
                        your answers that count and no agent has taken yet
   ack ID --sent | --doing | --done "what was done"
