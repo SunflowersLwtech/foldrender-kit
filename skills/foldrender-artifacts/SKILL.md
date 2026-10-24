@@ -315,6 +315,16 @@ When a command fails with "not signed in" (exit code 3):
 
 If the user gives you a token, run `foldrender login --token <token>` and do not repeat it back.
 
+### Several accounts
+
+One machine can be signed in to several GitHub accounts. `foldrender auth list` shows them, the default marked; `foldrender whoami` says which one a command runs as.
+
+- When the user names the account to use ("publish this as my work account"), run that command with `--as <login>`. It does not change the default.
+- When you run on the user's behalf for a while (a session, the sidebar's bridge), pin your account with `FOLDRENDER_ACCOUNT=<login>` for every command, so that the user switching accounts in a terminal (`foldrender auth switch`) does not move what you publish. `FOLDRENDER_TOKEN`, when set, comes before both.
+- To add another account, run `foldrender login` as in "Signing in" and ask the user to approve it as that account (in the browser, switch to it first). The accounts signed in before stay; the new one becomes the default.
+- Do not run `foldrender auth switch` or `foldrender logout` unless the user asks: they change what every terminal on the machine runs as. `foldrender logout <login>` revokes that account's token on the server too.
+- Exit 3 with "is not signed in on this machine" means the account named by `--as` or `FOLDRENDER_ACCOUNT` has no sign-in here: tell the user, and do not fall back to another account.
+
 ## Exit codes
 
 | Code | Meaning | What to do |

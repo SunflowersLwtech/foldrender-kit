@@ -10,7 +10,10 @@
 # notes, warnings and the next commands, one line each. Other commands print
 # to stdout, briefly by default; --json prints the API's answer as it is.
 #
-#   FOLDRENDER_TOKEN       API token; takes precedence over the saved login.
+#   FOLDRENDER_TOKEN       API token; takes precedence over any saved account.
+#   FOLDRENDER_ACCOUNT     A saved account's GitHub login (as --as LOGIN): this
+#                          command runs as that account, whichever is the
+#                          default (foldrender auth switch).
 #   FOLDRENDER_API         API base URL (default https://foldrender.dev/artifacts,
 #                          where the app is; its API is under /api there).
 #   FOLDRENDER_NO_BROWSER  Set to 1 to print the sign-in link, not open it.
@@ -28,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.15.13
+FR_CLI_VERSION=0.16.0
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -39,8 +42,26 @@ MAX_BYTES=5242880
 CARD_MAX_BYTES=2097152
 CANVAS_MAX_CARDS=24
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/foldrender"
-TOKEN_FILE="$CONFIG_DIR/token"
+# Saved accounts (0.16.0): accounts/<login> holds that account's token (mode
+# 600) and accounts/<login>.slugs its slug map; "active" names the default.
+# A command's account is, first to last: FOLDRENDER_TOKEN (a token: its account
+# is not looked up, and its slug map is CONFIG_DIR/slugs, as before), --as LOGIN
+# or FOLDRENDER_ACCOUNT (a saved account: an agent pins one, so that switching
+# in a terminal does not move it), the default. Before 0.16.0 a machine had one,
+# CONFIG_DIR/token with CONFIG_DIR/slugs: it is used as the default until a
+# command that names accounts (login, logout, auth, whoami) learns whose it is
+# and moves it under its login, its slug map copied (CONFIG_DIR/slugs stays for
+# FOLDRENDER_TOKEN runs).
+ACCOUNTS_DIR="$CONFIG_DIR/accounts"
+ACTIVE_FILE="$CONFIG_DIR/active"
+LEGACY_TOKEN="$CONFIG_DIR/token"
 SLUG_MAP="$CONFIG_DIR/slugs"
+TOKEN_FILE=""
+TOKEN=""
+ACCOUNT=""
+ACCOUNT_FROM=""
+ACCOUNT_ERROR=""
+AS_LOGIN=""
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/foldrender.XXXXXX")" || exit 1
 trap 'rm -rf "$TMP"' EXIT
@@ -65,15 +86,85 @@ need() {
   [ "$1" -ge 2 ] || die 2 "$2 needs a value"
 }
 
-read_token() {
+lower() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+# A GitHub login, as saved here (lowercase): letters, digits and hyphens.
+valid_login() {
+  case "$1" in ''|-*|*[!a-z0-9-]*) return 1 ;; esac
+  [ "${#1}" -le 39 ]
+}
+
+# The saved accounts' logins, one a line, in order.
+saved_logins() {
+  [ -d "$ACCOUNTS_DIR" ] || return 0
+  local f b
+  for f in "$ACCOUNTS_DIR"/*; do
+    b="${f##*/}"
+    case "$b" in *.*) continue ;; esac
+    valid_login "$b" && [ -f "$f" ] && printf '%s\n' "$b"
+  done
+  return 0
+}
+
+active_login() {
+  head -n 1 "$ACTIVE_FILE" 2>/dev/null | tr -d ' \t\r\n'
+}
+
+# use_account LOGIN FROM: this run's account is the saved LOGIN.
+use_account() {
+  ACCOUNT="$1"
+  ACCOUNT_FROM="$2"
+  TOKEN_FILE="$ACCOUNTS_DIR/$1"
+  SLUG_MAP="$ACCOUNTS_DIR/$1.slugs"
+  TOKEN="$(head -n 1 "$TOKEN_FILE" | tr -d ' \t\r\n')"
+}
+
+# The account this run uses (see CONFIG_DIR above), into TOKEN, ACCOUNT,
+# ACCOUNT_FROM (FOLDRENDER_TOKEN, --as, FOLDRENDER_ACCOUNT, default, or saved for
+# the one from before 0.16.0), TOKEN_FILE and SLUG_MAP. One named that is not
+# saved here leaves no token and ACCOUNT_ERROR, which require_token says: a
+# command that needs no token (help, version) still runs.
+select_account() {
+  local login="" from=""
+  TOKEN=""; ACCOUNT=""; ACCOUNT_FROM=""; ACCOUNT_ERROR=""; TOKEN_FILE=""; SLUG_MAP="$CONFIG_DIR/slugs"
   if [ -n "${FOLDRENDER_TOKEN:-}" ]; then
-    printf '%s' "$FOLDRENDER_TOKEN"
-  elif [ -f "$TOKEN_FILE" ]; then
-    head -n 1 "$TOKEN_FILE" | tr -d ' \t\r\n'
+    TOKEN="$FOLDRENDER_TOKEN"
+    ACCOUNT_FROM=FOLDRENDER_TOKEN
+    return 0
+  fi
+  if [ -n "$AS_LOGIN" ]; then
+    login="$AS_LOGIN"; from=--as
+  elif [ -n "${FOLDRENDER_ACCOUNT:-}" ]; then
+    login="$FOLDRENDER_ACCOUNT"; from=FOLDRENDER_ACCOUNT
+  fi
+  if [ -n "$from" ]; then
+    login="$(lower "$login")"
+    if ! valid_login "$login"; then
+      ACCOUNT_ERROR="not a GitHub login: $login ($from)"
+    elif [ ! -f "$ACCOUNTS_DIR/$login" ]; then
+      ACCOUNT_ERROR="$login is not signed in on this machine ($from). Run: foldrender login (approve it as $login), or see who is: foldrender auth list"
+    else
+      use_account "$login" "$from"
+    fi
+    return 0
+  fi
+  login="$(active_login)"
+  if valid_login "$login" && [ -f "$ACCOUNTS_DIR/$login" ]; then
+    use_account "$login" default
+  elif [ -f "$LEGACY_TOKEN" ]; then
+    TOKEN="$(head -n 1 "$LEGACY_TOKEN" | tr -d ' \t\r\n')"
+    TOKEN_FILE="$LEGACY_TOKEN"
+    ACCOUNT_FROM=saved
+  else
+    login="$(saved_logins | head -n 1)"
+    [ -z "$login" ] || use_account "$login" default
   fi
 }
 
 require_token() {
+  [ -z "$ACCOUNT_ERROR" ] || die 3 "$ACCOUNT_ERROR"
   [ -n "$TOKEN" ] || die 3 "not signed in. Run: foldrender login"
 }
 
@@ -365,7 +456,7 @@ map_forget() {
 
 # A temporary file of this run's own: two publishes at once must not write one.
 map_set() {
-  mkdir -p "$CONFIG_DIR"
+  mkdir -p "${SLUG_MAP%/*}"
   {
     [ -f "$SLUG_MAP" ] && map_without 1 "$1"
     printf '%s\t%s\n' "$1" "$2"
@@ -440,16 +531,79 @@ open_url() {
   return 0
 }
 
-save_token() {
-  mkdir -p "$CONFIG_DIR"
-  rm -f "$TOKEN_FILE.tmp"
-  ( umask 077 && printf '%s\n' "$1" > "$TOKEN_FILE.tmp" )
-  chmod 600 "$TOKEN_FILE.tmp"
-  mv -f "$TOKEN_FILE.tmp" "$TOKEN_FILE"
+# store_account LOGIN TOKEN: LOGIN's token, saved (mode 600, in a folder only
+# this user reads); one saved before for LOGIN is replaced.
+store_account() {
+  mkdir -p "$ACCOUNTS_DIR" || die 1 "cannot make $ACCOUNTS_DIR"
+  chmod 700 "$ACCOUNTS_DIR" 2>/dev/null
+  rm -f "$ACCOUNTS_DIR/$1.tmp"
+  ( umask 077 && printf '%s\n' "$2" > "$ACCOUNTS_DIR/$1.tmp" ) || die 1 "cannot write $ACCOUNTS_DIR"
+  chmod 600 "$ACCOUNTS_DIR/$1.tmp"
+  mv -f "$ACCOUNTS_DIR/$1.tmp" "$ACCOUNTS_DIR/$1" || die 1 "cannot write $ACCOUNTS_DIR/$1"
+}
+
+set_active() {
+  mkdir -p "$CONFIG_DIR" || die 1 "cannot make $CONFIG_DIR"
+  printf '%s\n' "$1" > "$ACTIVE_FILE.tmp" && mv -f "$ACTIVE_FILE.tmp" "$ACTIVE_FILE" || die 1 "cannot write $ACTIVE_FILE"
+}
+
+# whose_token TOKEN: asks the server whose TOKEN is (GET /api/me). 0 with its
+# login in WHO; 1 when the server refused it (STATUS) or could not be reached
+# (STATUS empty).
+whose_token() {
+  local saved="$TOKEN"
+  WHO=""
+  TOKEN="$1"
+  if ! api_once GET /api/me -H "$(auth_header)"; then
+    TOKEN="$saved"; STATUS=""; return 1
+  fi
+  TOKEN="$saved"
+  case "$STATUS" in 2??) ;; *) return 1 ;; esac
+  WHO="$(lower "$(field login)")"
+  valid_login "$WHO"
+}
+
+# migrate_legacy: the sign-in saved before 0.16.0 (CONFIG_DIR/token), named
+# by the server and moved under its login, with a copy of its slug map; the
+# default if there is none. Left as it is when the server cannot be reached;
+# removed when the server refuses it (401), as no good. When the account has a
+# token saved here already (an older CLI signed in again after the move, or a
+# login whose /api/me failed), that one is kept, and the old one is revoked on
+# the server before it goes: never a good token nobody here knows of.
+migrate_legacy() {
+  local t a had
+  [ -f "$LEGACY_TOKEN" ] || return 0
+  t="$(head -n 1 "$LEGACY_TOKEN" | tr -d ' \t\r\n')"
+  if [ -z "$t" ]; then
+    rm -f "$LEGACY_TOKEN"
+    return 0
+  fi
+  if ! whose_token "$t"; then
+    if [ "$STATUS" = 401 ]; then
+      rm -f "$LEGACY_TOKEN"
+      # It was this run's account: this run has another now, or none.
+      [ "$ACCOUNT_FROM" != saved ] || select_account
+    fi
+    return 0
+  fi
+  had="$(head -n 1 "$ACCOUNTS_DIR/$WHO" 2>/dev/null | tr -d ' \t\r\n')"
+  if [ -n "$had" ] && [ "$had" != "$t" ]; then
+    # Revoked, or kept here to try again: never dropped while it is still good.
+    revoke_token "$t" || return 0
+    rm -f "$LEGACY_TOKEN"
+    [ "$ACCOUNT_FROM" != saved ] || use_account "$WHO" default
+    return 0
+  fi
+  store_account "$WHO" "$t"
+  [ ! -f "$CONFIG_DIR/slugs" ] || [ -f "$ACCOUNTS_DIR/$WHO.slugs" ] || cp -p "$CONFIG_DIR/slugs" "$ACCOUNTS_DIR/$WHO.slugs"
+  a="$(active_login)"
+  valid_login "$a" && [ -f "$ACCOUNTS_DIR/$a" ] || set_active "$WHO"
+  rm -f "$LEGACY_TOKEN"
+  [ "$ACCOUNT_FROM" != saved ] || use_account "$WHO" default
 }
 
 warn_env_token() {
-  [ -z "${FOLDRENDER_TOKEN:-}" ] || note "FOLDRENDER_TOKEN is set, so it is used instead of the saved token"
+  [ -z "${FOLDRENDER_TOKEN:-}" ] || note "FOLDRENDER_TOKEN is set, so it is used instead of the saved accounts"
 }
 
 # json_field KEY: the string under KEY in a JSON body (no quotes inside), or
@@ -615,22 +769,39 @@ field() {
   sed -n "s/^$1=//p" "$TMP/body" | head -n 1 | tr -d '\r'
 }
 
+# login [--token TOKEN]: adds an account (or signs one in again) and makes it
+# the default; the accounts saved before stay, and auth switch goes back.
 cmd_login() {
-  local token=""
+  local token="" login others
   while [ $# -gt 0 ]; do
     case "$1" in
       --token) need $# "$1"; token="$2"; shift 2 ;;
       *) die 2 "unknown option: $1" ;;
     esac
   done
+  # The sign-in from before 0.16.0 is kept, under its own login.
+  migrate_legacy
   if [ -n "$token" ]; then
     TOKEN="$token"
-    cmd_whoami
-    save_token "$token"
-    printf 'Token saved to %s\n' "$TOKEN_FILE"
+    ACCOUNT_ERROR=""
+    show_account
+    login="$(lower "$(field login)")"
+    valid_login "$login" || die 1 "the server did not say whose this token is"
   else
     device_login
+    token="$LOGIN_TOKEN"
+    login="$LOGIN_AS"
+    if ! valid_login "$login"; then
+      whose_token "$token" || die 1 "the server did not say whose the new token is"
+      login="$WHO"
+    fi
+    printf 'Signed in as %s.\n' "$login"
   fi
+  store_account "$login" "$token"
+  set_active "$login"
+  printf 'Token saved to %s\n' "$ACCOUNTS_DIR/$login"
+  others="$(saved_logins | awk -v me="$login" '$0 != me' | paste -sd ' ' -)"
+  [ -z "$others" ] || note "$login is now the default account; also signed in here: ${others// /, } (foldrender auth switch LOGIN, or --as LOGIN for one command)"
   warn_env_token
 }
 
@@ -663,8 +834,8 @@ device_login() {
       token="$(field token)"
       login="$(field login)"
       [ -n "$token" ] || die 1 "the server returned no token"
-      save_token "$token"
-      printf 'Signed in as %s. Token saved to %s\n' "${login:-your account}" "$TOKEN_FILE"
+      LOGIN_TOKEN="$token"
+      LOGIN_AS="$(lower "$login")"
       return 0
     fi
     grep -q 'authorization_pending' "$TMP/body" && continue
@@ -678,7 +849,8 @@ device_login() {
   done
 }
 
-cmd_whoami() {
+# show_account: the account TOKEN is, its plan and pages, on stdout.
+show_account() {
   api_auth GET /api/me
   expect_2xx
   if grep -q '^login=' "$TMP/body"; then
@@ -693,10 +865,139 @@ cmd_whoami() {
   fi
 }
 
+# whoami: the account this command runs as; stderr says where that comes from
+# when it is not simply the only one saved.
+cmd_whoami() {
+  [ "$ACCOUNT_FROM" != saved ] || migrate_legacy
+  show_account
+  case "$ACCOUNT_FROM" in
+    --as|FOLDRENDER_ACCOUNT) note "this is $ACCOUNT, named by $ACCOUNT_FROM; the default here is $(active_login)" ;;
+    default) [ "$(saved_logins | wc -l | tr -d ' ')" -le 1 ] || note "this is the default account; others are signed in here too (foldrender auth list)" ;;
+  esac
+}
+
+# revoke_token TOKEN: the token is revoked on the server (DELETE
+# /api/tokens/current). 0 when it is, or was no good already (401); 2 when it
+# is not one of FoldRender's to revoke (a GitHub token signed in with login
+# --token: 400); 1 when the server could not be reached or would not.
+revoke_token() {
+  local saved="$TOKEN"
+  TOKEN="$1"
+  if ! api_once DELETE /api/tokens/current -H "$(auth_header)"; then
+    TOKEN="$saved"; STATUS=""; return 1
+  fi
+  TOKEN="$saved"
+  case "$STATUS" in 2??|401) return 0 ;; 400) return 2 ;; esac
+  return 1
+}
+
+# logout [LOGIN | --all]: each account's token revoked on the server, then
+# removed here (its slug map stays, for when it signs in again). With neither,
+# the account this command would run as (FOLDRENDER_TOKEN's is not saved here,
+# and is not touched). The default moves to an account still signed in.
 cmd_logout() {
-  rm -f "$TOKEN_FILE"
-  printf 'Removed the saved token.\n'
-  [ -z "${FOLDRENDER_TOKEN:-}" ] || note "FOLDRENDER_TOKEN is still set in this shell. Unset it to sign out completely."
+  local all="" who="" list="" l t failed="" a next rc
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all) all=1; shift ;;
+      -*) die 2 "unknown option: $1" ;;
+      *) [ -z "$who" ] || die 2 "logout takes one login (or --all)"; who="$(lower "$1")"; shift ;;
+    esac
+  done
+  [ -z "$all" ] || [ -z "$who" ] || die 2 "logout takes a login or --all, not both"
+  migrate_legacy
+  if [ -n "$all" ]; then
+    list="$(saved_logins)"
+  elif [ -n "$who" ]; then
+    valid_login "$who" || die 2 "not a GitHub login: $who"
+    [ -f "$ACCOUNTS_DIR/$who" ] || die 2 "$who is not signed in on this machine (foldrender auth list)"
+    list="$who"
+  elif [ -n "$ACCOUNT_ERROR" ]; then
+    die 3 "$ACCOUNT_ERROR"
+  elif [ -n "$ACCOUNT" ]; then
+    list="$ACCOUNT"
+  elif [ "$ACCOUNT_FROM" = saved ]; then
+    # From before 0.16.0, and the server could not say whose: revoked and removed as it is.
+    if revoke_token "$TOKEN"; then printf 'Signed out: the saved token is revoked and removed.\n'
+    else printf 'Removed the saved token, but could not revoke it on the server (%s). Revoke it under Account & CLI tokens: %s/account\n' "${STATUS:-$(curl_error)}" "$API"; failed=1; fi
+    rm -f "$LEGACY_TOKEN"
+  fi
+  for l in $list; do
+    t="$(head -n 1 "$ACCOUNTS_DIR/$l" | tr -d ' \t\r\n')"
+    rc=0
+    [ -z "$t" ] || { revoke_token "$t"; rc=$?; }
+    if [ "$rc" = 0 ]; then
+      printf 'Signed out of %s: its token is revoked and removed.\n' "$l"
+    elif [ "$rc" = 2 ]; then
+      printf 'Signed out of %s here. It was signed in with a GitHub token, which FoldRender cannot revoke: revoke it on GitHub if it is no longer needed (https://github.com/settings/tokens).\n' "$l"
+    else
+      printf 'Signed out of %s here, but its token could not be revoked on the server (%s). Revoke it under Account & CLI tokens: %s/account\n' "$l" "${STATUS:-$(curl_error)}" "$API"
+      failed=1
+    fi
+    rm -f "$ACCOUNTS_DIR/$l"
+  done
+  a="$(active_login)"
+  if ! { valid_login "$a" && [ -f "$ACCOUNTS_DIR/$a" ]; }; then
+    next="$(saved_logins | head -n 1)"
+    if [ -n "$next" ]; then
+      set_active "$next"
+      printf 'The default account is now %s.\n' "$next"
+    else
+      rm -f "$ACTIVE_FILE"
+    fi
+  fi
+  [ -n "$list$all" ] || [ "$ACCOUNT_FROM" = saved ] || [ -n "${FOLDRENDER_TOKEN:-}" ] || printf 'No account was signed in here.\n'
+  [ -z "${FOLDRENDER_TOKEN:-}" ] || note "FOLDRENDER_TOKEN is still set in this shell, and is not signed out by this. Unset it to sign out completely."
+  [ -z "$failed" ] || exit 6
+}
+
+# auth list | auth switch LOGIN: the accounts signed in here, and which is the
+# default (the account commands run as when FOLDRENDER_TOKEN, --as and
+# FOLDRENDER_ACCOUNT name none).
+cmd_auth() {
+  local sub="${1:-list}" to a l n
+  [ $# -eq 0 ] || shift
+  case "$sub" in
+    list|ls|status)
+      [ $# -eq 0 ] || die 2 "usage: foldrender auth list"
+      migrate_legacy
+      a="$(active_login)"
+      n=0
+      for l in $(saved_logins); do
+        n=$((n + 1))
+        if [ "$l" = "$a" ]; then printf '* %s (default)\n' "$l"; else printf '  %s\n' "$l"; fi
+      done
+      if [ "$ACCOUNT_FROM" = saved ]; then
+        printf '* a sign-in saved before 0.16.0 (whose, the server could not say just now)\n'
+        n=$((n + 1))
+      fi
+      [ "$n" -gt 0 ] || { printf 'No account is signed in here. Run: foldrender login\n'; [ -z "${FOLDRENDER_TOKEN:-}" ] || note "FOLDRENDER_TOKEN is set: commands run as its account"; exit 3; }
+      case "$ACCOUNT_FROM" in
+        FOLDRENDER_TOKEN) note "commands run as FOLDRENDER_TOKEN's account here, not as one of these" ;;
+        --as|FOLDRENDER_ACCOUNT) note "this command ran as $ACCOUNT ($ACCOUNT_FROM)" ;;
+      esac
+      [ -z "$ACCOUNT_ERROR" ] || note "$ACCOUNT_ERROR"
+      ;;
+    switch)
+      to="${1:-}"
+      [ $# -le 1 ] || die 2 "usage: foldrender auth switch LOGIN"
+      migrate_legacy
+      a="$(active_login)"
+      if [ -z "$to" ]; then
+        # Two accounts: the other one. More: say which.
+        [ "$(saved_logins | wc -l | tr -d ' ')" = 2 ] || die 2 "which account? foldrender auth switch LOGIN (signed in here: $(saved_logins | paste -sd ' ' - | sed 's/ /, /g'))"
+        to="$(saved_logins | awk -v me="$a" '$0 != me' | head -n 1)"
+      fi
+      to="$(lower "$to")"
+      valid_login "$to" || die 2 "not a GitHub login: $to"
+      [ -f "$ACCOUNTS_DIR/$to" ] || die 2 "$to is not signed in on this machine (signed in: $(saved_logins | paste -sd ' ' - | sed 's/ /, /g')). To add it: foldrender login"
+      set_active "$to"
+      printf 'The default account is now %s.\n' "$to"
+      [ -z "${FOLDRENDER_TOKEN:-}" ] || note "FOLDRENDER_TOKEN is set in this shell, and still comes first"
+      [ -z "${FOLDRENDER_ACCOUNT:-}" ] || note "FOLDRENDER_ACCOUNT=$FOLDRENDER_ACCOUNT is set in this shell, and still comes first"
+      ;;
+    *) die 2 "usage: foldrender auth list | foldrender auth switch LOGIN" ;;
+  esac
 }
 
 # json_number KEY: the number under KEY in a JSON body.
@@ -942,7 +1243,13 @@ cmd_account() {
   expect_2xx
   pages="$(json_number pages)"
   tokens="$(json_number tokens)"
-  rm -f "$TOKEN_FILE" "$SLUG_MAP" "$SLUG_MAP.tmp"
+  # Its sign-in here, and its slug map; the default moves to another account.
+  [ -z "$TOKEN_FILE" ] || rm -f "$TOKEN_FILE"
+  rm -f "$ACCOUNTS_DIR/$login" "$ACCOUNTS_DIR/$login.slugs" "$SLUG_MAP" "$SLUG_MAP.tmp"
+  if [ "$(active_login)" = "$login" ]; then
+    rm -f "$ACTIVE_FILE"
+    [ -z "$(saved_logins | head -n 1)" ] || set_active "$(saved_logins | head -n 1)"
+  fi
   printf 'Deleted the account %s: %s page(s) and %s API token(s).\n' "$login" "${pages:-?}" "${tokens:-?}"
   printf 'Removed the saved token and the slug map from this machine.\n'
   [ -z "${FOLDRENDER_TOKEN:-}" ] || note "FOLDRENDER_TOKEN is still set in this shell. Unset it to sign out completely."
@@ -2896,7 +3203,7 @@ foldrender publishes HTML pages as links and reads pages back as text.
   desk ...             your desk: agents ask and report, you answer (help desk)
   bridge --page PAGE   connect an agent (or --session NAME) to the page's sidebar
   rm PAGE... / open PAGE   delete pages / print a page's address and open it
-  login / logout / whoami / export [FILE] / account delete / version
+  login / logout / whoami / auth / export [FILE] / account delete / version
 
 PAGE is a page's address, its id, or an old a.foldrender.dev link.
 --json prints the API's answer. More: foldrender help COMMAND (or COMMAND
@@ -3273,10 +3580,21 @@ foldrender export [FILE.zip]
 EOF
     ;;
     login|logout|whoami) cat <<'EOF'
-foldrender login                 sign in: prints a link and a code to approve
+foldrender login                 sign in: prints a link and a code to approve.
+                                 Another account? Approve the link as it (switch
+                                 accounts in the browser first): it is added, and
+                                 becomes the default; the others stay signed in
 foldrender login --token TOKEN   save a token (from the account page) instead
-foldrender whoami                the signed-in login, plan and pages used
-foldrender logout                remove the saved token
+foldrender whoami                the login this command runs as, plan and pages used
+foldrender auth list             the accounts signed in here, the default marked
+foldrender auth switch LOGIN     make LOGIN the default (with two, the other one)
+foldrender logout [LOGIN|--all]  revoke the token on the server and remove it here:
+                                 the account in use, LOGIN, or every one
+Which account a command runs as, first to last: FOLDRENDER_TOKEN (a token; not
+one of the saved accounts), --as LOGIN anywhere on the command line or
+FOLDRENDER_ACCOUNT=LOGIN (a saved account: an agent sets this, so that a switch
+in a terminal does not move it), the default. Each account keeps its own map of
+published files, so publishing a file again updates that account's page.
 EOF
     ;;
     account) cat <<'EOF'
@@ -3301,7 +3619,8 @@ or not unique, the page moved on from --base, or a canvas edit was refused),
 11 no new answer before --timeout (answers --wait), 12 the id or address
 publish was asked for is another page's (the error names the page and the
 command to update it).
-Environment: FOLDRENDER_TOKEN (a token instead of the saved login),
+Environment: FOLDRENDER_TOKEN (a token instead of the saved accounts),
+FOLDRENDER_ACCOUNT (a saved account's login, as --as),
 FOLDRENDER_API (the API, for testing), FOLDRENDER_NO_BROWSER=1,
 FOLDRENDER_READ_MAX_TOKENS, FOLDRENDER_NO_UPDATE_NOTE=1 (never say that a
 newer CLI is out). Free plan: 10 pages, 30 days each, 5 MB a page.
@@ -3335,11 +3654,12 @@ main() {
   local cmd="${1:-help}"
   [ $# -eq 0 ] || shift
   case "$cmd" in
-    login|logout|account|export|whoami|publish|edit|share|list|ls|read|cat|versions|restore|undo|canvas|answers|desk|bridge|rm|delete|open|version)
+    login|logout|auth|account|export|whoami|publish|edit|share|list|ls|read|cat|versions|restore|undo|canvas|answers|desk|bridge|rm|delete|open|version)
       if help_asked "$cmd" "$@"; then
         case "$cmd" in
           list) cmd_help ls ;;
           cat) cmd_help read ;;
+          auth) cmd_help login ;;
           version) cmd_help ;;
           *) cmd_help "$cmd" ;;
         esac
@@ -3348,7 +3668,8 @@ main() {
   esac
   case "$cmd" in
     login) cmd_login "$@" ;;
-    logout) cmd_logout ;;
+    logout) cmd_logout "$@" ;;
+    auth) cmd_auth "$@" ;;
     account) cmd_account "$@" ;;
     export) cmd_export "$@" ;;
     whoami) cmd_whoami ;;
@@ -3373,5 +3694,25 @@ main() {
   esac
 }
 
-TOKEN="$(read_token)"
-main "$@"
+# --as LOGIN (or --as=LOGIN), anywhere: this command runs as that saved
+# account. Not the value of an option that takes one (edit --old --as).
+ARGS=()
+skip=""
+first=""
+while [ $# -gt 0 ]; do
+  if [ -n "$skip" ]; then ARGS+=("$1"); skip=""; shift; continue; fi
+  case "$1" in
+    --link) ARGS+=("$1"); case "$first" in canvas|desk) skip=1 ;; esac; shift; continue ;;
+    --as) [ $# -ge 2 ] || die 2 "--as needs a value"; AS_LOGIN="$2"; shift 2 ;;
+    --as=*) AS_LOGIN="${1#--as=}"; [ -n "$AS_LOGIN" ] || die 2 "--as needs a value"; shift ;;
+    --old|--new|--title|--name|--folder|--share|--slug|--edits|--patch|--base|--assets|--save|-o|\
+    --section|--card|--from|--max-tokens|--max-chars|--meta|--access|-n|--add|--rm|--note|--owner|\
+    --confirm|--token|--timeout|--after|--notify|--ack|--to|--idempotency-key|--page|--agent|--dir|\
+    --desk|--role|--context|--suggest|--option|--deadline|--product|--state|--device|--minutes|--session|\
+    --next|--at|--match|--until|--reply-url|--lang|--done|--mesh-cli|--mcp|--id)
+      ARGS+=("$1"); skip=1; shift ;;
+    *) [ -n "$first" ] || case "$1" in -*) ;; *) first="$1" ;; esac; ARGS+=("$1"); shift ;;
+  esac
+done
+select_account
+main ${ARGS[@]+"${ARGS[@]}"}
