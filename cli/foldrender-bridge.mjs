@@ -30,13 +30,13 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, statSync, unwatchFile, watchFile, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, renameSync, statSync, unwatchFile, watchFile, writeFileSync } from "node:fs";
 import { hostname, homedir } from "node:os";
 import { basename, delimiter, dirname, extname, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const BRIDGE_VERSION = "0.15.9";
+export const BRIDGE_VERSION = "0.15.11";
 export const PROTOCOL = "fr-agent.1";
 
 // The agents this bridge starts, as the ACP registry
@@ -170,6 +170,7 @@ export function parseArgs(argv) {
     else if (a === "--session") out.session = v();
     else if (a === "--channel") out.channel = true;
     else if (a === "--mesh-cli") out.meshCli = v();
+    else if (a === "--mcp") out.mcp = v();
     else throw new Error(`unknown option: ${a}`);
   }
   return out;
@@ -560,8 +561,18 @@ export class AgentProcess {
       this.write({ jsonrpc: "2.0", id: m.id, result });
       return;
     }
-    // Anything else the agent asks for (files, terminals) this client does not
-    // offer: it said so in initialize, and says so again.
+    // Its files and commands through this client (the fence, the owner's word
+    // for what is outside it): the bridge answers, or says why not.
+    if (/^(fs\/(read|write)_text_file|terminal\/(create|output|wait_for_exit|kill|release))$/.test(m.method || "") && m.id !== undefined && this.handlers.client) {
+      try {
+        this.write({ jsonrpc: "2.0", id: m.id, result: (await this.handlers.client(m.method, m.params || {})) ?? {} });
+      } catch (err) {
+        this.write({ jsonrpc: "2.0", id: m.id, error: { code: Number.isInteger(err?.code) ? err.code : -32603, message: String(err?.message || err).slice(0, 400) } });
+      }
+      return;
+    }
+    // Anything else the agent asks for this client does not offer: it said so
+    // in initialize, and says so again.
     if (m.id !== undefined) this.write({ jsonrpc: "2.0", id: m.id, error: { code: -32601, message: `this client does not offer ${m.method}` } });
   }
 
@@ -660,6 +671,11 @@ export class TurnRecord {
       const parts = this.parts.map((p) => {
         if (p.k === "text" || p.k === "thought") return { ...p, text: cut(p.text, p.k === "thought" ? Math.min(limit, 2000) : limit) };
         if (p.k === "panel" && p.diff) return { ...p, diff: { ...p.diff, old: cut(p.diff.old, limit), new: cut(p.diff.new, limit) } };
+        // What the turn changed: fewer lines of each file's diff, its counts kept.
+        if (p.k === "changes" && limit !== Infinity) {
+          const keep = Math.floor(limit / 100);
+          return { ...p, files: p.files.map((f) => (f.lines && f.lines.length > keep ? { ...f, lines: f.lines.slice(0, keep), cut: true } : f)) };
+        }
         if (p.k === "tool") {
           return {
             ...p,
@@ -672,7 +688,7 @@ export class TurnRecord {
       const record = { parts };
       if (bytesOf(JSON.stringify(record)) <= max) return record;
     }
-    return { parts: this.parts.filter((p) => p.k === "text").map((p) => ({ k: "text", text: cut(p.text, 1000) })), cut: true };
+    return { parts: [...this.parts.filter((p) => p.k === "text").map((p) => ({ k: "text", text: cut(p.text, 1000) })), ...this.parts.filter((p) => p.k === "changes").map((p) => ({ ...p, files: p.files.map(({ lines, ...f }) => ({ ...f, ...(lines?.length ? { cut: true } : {}) })) }))], cut: true };
   }
 }
 
@@ -1108,6 +1124,384 @@ export function buildAttachmentFileName(fileId, rawName, taken = new Set()) {
   return `${stem}-${randomBytes(4).toString("hex")}${ext}`;
 }
 
+// ---------- the agent's files and commands, through this client ----------
+//
+// The bridge offers ACP's fs (read and write a text file) and terminal (run a
+// command, read what it prints) to the agent, as Lody's client does, within a
+// fence: the folder the agent works in (--dir). A path inside it (after every
+// symbolic link is followed) is read or written as asked; one outside it is
+// asked of the page's owner first, in the sidebar, as a question of the
+// agent's is (once each time: allow, or not). A command runs in the folder
+// unless the owner allows another. The fence is the client's: an agent's own
+// tools (Claude Code's, Codex's, Gemini CLI's outside its folder) do not come
+// this way, and a command can go anywhere the owner's account can. It is not
+// a sandbox: what the agent does unasked is as its own settings say.
+
+export const FS_MAX_BYTES = 16 * 1024 * 1024; // a file read or written through the client
+export const TERMINALS_MAX = 16; // open at once
+export const TERMINAL_OUTPUT_DEFAULT = 1024 * 1024; // what a terminal keeps of its output, unless the agent says less
+export const TERMINAL_OUTPUT_MAX = 4 * 1024 * 1024;
+
+// Where `p` really is, and whether that is inside `root` (itself real): the
+// nearest part of it that exists, its links followed, and the rest after it.
+// A part that is a link whose target is not there yet is where it leads, not
+// its name: a write would follow it (a cloned repository can commit a link to
+// ~/.bash_aliases). At most 40 links followed, as the system does.
+export function fenced(root, p) {
+  let want = resolve(root, String(p ?? ""));
+  for (let hops = 0; hops <= 40; hops++) {
+    let at = want;
+    const rest = [];
+    let next = null;
+    for (;;) {
+      try {
+        const real = join(realpathSync(at), ...rest.slice().reverse());
+        const inside = real === root || real.startsWith(root.endsWith(sep) ? root : root + sep);
+        return { path: real, inside };
+      } catch (err) {
+        if (err?.code !== "ENOENT" && err?.code !== "ENOTDIR") return { path: want, inside: false };
+        let link = null;
+        try { if (lstatSync(at).isSymbolicLink()) link = readlinkSync(at); } catch { link = null; }
+        if (link !== null) { next = join(resolve(dirname(at), link), ...rest.slice().reverse()); break; }
+        const up = dirname(at);
+        if (up === at) return { path: want, inside: false };
+        rest.push(basename(at));
+        at = up;
+      }
+    }
+    want = next;
+  }
+  return { path: want, inside: false };
+}
+
+// The lines `line` (1-based) on, at most `limit` of them, as ACP's read asks.
+export function linesOf(text, line, limit) {
+  if ((line === null || line === undefined) && (limit === null || limit === undefined)) return text;
+  const all = text.split("\n");
+  const from = Math.max(1, Number.isInteger(line) ? line : 1) - 1;
+  const to = Number.isInteger(limit) && limit >= 0 ? from + limit : all.length;
+  return all.slice(from, to).join("\n");
+}
+
+// What to run for a command the agent gives: as given, but a whole command
+// line with no arguments (Grok sends `/bin/bash -lc '…'` as the command) that
+// is not a file there, through the shell, as Lody's client takes it (its
+// resolveTerminalSpawnTarget: `sh -c`, not a login shell; cmd.exe on Windows).
+export function commandLine(command, args, cwd, platform = process.platform) {
+  if (args.length || !/\s/.test(command)) return [command, args];
+  try { if (statSync(resolve(cwd || ".", command)).isFile()) return [command, args]; } catch { /* not a file */ }
+  return platform === "win32" ? ["cmd.exe", ["/c", command]] : ["/bin/sh", ["-c", command]];
+}
+
+// Commands the agent runs through this client: each in a process group of its
+// own, what it prints kept up to its limit (the newest, as ACP says), killed
+// with the bridge.
+export class Terminals {
+  constructor({ env = process.env } = {}) {
+    this.env = env;
+    this.open = new Map(); // id -> {child, out, bytes, limit, truncated, exit, exited, session}
+    this.next = 1;
+  }
+  create({ sessionId, command, args = [], env = [], cwd, outputByteLimit }) {
+    if (this.open.size >= TERMINALS_MAX) throw Object.assign(new Error(`at most ${TERMINALS_MAX} commands at once`), { code: -32602 });
+    if (typeof command !== "string" || !command) throw Object.assign(new Error("a command to run"), { code: -32602 });
+    const extra = {};
+    for (const e of Array.isArray(env) ? env : []) if (e && typeof e.name === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(e.name)) extra[e.name] = String(e.value ?? "");
+    const asked = Number(outputByteLimit);
+    const limit = Math.min(Number.isFinite(asked) && asked > 0 ? asked : TERMINAL_OUTPUT_DEFAULT, TERMINAL_OUTPUT_MAX);
+    const id = `t${this.next++}`;
+    const t = { out: [], bytes: 0, limit, truncated: false, exit: null, session: sessionId };
+    const [file, argv] = commandLine(command, (Array.isArray(args) ? args : []).map(String), cwd);
+    let child;
+    try {
+      child = spawn(file, argv, { cwd, env: { ...this.env, ...extra }, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32", windowsHide: true });
+    } catch (err) {
+      throw Object.assign(new Error(`could not run ${command}: ${err.message}`), { code: -32602 });
+    }
+    t.child = child;
+    const keep = (d) => {
+      t.out.push(d);
+      t.bytes += d.length;
+      // The newest output within the limit; what is cut goes from the start.
+      while (t.bytes > t.limit && t.out.length) {
+        const over = t.bytes - t.limit;
+        const first = t.out[0];
+        if (first.length <= over) { t.out.shift(); t.bytes -= first.length; } else { t.out[0] = first.subarray(over); t.bytes -= over; }
+        t.truncated = true;
+      }
+    };
+    child.stdout.on("data", keep);
+    child.stderr.on("data", keep);
+    // Ended when the command exits: its output gets a moment to drain, but
+    // something it left running that still holds the output (a login shell's
+    // profile can start one) does not hold the end back. What that prints is
+    // still kept.
+    t.exited = new Promise((done) => {
+      const end = (e) => { if (!t.exit) { t.exit = e; done(e); } };
+      child.on("error", (err) => end({ exitCode: null, signal: null, error: err.message }));
+      child.on("exit", (code, signal) => { const e = { exitCode: code, signal: signal || null }; setTimeout(() => end(e), 500).unref?.(); });
+      child.on("close", (code, signal) => end({ exitCode: code, signal: signal || null }));
+    });
+    this.open.set(id, t);
+    return { id, started: new Promise((ok, fail) => { child.once("spawn", () => ok(id)); child.once("error", (err) => fail(Object.assign(new Error(`could not run ${command}: ${err.message}`), { code: -32602 }))); }) };
+  }
+  get(id, sessionId) {
+    const t = this.open.get(String(id ?? ""));
+    if (!t || (sessionId !== undefined && t.session !== sessionId)) throw Object.assign(new Error(`no terminal ${id}`), { code: -32602 });
+    return t;
+  }
+  // What it printed (UTF-8, cut at a character), whether some was cut, and how it ended.
+  output(t) {
+    let text = Buffer.concat(t.out).toString("utf8");
+    if (t.truncated) text = text.replace(/^\uFFFD+/, "");
+    return { output: text, truncated: t.truncated, ...(t.exit ? { exitStatus: { exitCode: t.exit.exitCode, signal: t.exit.signal } } : {}) };
+  }
+  // The command's whole process group, also once the command itself has
+  // exited: what it left running goes too.
+  kill(t, graceMs = 2000) {
+    const pid = t.child.pid;
+    const group = process.platform !== "win32" && pid;
+    const alive = () => { try { process.kill(-pid, 0); return true; } catch { return false; } };
+    const send = (sig) => { try { if (group) process.kill(-pid, sig); else if (!t.exit) t.child.kill(sig); } catch { /* gone */ } };
+    if (t.exit && (!group || !alive())) return Promise.resolve();
+    send("SIGTERM");
+    return new Promise((done) => {
+      const until = Date.now() + graceMs;
+      const tick = () => {
+        if (!(group ? alive() : !t.exit)) return t.exited.then(() => done());
+        if (Date.now() >= until) { send("SIGKILL"); return t.exited.then(() => done()); }
+        setTimeout(tick, 50);
+      };
+      tick();
+    });
+  }
+  release(id, t) {
+    this.open.delete(id);
+    return this.kill(t);
+  }
+  // Everything still running (the bridge stops, or its agent did).
+  stopAll() {
+    const all = [...this.open.entries()];
+    this.open.clear();
+    return Promise.all(all.map(([, t]) => this.kill(t)));
+  }
+}
+
+// The owner's MCP servers for the agent (--mcp FILE): the usual JSON
+// ({"mcpServers": {name: {command, args, env} | {type: "http" | "sse", url,
+// headers}}}, as .mcp.json and Claude Desktop write it), in ACP's shape, and
+// only the kinds the agent takes: stdio by every agent but pi (pi has no MCP),
+// http and sse as its initialize says (mcpCapabilities). Their settings (an
+// env, a header) go to the agent on this computer, never to the page.
+export function mcpServersFor(file, caps, agentId) {
+  const out = { servers: [], left: [] };
+  if (!file) return out;
+  const conf = JSON.parse(readFileSync(file, "utf8"));
+  const list = conf && typeof conf.mcpServers === "object" && conf.mcpServers ? conf.mcpServers : {};
+  const pairs = (o) => Object.entries(o && typeof o === "object" ? o : {}).filter(([, v]) => typeof v === "string" || typeof v === "number").map(([name, value]) => ({ name, value: String(value) }));
+  const mc = caps?.mcpCapabilities || {};
+  for (const [name, c] of Object.entries(list).slice(0, 50)) {
+    if (!c || typeof c !== "object" || !/^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$/.test(name)) continue;
+    const kind = c.type === "http" || c.type === "sse" ? c.type : c.url && !c.command ? "http" : "stdio";
+    const takes = agentId === "pi" ? false : kind === "stdio" ? true : mc[kind] === true;
+    if (!takes) { out.left.push(`${name} (${kind})`); continue; }
+    if (kind === "stdio") {
+      if (typeof c.command !== "string" || !c.command) { out.left.push(`${name} (no command)`); continue; }
+      out.servers.push({ name, command: c.command, args: (Array.isArray(c.args) ? c.args : []).map(String), env: pairs(c.env) });
+    } else {
+      if (typeof c.url !== "string" || !/^https?:\/\//.test(c.url)) { out.left.push(`${name} (no url)`); continue; }
+      out.servers.push({ type: kind, name, url: c.url, headers: pairs(c.headers) });
+    }
+  }
+  return out;
+}
+
+// ---------- what a turn changed in the folder ----------
+//
+// Each turn's files, as Lody's client keeps a turn's diff: a file is taken
+// when the turn first touches it (a tool call naming it, or a write through
+// the bridge), as it is then: read from the folder while the tool has not run
+// yet, or, when the agent says it only once it is done, the agent's own change
+// undone on the file as it is now (its new text found once in it). When the
+// turn ends, each is compared with the file as it is then, line by line. Only
+// files inside the folder, and not the bridge's own (.foldrender/): what
+// someone on the page reads of the folder is what the agent changed in it.
+
+export const CHANGES_FILE_BYTES = 1024 * 1024; // a file larger than this is named, not compared
+export const CHANGES_FILES_MAX = 200; // files a turn tracks
+export const CHANGES_SHOWN_MAX = 50; // files a turn's record lists
+export const CHANGES_FILE_LINES = 400; // a file's diff lines kept (more cut)
+export const CHANGES_TURN_LINES = 2000;
+
+// The lines of a and b, as Myers's diff orders them: [" ", line] kept, ["-",
+// line] gone, ["+", line] added. Past maxD changes, one block between what the
+// two begin and end with alike.
+export function lineDiff(a, b, maxD = 1000) {
+  let s = 0;
+  while (s < a.length && s < b.length && a[s] === b[s]) s++;
+  let e = 0;
+  while (e < a.length - s && e < b.length - s && a[a.length - 1 - e] === b[b.length - 1 - e]) e++;
+  const A = a.slice(s, a.length - e);
+  const B = b.slice(s, b.length - e);
+  const mid = myers(A, B, maxD) || [...A.map((l) => ["-", l]), ...B.map((l) => ["+", l])];
+  return [...a.slice(0, s).map((l) => [" ", l]), ...mid, ...a.slice(a.length - e).map((l) => [" ", l])];
+}
+function myers(A, B, maxD) {
+  const N = A.length;
+  const M = B.length;
+  if (!N) return B.map((l) => ["+", l]);
+  if (!M) return A.map((l) => ["-", l]);
+  const max = Math.min(N + M, maxD);
+  const off = max + 1;
+  const v = new Int32Array(2 * max + 3);
+  const trace = [];
+  for (let d = 0; d <= max; d++) {
+    trace.push(v.slice());
+    for (let k = -d; k <= d; k += 2) {
+      let x = k === -d || (k !== d && v[off + k - 1] < v[off + k + 1]) ? v[off + k + 1] : v[off + k - 1] + 1;
+      let y = x - k;
+      while (x < N && y < M && A[x] === B[y]) { x++; y++; }
+      v[off + k] = x;
+      if (x >= N && y >= M) {
+        // Back from the end, each step the one that led here.
+        const ops = [];
+        let cx = N;
+        let cy = M;
+        for (let dd = d; dd > 0; dd--) {
+          const pv = trace[dd];
+          const ck = cx - cy;
+          const pk = ck === -dd || (ck !== dd && pv[off + ck - 1] < pv[off + ck + 1]) ? ck + 1 : ck - 1;
+          const px = pv[off + pk];
+          const py = px - pk;
+          while (cx > px && cy > py) { ops.push([" ", A[cx - 1]]); cx--; cy--; }
+          if (cx === px) ops.push(["+", B[cy - 1]]);
+          else ops.push(["-", A[cx - 1]]);
+          cx = px;
+          cy = py;
+        }
+        while (cx > 0 && cy > 0) { ops.push([" ", A[cx - 1]]); cx--; cy--; }
+        return ops.reverse();
+      }
+    }
+  }
+  return null;
+}
+
+// The changed lines with `ctx` around them, as a unified diff's hunks
+// ("@@ -a,n +b,m @@", then " ", "-", "+" lines, each cut to 400 characters),
+// and how many lines were added and removed.
+export function hunksOf(ops, ctx = 3) {
+  let add = 0;
+  let del = 0;
+  for (const [o] of ops) { if (o === "+") add++; else if (o === "-") del++; }
+  const lines = [];
+  const changed = ops.map(([o]) => o !== " ");
+  let i = 0;
+  let ai = 1;
+  let bi = 1;
+  const at = []; // line numbers in a and b before each op
+  for (const [o] of ops) { at.push([ai, bi]); if (o !== "+") ai++; if (o !== "-") bi++; }
+  while (i < ops.length) {
+    if (!changed[i]) { i++; continue; }
+    let from = Math.max(0, i - ctx);
+    let to = i;
+    // The hunk goes on while the next change is within 2 * ctx kept lines.
+    for (;;) {
+      let j = to + 1;
+      while (j < ops.length && !changed[j]) j++;
+      if (j < ops.length && j - to - 1 <= 2 * ctx) { to = j; continue; }
+      break;
+    }
+    const end = Math.min(ops.length, to + ctx + 1);
+    const part = ops.slice(from, end);
+    const na = part.filter(([o]) => o !== "+").length;
+    const nb = part.filter(([o]) => o !== "-").length;
+    lines.push(`@@ -${at[from][0]},${na} +${at[from][1]},${nb} @@`);
+    for (const [o, l] of part) lines.push(o + cut(String(l), 400));
+    i = end;
+  }
+  return { add, del, lines };
+}
+
+const NOT_TEXT = Symbol("not text");
+// A file as text: null when it is not there; NOT_TEXT when it is too large to
+// compare, or not text (a NUL in it).
+function fileText(abs) {
+  let st;
+  try { st = statSync(abs); } catch { return null; }
+  if (!st.isFile()) return null;
+  if (st.size > CHANGES_FILE_BYTES) return NOT_TEXT;
+  let buf;
+  try { buf = readFileSync(abs); } catch { return null; }
+  if (buf.includes(0)) return NOT_TEXT;
+  return buf.toString("utf8");
+}
+// (A last newline ends the last line; it is not a line of its own.)
+const linesIn = (t) => (t === null || t === "" ? [] : String(t).replace(/\n$/, "").split("\n"));
+
+export class TurnChanges {
+  constructor(root) {
+    this.root = root;
+    this.files = new Map(); // real path -> {before} | {unknown: true}
+  }
+  // A path of the folder's (real), or null: outside it, the folder itself, or the bridge's own.
+  mine(p) {
+    if (typeof p !== "string" || !p) return null;
+    const f = fenced(this.root, p);
+    if (!f.inside || f.path === this.root) return null;
+    const rel = f.path.slice(this.root.length).replace(/^[\\/]+/, "");
+    if (!rel || rel.split(/[\\/]/)[0] === ".foldrender") return null;
+    return f.path;
+  }
+  // A tool call as the agent reports it: the files it names (its locations,
+  // its diffs), each taken the first time.
+  seen(u) {
+    if (u?.sessionUpdate !== "tool_call" && u?.sessionUpdate !== "tool_call_update") return;
+    const done = /^(completed|failed)$/.test(String(u.status || ""));
+    const diffs = Array.isArray(u.content) ? u.content.filter((c) => c?.type === "diff" && typeof c.path === "string") : [];
+    const named = [...(Array.isArray(u.locations) ? u.locations.map((l) => l?.path) : []), ...diffs.map((d) => d.path)];
+    for (const p of named) {
+      const abs = this.mine(p);
+      if (!abs || this.files.has(abs) || this.files.size >= CHANGES_FILES_MAX) continue;
+      if (!done) { this.files.set(abs, { before: fileText(abs) }); continue; }
+      const d = diffs.find((x) => this.mine(x.path) === abs);
+      if (!d) { this.files.set(abs, { unknown: true }); continue; }
+      if (d.oldText === null || d.oldText === undefined) { this.files.set(abs, { before: null }); continue; }
+      const now = fileText(abs);
+      const n = typeof now === "string" && typeof d.newText === "string" && d.newText ? now.split(d.newText).length - 1 : 0;
+      this.files.set(abs, n === 1 ? { before: now.replace(d.newText, () => String(d.oldText)) } : { unknown: true });
+    }
+  }
+  // A write through the bridge: the file as it was before it.
+  wrote(abs, old) {
+    const mine = this.mine(abs);
+    if (mine && !this.files.has(mine) && this.files.size < CHANGES_FILES_MAX) this.files.set(mine, { before: old });
+  }
+  // The turn's record of them: each file changed, with its diff; null when none.
+  part() {
+    const files = [];
+    let add = 0;
+    let del = 0;
+    let budget = CHANGES_TURN_LINES;
+    for (const [abs, t] of this.files) {
+      const path = abs.slice(this.root.length).replace(/^[\\/]+/, "");
+      if (t.unknown) { files.push({ path, shown: false }); continue; }
+      const after = fileText(abs);
+      if (after === t.before) continue;
+      if (after === NOT_TEXT || t.before === NOT_TEXT) { files.push({ path, shown: false, large: true }); continue; }
+      const h = hunksOf(lineDiff(linesIn(t.before), linesIn(after)));
+      if (!h.add && !h.del) continue;
+      add += h.add;
+      del += h.del;
+      const keep = Math.max(0, Math.min(CHANGES_FILE_LINES, budget));
+      budget -= Math.min(keep, h.lines.length);
+      files.push({ path, add: h.add, del: h.del, ...(t.before === null ? { made: true } : {}), ...(after === null ? { gone: true } : {}), lines: h.lines.slice(0, keep), ...(h.lines.length > keep ? { cut: true } : {}) });
+    }
+    if (!files.length) return null;
+    return { k: "changes", files: files.slice(0, CHANGES_SHOWN_MAX), more: Math.max(0, files.length - CHANGES_SHOWN_MAX), add, del };
+  }
+}
+
 // ---------- a form the agent asks the person to fill ----------
 
 // The form an agent asks for (ACP elicitation, form mode: a JSON Schema
@@ -1195,8 +1589,11 @@ export class Bridge {
   // closed, as AgentProcess has: the app's own ACP client).
   // `session` ({name, deliver(text, as), alive()}): a terminal session's bridge
   // (meshSession below), which carries text only: no agent is started here.
-  constructor({ api, page, agent, dir, token, command, fetchImpl = fetch, WebSocketImpl = globalThis.WebSocket, env = process.env, authHeaders = null, agentFactory = null, known = null, session = null, claudeManaged = null, managedTtlMs = 60_000, managedRead = (e) => managedSources({ env: e }) }) {
-    Object.assign(this, { api, page, agentId: session ? "session" : agent, dir, token, command, fetchImpl, WebSocketImpl, env, authHeaders, agentFactory, session, claudeManaged, managedTtlMs, managedRead, managedAt: 0, managedCache: null });
+  constructor({ api, page, agent, dir, token, command, fetchImpl = fetch, WebSocketImpl = globalThis.WebSocket, env = process.env, authHeaders = null, agentFactory = null, known = null, session = null, claudeManaged = null, managedTtlMs = 60_000, managedRead = (e) => managedSources({ env: e }), mcp = null }) {
+    Object.assign(this, { api, page, agentId: session ? "session" : agent, dir, token, command, fetchImpl, WebSocketImpl, env, authHeaders, agentFactory, session, claudeManaged, managedTtlMs, managedRead, managedAt: 0, managedCache: null, mcp });
+    // The agent's commands run through this client (fs and terminal, within the folder).
+    this.terms = new Terminals({ env });
+    this.mcpSaid = null;
     this.known = session ? { name: `Terminal session ${session.name}`, adapter: "session" } : known || AGENTS[agent];
     // How the agent starts (a test's command, the app's client, its CLI, or its package).
     this.how = session ? { command: null, version: "text" } : command ? { command, version: "custom" } : agentFactory ? { command: null, version: "app" } : agentCommand(this.known, env);
@@ -1322,6 +1719,7 @@ export class Bridge {
       update: (params) => this.onUpdate(params),
       permission: (params) => this.onPermission(params),
       elicit: (params) => this.onElicit(params),
+      client: (method, params) => this.onClient(method, params),
     };
     const agent = this.agentFactory ? this.agentFactory({ env, cwd: this.dir, handlers }) : new AgentProcess(command, { env, cwd: this.dir, handlers });
     this.agent = agent;
@@ -1331,12 +1729,15 @@ export class Bridge {
       protocolVersion: 1,
       // Forms the agent asks (elicitation, form mode only: no URL is opened for
       // anyone here).
-      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false, elicitation: { form: {} } },
+      // Its files and commands through this client, within the folder (the
+      // owner is asked for anything outside it).
+      clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true, elicitation: { form: {} } },
       clientInfo: { name: "foldrender-bridge", version: BRIDGE_VERSION },
     });
     this.agentInfo = init?.agentInfo || null;
     this.caps = init?.agentCapabilities && typeof init.agentCapabilities === "object" ? init.agentCapabilities : {};
     agent.exited.then(({ code, signal }) => {
+      if (this.agent === agent) this.terms.stopAll();
       if (this.agent === agent && !this.stopped) warn(`the agent stopped (${signal || code}); it starts again with the next message`);
     });
     return agent;
@@ -1773,7 +2174,7 @@ export class Bridge {
       for (const method of ways) {
         this.replaying.add(saved.acp);
         try {
-          made = { ...((await agent.request(method, { sessionId: saved.acp, cwd: this.dir, mcpServers: [] })) || {}), sessionId: saved.acp };
+          made = { ...((await agent.request(method, { sessionId: saved.acp, cwd: this.dir, mcpServers: this.mcpServers() })) || {}), sessionId: saved.acp };
           how = method === "session/load" ? "loaded" : "resumed";
           break;
         } catch (err) {
@@ -1785,7 +2186,7 @@ export class Bridge {
       if (!made) log(`the agent's earlier session for this conversation was not taken up again (${cut(why, 200)}); a new one is told the conversation so far`);
       else log(`took up ${this.known.name}'s earlier session for this conversation (${how === "loaded" ? "session/load" : "session/resume"})`);
     }
-    if (!made) made = await agent.request("session/new", { cwd: this.dir, mcpServers: [] });
+    if (!made) made = await agent.request("session/new", { cwd: this.dir, mcpServers: this.mcpServers() });
     const acp = String(made.sessionId);
     // The mode the session actually started in (the organisation's policy,
     // or a setting read where the bridge does not look; for one taken up
@@ -1849,7 +2250,7 @@ export class Bridge {
     // an "always allow" there): the room told if it is no longer sure.
     this.sayAsks();
     if (this.holdsBack(p)) return;
-    const turn = { seq: p.seq, sid: p.sid, acp: null, at: Date.now(), record: new TurnRecord(), pending: new Map(), elicits: new Map(), batch: [], timer: null, cancelled: false, calls: new Map() };
+    const turn = { seq: p.seq, sid: p.sid, acp: null, at: Date.now(), by: p.by || null, okBy: p.ok_by || null, record: new TurnRecord(), pending: new Map(), elicits: new Map(), batch: [], timer: null, cancelled: false, calls: new Map(), changes: new TurnChanges(this.fenceRoot()) };
     this.turn = turn;
     this.send({ t: "started", seq: p.seq });
     log(`@${p.by}: ${cut(String(p.text).split("\n")[0], 100)}`);
@@ -1909,6 +2310,9 @@ export class Bridge {
       // so the page puts it away (no one can answer it now).
       for (const [req, w] of turn.pending) this.answer(turn, req, w, null, null);
       for (const req of [...turn.elicits.keys()]) this.elicited(turn, req, null, null);
+      // What it changed in the folder, for the turn's record.
+      const changed = turn.changes.part();
+      if (changed) turn.record.parts.push(changed);
       const stop = turn.cancelled ? "cancelled" : String(answer?.stopReason || "end_turn");
       // Nothing said at all: the agent's own reason, where it keeps one (pi).
       if (!turn.cancelled && this.agentId === "pi" && !turn.record.parts.some((x) => x.k !== "note")) {
@@ -1926,6 +2330,9 @@ export class Bridge {
       for (const [req, w] of turn.pending) this.answer(turn, req, w, null, null);
       for (const req of [...turn.elicits.keys()]) this.elicited(turn, req, null, null);
       if (turn.cancelled) {
+        // (Stopped: what it had changed by then.)
+        const changed = turn.changes.part();
+        if (changed) turn.record.parts.push(changed);
         this.send({ t: "done", seq: p.seq, stop: "cancelled", record: turn.record.fit(this.limits.turn_bytes - 1024) });
       } else {
         // What the agent said, with the detail it gives beside it.
@@ -1987,7 +2394,9 @@ export class Bridge {
     }
     const turn = this.turn;
     if (!turn || params.sessionId !== turn.acp) return;
-    const u = params.update;
+    // (The files it names, for what the turn changed; a command run here shows what it printed.)
+    turn.changes.seen(params.update);
+    const u = this.withTerminals(params.update);
     turn.record.add(u);
     const s = slim(u);
     if (!s) return;
@@ -2076,6 +2485,131 @@ export class Bridge {
     log(option === null ? "the question was withdrawn" : `@${by} answered: ${name}`);
   }
 
+  // The owner's MCP servers for this agent (--mcp), read again for each
+  // session (the file may have changed); which were left out is said once.
+  mcpServers() {
+    if (!this.mcp) return [];
+    let got;
+    try {
+      got = mcpServersFor(this.mcp, this.caps, this.agentId);
+    } catch (err) {
+      if (this.mcpSaid !== "bad") warn(`the MCP servers in ${this.mcp} could not be read (${cut(err.message, 200)}); the agent has none of them`);
+      this.mcpSaid = "bad";
+      return [];
+    }
+    const said = `${got.servers.map((x) => x.name).join(",")}|${got.left.join(",")}`;
+    if (this.mcpSaid !== said) {
+      this.mcpSaid = said;
+      log(`MCP servers for ${this.known.name}: ${got.servers.map((x) => x.name).join(", ") || "none"}${got.left.length ? `; not ${got.left.join(", ")}: ${this.agentId === "pi" ? "pi has no MCP" : "it does not take that kind"}` : ""}`);
+    }
+    return got.servers;
+  }
+
+  // The folder the fence is (real, its links followed).
+  fenceRoot() {
+    if (!this.fence) {
+      try { this.fence = realpathSync(resolve(this.dir || ".")); } catch { this.fence = resolve(this.dir || "."); }
+    }
+    return this.fence;
+  }
+
+  // Outside the folder: the page's owner says, in the sidebar, as to a
+  // question of the agent's (only during a turn of that session: no one else
+  // asks for it). Not allowed, or not answered in time: refused.
+  async askOutside(acp, call) {
+    const turn = this.turn;
+    const refused = (why) => Object.assign(new Error(why), { code: -32602 });
+    if (!turn || turn.acp !== acp) throw refused(`${call.title}: the page's owner can only allow that while the agent answers a message`);
+    const r = await this.onPermission({
+      sessionId: acp,
+      toolCall: { toolCallId: `fr-fence-${this.nextReq}`, title: call.title, kind: call.kind, locations: [{ path: call.path }] },
+      options: [{ optionId: "allow_once", name: "Allow once", kind: "allow_once" }, { optionId: "reject_once", name: "Don't allow", kind: "reject_once" }],
+    });
+    if (r?.outcome?.outcome === "selected" && r.outcome.optionId === "allow_once") return;
+    throw refused(`${call.title}: the page's owner did not allow it`);
+  }
+
+  // Whose message began the turn of session `acp`, when it is someone else's
+  // the owner did not hand over: its writes and commands are asked of the owner
+  // too (such a message reaches the agent only when its agent is sure to ask
+  // first by itself, which today Claude Code and Codex are, and they do not
+  // come this way; one that does should not act unasked either). Else null.
+  othersTurn(acp) {
+    const turn = this.turn;
+    if (!turn || turn.acp !== acp || !turn.by || turn.okBy) return null;
+    return turn.by !== this.info?.login ? turn.by : null;
+  }
+
+  // The agent's fs and terminal requests (ACP's client methods).
+  async onClient(method, params) {
+    const acp = params.sessionId;
+    if (typeof acp !== "string" || ![...this.sessions.values()].includes(acp)) throw Object.assign(new Error("not a session of this client"), { code: -32602 });
+    const root = this.fenceRoot();
+    const bad = (why) => Object.assign(new Error(why), { code: -32602 });
+    if (method === "fs/read_text_file") {
+      const f = fenced(root, params.path);
+      if (!f.inside) await this.askOutside(acp, { kind: "read", title: `Read ${f.path}, outside the folder`, path: f.path });
+      let st;
+      try { st = statSync(f.path); } catch (err) {
+        if (err?.code === "ENOENT") throw Object.assign(new Error(`no file at ${f.path}`), { code: -32002 });
+        throw err;
+      }
+      if (!st.isFile()) throw bad(`${f.path} is not a file`);
+      if (st.size > FS_MAX_BYTES) throw bad(`${f.path} is larger than ${FS_MAX_BYTES} bytes`);
+      return { content: linesOf(readFileSync(f.path, "utf8"), params.line ?? null, params.limit ?? null) };
+    }
+    if (method === "fs/write_text_file") {
+      if (typeof params.content !== "string") throw bad("the text to write");
+      if (Buffer.byteLength(params.content) > FS_MAX_BYTES) throw bad(`at most ${FS_MAX_BYTES} bytes a file`);
+      const f = fenced(root, params.path);
+      if (!f.inside) await this.askOutside(acp, { kind: "edit", title: `Write ${f.path}, outside the folder`, path: f.path });
+      else if (this.othersTurn(acp)) await this.askOutside(acp, { kind: "edit", title: `Write ${f.path}, in a turn @${this.othersTurn(acp)} began`, path: f.path });
+      if (this.turn?.acp === acp) {
+        let old = null;
+        try { old = readFileSync(f.path, "utf8"); } catch { old = null; }
+        this.turn.changes.wrote(f.path, old);
+      }
+      mkdirSync(dirname(f.path), { recursive: true });
+      // (Never through a link, should one have been put there since.)
+      const noFollow = process.platform === "win32" || !fsConstants.O_NOFOLLOW ? "w" : fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW;
+      writeFileSync(f.path, params.content, { flag: noFollow });
+      return {};
+    }
+    if (method === "terminal/create") {
+      const f = fenced(root, params.cwd ?? root);
+      const what = [params.command, ...(Array.isArray(params.args) ? params.args : [])].join(" ");
+      // (The whole command, as the owner is to allow it: up to 2,000 characters.)
+      if (!f.inside) await this.askOutside(acp, { kind: "execute", title: `Run ${cut(what, 2000)} in ${f.path}, outside the folder`, path: f.path });
+      else if (this.othersTurn(acp)) await this.askOutside(acp, { kind: "execute", title: `Run ${cut(what, 2000)}, in a turn @${this.othersTurn(acp)} began`, path: f.path });
+      const { id, started } = this.terms.create({ ...params, cwd: f.path });
+      try { await started; } catch (err) { this.terms.open.delete(id); throw err; }
+      log(`the agent runs ${cut(what, 160)}${f.inside ? "" : ` in ${f.path}`}`);
+      return { terminalId: id };
+    }
+    const t = this.terms.get(params.terminalId, acp);
+    if (method === "terminal/output") return this.terms.output(t);
+    if (method === "terminal/wait_for_exit") { const e = await t.exited; return { exitCode: e.exitCode, signal: e.signal }; }
+    if (method === "terminal/kill") { await this.terms.kill(t); return {}; }
+    if (method === "terminal/release") { await this.terms.release(String(params.terminalId), t); return {}; }
+    throw Object.assign(new Error(`this client does not offer ${method}`), { code: -32601 });
+  }
+
+  // A tool call that shows one of the commands run here (ACP's terminal
+  // content): what it printed so far, as text the page can show.
+  withTerminals(u) {
+    if (!Array.isArray(u?.content) || !u.content.some((c) => c?.type === "terminal")) return u;
+    return {
+      ...u,
+      content: u.content.map((c) => {
+        const t = c?.type === "terminal" ? this.terms.open.get(String(c.terminalId ?? "")) : null;
+        if (!t) return c;
+        const text = this.terms.output(t).output;
+        // (8,000 characters with its "…", so that the update's own cut leaves it as it is.)
+        return { type: "content", content: { type: "text", text: text.length > 8000 ? `…${text.slice(-7999)}` : text } };
+      }),
+    };
+  }
+
   // A form the agent asks the person to fill (elicitation, form mode): the
   // fields it asks for go to the page as the page can show them, and only the
   // owner's answer comes back, holding only what the form asked (an option it
@@ -2130,7 +2664,7 @@ export class Bridge {
   stop() {
     this.stopped = true;
     try { this.ws?.close(1000, "bridge stopped"); } catch { /* closed */ }
-    const gone = Promise.resolve(this.agent?.stop());
+    const gone = Promise.all([Promise.resolve(this.agent?.stop()), this.terms.stopAll()]);
     this.panel.stop();
     return gone;
   }
@@ -2334,7 +2868,14 @@ async function main() {
   }
   const env = { ...process.env };
   delete env.FOLDRENDER_TOKEN;
-  const bridge = new Bridge({ api: args.api, page: args.page, agent: args.agent, dir, token, command, env, session });
+  // The owner's MCP servers (--mcp FILE): read now, so a bad file stops here.
+  let mcp = null;
+  if (args.mcp) {
+    mcp = resolve(args.mcp);
+    try { mcpServersFor(mcp, { mcpCapabilities: { http: true, sse: true } }, args.agent); } catch (err) { warn(`--mcp ${args.mcp}: ${cut(err.message, 200)}`); return 2; }
+    if (session) { warn("--mcp is for an agent the bridge starts, not a terminal session"); return 2; }
+  }
+  const bridge = new Bridge({ api: args.api, page: args.page, agent: args.agent, dir, token, command, env, session, mcp });
   // A channel ends with its session: Claude Code closes its stdin.
   if (channel) channel.closed.then(() => { bridge.stop(); setTimeout(() => process.exit(0), 1500).unref(); });
   // Stopped (Ctrl-C, a signal): the room is told by the socket's close, which

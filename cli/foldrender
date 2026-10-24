@@ -28,11 +28,11 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.15.9
+FR_CLI_VERSION=0.15.11
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=7fa2ea73569cec4073e65267bc88ad10ecaffdc62fea464c1257456734645c51
+FR_BRIDGE_SHA256=bc4ee6c4394c4437a09f3a1fb080964bc7c2ecdd1b0dbaa440815b48ee2486e3
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -2767,13 +2767,14 @@ cmd_desk() {
 # against FR_BRIDGE_SHA256 and kept in the cache folder; the sign-in goes to it
 # in the environment, never on its command line.
 cmd_bridge() {
-  local target="" agent="claude" dir="$PWD" session="" channel="" mesh_cli="" node_major file cache url got
+  local target="" agent="claude" dir="$PWD" session="" channel="" mesh_cli="" mcp="" node_major file cache url got
   while [ $# -gt 0 ]; do
     case "$1" in
       --page) need $# "$1"; target="$2"; shift 2 ;;
       --agent) need $# "$1"; agent="$2"; shift 2 ;;
       --session) need $# "$1"; session="$2"; shift 2 ;;
       --mesh-cli) need $# "$1"; mesh_cli="$2"; shift 2 ;;
+      --mcp) need $# "$1"; mcp="$2"; shift 2 ;;
       --channel) channel=1; shift ;;
       --dir) need $# "$1"; dir="$2"; shift 2 ;;
       -*) die 2 "unknown option: $1" ;;
@@ -2784,6 +2785,8 @@ cmd_bridge() {
   case "$agent" in claude|codex|gemini|antigravity|grok|devin|pi) ;; *) die 2 "unknown agent: $agent (one of: claude, codex, gemini, antigravity, grok, devin, pi)" ;; esac
   [ -z "$mesh_cli" ] || [ -n "$session" ] || die 2 "--mesh-cli goes with --session NAME (the mesh's CLI that session's messages are sent with)"
   [ -d "$dir" ] || die 2 "--dir $dir is not a folder"
+  [ -z "$mcp" ] || [ -z "$session$channel" ] || die 2 "--mcp is for an agent the bridge starts (--agent), not a terminal session"
+  [ -z "$mcp" ] || [ -f "$mcp" ] || die 2 "--mcp $mcp is not a file"
   require_token
   command -v node >/dev/null 2>&1 || die 2 "the bridge needs Node 22 or later (https://nodejs.org); it is not installed"
   node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null)"
@@ -2816,6 +2819,9 @@ cmd_bridge() {
       exec node "$file" --api "$API" --page "$PAGE_ID" --session "$session" --mesh-cli "$mesh_cli" --dir "$dir"
     fi
     exec node "$file" --api "$API" --page "$PAGE_ID" --session "$session" --dir "$dir"
+  fi
+  if [ -n "$mcp" ]; then
+    exec node "$file" --api "$API" --page "$PAGE_ID" --agent "$agent" --mcp "$mcp" --dir "$dir"
   fi
   exec node "$file" --api "$API" --page "$PAGE_ID" --agent "$agent" --dir "$dir"
 }
@@ -3031,7 +3037,7 @@ foldrender answers --inbox | --ack ID,ID --to NAME
 EOF
     ;;
     bridge) cat <<'EOF'
-foldrender bridge --page PAGE [--dir DIR] [--agent claude|codex|gemini|antigravity|grok|devin|pi]
+foldrender bridge --page PAGE [--dir DIR] [--agent claude|codex|gemini|antigravity|grok|devin|pi] [--mcp FILE]
 foldrender bridge --page PAGE --session NAME [--mesh-cli PATH]
 foldrender bridge --page PAGE --channel
   Connects a coding agent on this computer to PAGE's agent sidebar, and stays
@@ -3069,10 +3075,29 @@ foldrender bridge --page PAGE --channel
   and yours is run as typed (anyone else's "/word" is a message). The title
   the agent gives a conversation, and its usage (the context it holds, and
   what it cost, which only you see), show in the sidebar.
+  The bridge offers the agent ACP's file and terminal requests: a file in
+  DIR is read or written as asked, a command runs in DIR, and what a command
+  prints shows in its line in the sidebar. A file or a command's folder
+  outside DIR (its links followed) is asked of you in the sidebar first.
+  This fence is the bridge's own: an agent's own tools do not come through
+  it, so it is no sandbox, and a command run in DIR can still reach anything
+  your account can; what the agent does unasked is as its settings say. In a
+  turn someone else's message began (one you did not hand over), its writes
+  and commands through the bridge are asked of you too.
+  What a turn changed in DIR shows at the turn's end: how many files, the
+  lines added and removed, and each file's diff (the files its tool calls
+  name or it writes through the bridge, compared with how they were when the
+  turn first touched them; not those outside DIR, nor .foldrender/).
   Only the page's owner runs a bridge on a page; a second one (another
   computer) takes over from the first. FoldRender runs no model: the agent
   runs here, signed in as you.
   --dir DIR            the folder the agent works in (default: this one)
+  --mcp FILE           MCP servers for the agent, as .mcp.json writes them
+                       ({"mcpServers": {name: {command, args, env} or
+                       {type: "http" or "sse", url, headers}}}): each session
+                       gets those the agent takes (stdio by all but pi, which
+                       has no MCP; http and sse as it says). Their settings
+                       stay on this computer.
   --agent NAME         the agent, started as the ACP registry starts it:
                        claude  Claude Code (default; its ACP adapter, via npx)
                        codex   Codex (codex-acp, via npx; signed in: codex login)
