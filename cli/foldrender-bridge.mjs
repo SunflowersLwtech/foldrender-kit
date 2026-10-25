@@ -36,7 +36,7 @@ import { basename, delimiter, dirname, extname, join, resolve, sep } from "node:
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const BRIDGE_VERSION = "0.16.6";
+export const BRIDGE_VERSION = "0.16.7";
 export const PROTOCOL = "fr-agent.1";
 
 // The agents this bridge starts, as the ACP registry
@@ -193,6 +193,20 @@ export function cutBytes(text, max) {
 export function cut(text, max) {
   const s = String(text ?? "");
   return s.length <= max ? s : `${s.slice(0, max)}… (${s.length - max} more characters)`;
+}
+
+// The environment an agent starts with: this process's, the agent's own
+// settings over it, never the CLI's sign-in (the agent has its own). Claude
+// Code started by its ACP adapter has no task-list tool unless
+// CLAUDE_CODE_ENABLE_TODO_TOOLS is set (2.1.310: its TodoWrite is there only
+// then, found through ToolSearch; CLAUDE_CODE_ENABLE_TASKS does not bring
+// TaskCreate back), so it never plans where the sidebar can show it; the
+// adapter turns TodoWrite into ACP's plan. Set unless the owner set it.
+export function agentEnv(agentId, env = process.env, known = null) {
+  const out = { ...env, ...(known?.env || {}) };
+  delete out.FOLDRENDER_TOKEN;
+  if (agentId === "claude" && out.CLAUDE_CODE_ENABLE_TODO_TOOLS === undefined) out.CLAUDE_CODE_ENABLE_TODO_TOOLS = "1";
+  return out;
 }
 
 // The reader's own Claude Code, if there is one: the adapter runs it rather
@@ -1940,8 +1954,7 @@ export class Bridge {
   // Start the agent (once) and say hello in ACP.
   async startAgent() {
     if (this.agent && !this.agent.closed) return this.agent;
-    const env = { ...this.env, ...(this.known?.env || {}) };
-    delete env.FOLDRENDER_TOKEN; // the agent has the CLI's own sign-in, not this process's copy
+    const env = agentEnv(this.agentId, this.env, this.known);
     if (this.agentId === "claude" && !env.CLAUDE_CODE_EXECUTABLE) {
       const claude = findClaude(env);
       if (claude) env.CLAUDE_CODE_EXECUTABLE = claude;
