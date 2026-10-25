@@ -736,6 +736,21 @@ export class AgentProcess {
 
 // ---------- what a turn was, kept by the room ----------
 
+// Whose a step is, when the agent runs subagents: the call that launched one
+// (Claude Code's Agent or Task tool) and, for a subagent's own steps and
+// words, the call that launched it, as Claude Code's adapter says them in an
+// update's _meta (toolName, parentToolUseId). The sidebar lists a subagent's
+// steps under it, as Lody's subagent panel does, and its words are not taken
+// for the agent's answer. null when the update says neither.
+const LAUNCHES = new Set(["Agent", "Task"]);
+export function lineage(u) {
+  const cc = u?._meta?.claudeCode;
+  if (!cc || typeof cc !== "object") return null;
+  const parent = typeof cc.parentToolUseId === "string" && cc.parentToolUseId ? cc.parentToolUseId.slice(0, 200) : null;
+  const agent = LAUNCHES.has(cc.toolName);
+  return parent || agent ? { parent, agent } : null;
+}
+
 // The record of one turn, as the room keeps it and the sidebar shows it later:
 // the agent's words, its tool calls (title, kind, status, the changes it made,
 // a little of what came out), its plan, and the permission questions and how
@@ -747,13 +762,17 @@ export class TurnRecord {
   }
   add(u) {
     const kind = u?.sessionUpdate;
+    const from = lineage(u);
     if (kind === "agent_message_chunk" || kind === "agent_thought_chunk") {
       const text = u.content?.type === "text" ? String(u.content.text ?? "") : "";
       if (!text) return;
-      const k = kind === "agent_message_chunk" ? "text" : "thought";
+      // (A subagent's words are its own, kept under it as it thinking aloud:
+      // not the agent's answer.)
+      const parent = from?.parent || null;
+      const k = kind === "agent_message_chunk" && !parent ? "text" : "thought";
       const lastPart = this.parts.at(-1);
-      if (lastPart && lastPart.k === k) lastPart.text += text;
-      else this.parts.push({ k, text });
+      if (lastPart && lastPart.k === k && (lastPart.parent || null) === parent) lastPart.text += text;
+      else this.parts.push({ k, text, ...(parent ? { parent } : {}) });
       return;
     }
     if (kind === "tool_call" || kind === "tool_call_update") {
@@ -766,7 +785,12 @@ export class TurnRecord {
       }
       if (u.title) t.title = String(u.title);
       if (u.kind) t.kind = String(u.kind);
+      // (A later update of a subagent's step can leave its parent out: kept.)
+      if (from?.parent && from.parent !== id && !t.parent) t.parent = from.parent;
+      // A subagent: when it was launched and when it ended, for its time.
+      if (from?.agent && !t.agent) { t.agent = true; t.t0 = Date.now(); }
       if (u.status) t.status = String(u.status);
+      if (t.agent && !t.t1 && (t.status === "completed" || t.status === "failed")) t.t1 = Date.now();
       if (Array.isArray(u.locations) && u.locations.length) t.paths = u.locations.slice(0, 10).map((l) => String(l?.path ?? ""));
       if (Array.isArray(u.content)) {
         const diffs = u.content.filter((c) => c?.type === "diff").map((c) => ({ path: String(c.path ?? ""), old: c.oldText ?? null, new: String(c.newText ?? "") }));
@@ -823,6 +847,11 @@ export class TurnRecord {
 export function slim(u) {
   if (!u || typeof u !== "object") return null;
   const out = { ...u };
+  // (Whose it is, when a subagent's: said in fields of ours, the _meta being
+  // the agent's own.)
+  const from = lineage(u);
+  if (from?.parent) out.fr_parent = from.parent;
+  if (from?.agent) out.fr_agent = true;
   delete out.rawOutput;
   if (out.rawInput !== undefined) {
     const raw = JSON.stringify(out.rawInput);
@@ -1568,6 +1597,8 @@ function fileText(abs) {
 // (A last newline ends the last line; it is not a line of its own.)
 const linesIn = (t) => (t === null || t === "" ? [] : String(t).replace(/\n$/, "").split("\n"));
 
+// The kinds of call that read and do not write (ACP's ToolKind).
+const READ_ONLY_KINDS = new Set(["read", "search", "fetch", "think"]);
 export class TurnChanges {
   constructor(root) {
     this.root = root;
@@ -1594,6 +1625,8 @@ export class TurnChanges {
       if (!abs || this.files.has(abs) || this.files.size >= CHANGES_FILES_MAX) continue;
       if (!done) { this.files.set(abs, { before: fileText(abs) }); continue; }
       const d = diffs.find((x) => this.mine(x.path) === abs);
+      // (A call that cannot change a file, first heard of done: a read is not a change.)
+      if (!d && READ_ONLY_KINDS.has(String(u.kind || ""))) continue;
       if (!d) { this.files.set(abs, { unknown: true }); continue; }
       if (d.oldText === null || d.oldText === undefined) { this.files.set(abs, { before: null }); continue; }
       const now = fileText(abs);
