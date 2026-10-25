@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.16.13
+FR_CLI_VERSION=0.16.14
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -3450,7 +3450,10 @@ foldrender bridge --page PAGE --channel
   answer them; its slash commands are listed when you type "/" in the box,
   and yours is run as typed (anyone else's "/word" is a message). The title
   the agent gives a conversation, and its usage (the context it holds, and
-  what it cost, which only you see), show in the sidebar.
+  what it cost, which only you see), show in the sidebar. People there can
+  copy a message or the whole conversation (as Markdown), search it, pin one
+  message for everyone, and see who has read it how far ("Seen by @login"
+  under the last message: what their sidebar had on screen).
   The bridge offers the agent ACP's file and terminal requests: a file in
   DIR is read or written as asked, a command runs in DIR, and what a command
   prints shows in its line in the sidebar (also for a command the agent runs
