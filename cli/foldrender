@@ -31,11 +31,11 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.16.2
+FR_CLI_VERSION=0.16.3
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=9b69b703018bb240f1f0b690a0ee99f9d1c526c42b3d9ad52ee826586a44671e
+FR_BRIDGE_SHA256=78e7147bfb43fbb69f0935fb2b363ddd291416a84aef500d74d3c2f471599d32
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -3453,7 +3453,12 @@ foldrender bridge --page PAGE --channel
                        devin   Devin (devin acp; its CLI installed)
                        pi      pi (pi-acp, via npx; its own model settings)
   The sidebar shows what the agent says its session may be set to (its
-  modes, its models); only you change them, and only to one it offers.
+  modes, its models); only you change them, and only to one it offers. A
+  long list (pi's models, 100 and more) opens with a search, the one it is
+  set to first, then that one's provider's; a model whose turn failed on
+  this computer for lack of funds, a usage limit or access is listed last,
+  with why and when, until it answers again (kept 7 days in
+  ~/.cache/foldrender/agents/, names and those words only).
   --session NAME       instead of an agent: a session already open in a
                        terminal on the mesh (claude-mesh: this machine's
                        ~/.claude-mesh and its CLI, mesh-cli.mjs, found by

@@ -256,18 +256,55 @@ export function claudeAutoRuns(dir, env = process.env, sessionMode = null) {
 // What an agent's session may be set to, as the agent reports it when the
 // session opens (ACP's session config options, or its earlier modes and
 // models): its own list, cut to size, and never one made up here.
-// {via: "config" | "legacy", options: [{id, name, category, current, options: [{value, name, description}]}]}
-export function optionsOf(r) {
+// {via: "config" | "legacy", options: [{id, name, category, current, options: [{value, name, description, failed?: {why, at}}], more?}]}
+// At most OPTIONS_MAX a list, and all of them within OPTIONS_BYTES (one
+// message to the room holds 64 KB): pi lists every model of every provider
+// it has a key for, 100 and more. A model list is in the order an owner
+// looks for one (modelOrder); `failed` (model -> {why, at}) are the ones
+// that failed on this computer (FailedModels), last and said so; `more`, how
+// many did not fit.
+export const OPTIONS_MAX = 300;
+export const OPTIONS_BYTES = 40000;
+export function optionsOf(r, failed = new Map()) {
   const clip = (v, n) => String(v ?? "").slice(0, n);
-  const out = [];
+  const lists = [];
+  const size = (o) => Buffer.byteLength(JSON.stringify(o)) + 1;
   const add = (id, name, category, current, list) => {
-    const all = (list || []).map((o) => ({ value: clip(o.value, 120), name: clip(o.name || o.value, 80), ...(o.description ? { description: clip(o.description, 160) } : {}) })).filter((o) => o.value);
-    // At most 40, and always the one it is set to (shown as chosen, and
-    // chosen again), wherever it is in the agent's list.
-    let options = all.slice(0, 40);
-    const now = all.find((o) => o.value === clip(current, 120));
-    if (now && !options.includes(now)) options = [now, ...options.slice(0, 39)];
-    if (id && options.length) out.push({ id: clip(id, 60), name: clip(name || id, 60), category: clip(category, 30), current: clip(current, 120), options });
+    const cur = clip(current, 120);
+    let all = (list || []).map((o) => ({ value: clip(o.value, 120), name: clip(o.name || o.value, 80), ...(o.description ? { description: clip(o.description, 160) } : {}) })).filter((o) => o.value);
+    if (id === "model" || category === "model") all = modelOrder(all, cur, failed);
+    if (id && all.length) lists.push({ head: { id: clip(id, 60), name: clip(name || id, 60), category: clip(category, 30), current: cur }, all, cur, bytes: all.reduce((n, o) => n + size(o), 0) });
+  };
+  // Each list as many as fit, and always the one it is set to (shown as
+  // chosen, and chosen again), wherever it is in the agent's list. The
+  // smallest lists first, each at most an even share of what is left: a mode
+  // list keeps all of it, and a long model list has the rest.
+  const cutTo = (x, budget) => {
+    let options = [];
+    let bytes = 0;
+    for (const o of x.all) {
+      if (options.length >= OPTIONS_MAX || bytes + size(o) > budget) break;
+      options.push(o);
+      bytes += size(o);
+    }
+    const now = x.all.find((o) => o.value === x.cur);
+    if (now && !options.includes(now)) {
+      while (options.length && (options.length >= OPTIONS_MAX || bytes + size(now) > budget)) bytes -= size(options.pop());
+      options = [now, ...options];
+      bytes += size(now);
+    }
+    return { options, bytes };
+  };
+  const finish = () => {
+    let left = OPTIONS_BYTES - 400 * lists.length;
+    const order = lists.map((x, i) => i).sort((a, b) => lists[a].bytes - lists[b].bytes);
+    const made = [];
+    order.forEach((i, k) => {
+      const c = cutTo(lists[i], Math.max(0, Math.floor(left / (order.length - k))));
+      left -= c.bytes;
+      made[i] = c.options;
+    });
+    return lists.map((x, i) => ({ ...x.head, options: made[i], ...(x.all.length > made[i].length ? { more: x.all.length - made[i].length } : {}) })).filter((x) => x.options.length);
   };
   if (Array.isArray(r?.configOptions)) {
     for (const c of r.configOptions.slice(0, 6)) {
@@ -276,11 +313,99 @@ export function optionsOf(r) {
       const flat = (c.options || []).flatMap((o) => (Array.isArray(o?.options) ? o.options : [o]));
       add(c.id, c.name, c.category || "", c.currentValue, flat);
     }
-    return { via: "config", options: out };
+    return { via: "config", options: finish() };
   }
   if (Array.isArray(r?.modes?.availableModes)) add("mode", "Mode", "mode", r.modes.currentModeId, r.modes.availableModes.map((m) => ({ value: m.id, name: m.name, description: m.description })));
   if (Array.isArray(r?.models?.availableModels)) add("model", "Model", "model", r.models.currentModelId, r.models.availableModels.map((m) => ({ value: m.modelId, name: m.name, description: m.description })));
-  return { via: "legacy", options: out };
+  return { via: "legacy", options: finish() };
+}
+
+// A model list in the order an owner looks for one: the one it is set to,
+// then the others of its provider (the part before "/", as pi and OpenCode
+// name them) in the agent's order, then the rest; the ones that failed on
+// this computer last, each with why and when (`failed`).
+export function modelOrder(list, current, failed = new Map()) {
+  const provider = (v) => (v.includes("/") ? v.slice(0, v.indexOf("/")) : null);
+  const mine = provider(current);
+  const rank = (o) => (o.value === current ? 0 : failed.has(o.value) ? 3 : mine !== null && provider(o.value) === mine ? 1 : 2);
+  return list.map((o, i) => [rank(o), i, o]).sort((a, b) => a[0] - b[0] || a[1] - b[1]).map(([, , o]) => {
+    const { failed: _was, ...rest } = o;
+    const f = failed.get(o.value);
+    return f ? { ...rest, failed: { why: f.why, at: f.at } } : rest;
+  });
+}
+
+// Why a model failed, in a few words of our own, never the agent's (which can
+// carry anything): only for what says that model cannot be used now (no
+// funds, a usage limit, no access, not available); null for the rest (a
+// network error says nothing of the model). With the HTTP status it gave.
+export function whyModelFailed(text) {
+  const s = String(text || "");
+  const why = /insufficient|\bfunds\b|\bcredits?\b|\bbalance\b|payment required|\b402\b/i.test(s) ? "no funds"
+    : /usage limit|quota|limit (has been )?(exceeded|reached)|exceeded (your|the)|rate.?limit|too many requests|\b429\b/i.test(s) ? "usage limit reached"
+    : /window has ended|no longer (free|available|offered)|has been (retired|deprecated)/i.test(s) ? "no longer offered"
+    : /unknown model|no such model|model[^.]{0,60}(not (found|available|supported)|unavailable|does not exist)|\bunavailable\b/i.test(s) ? "not available"
+    : /forbidden|\b403\b|not allowed|access denied|(do|does) not have access|only from within/i.test(s) ? "not allowed"
+    : null;
+  if (!why) return null;
+  const code = s.match(/\b(40[0-9]|429|5[0-9]{2})\b/)?.[1];
+  return code ? `${why} (${code})` : why;
+}
+
+// The models that failed on this computer, by agent: a file of the bridge's
+// own beside its sessions' (the folder 700, the file 600), each {why, at}
+// (whyModelFailed's words, and when), forgotten after FAILED_DAYS or once the
+// model answers; at most FAILED_MAX an agent. Model names and those words
+// only: nothing anyone said, no error's text.
+export const FAILED_DAYS = 7;
+const FAILED_MAX = 200;
+export function failedModelsFile(env) {
+  const home = env.HOME || env.USERPROFILE || homedir();
+  const base = env.XDG_CACHE_HOME || (process.platform === "win32" && env.LOCALAPPDATA) || join(home, ".cache");
+  return join(base, "foldrender", "agents", "failed-models.json");
+}
+export class FailedModels {
+  constructor(file) {
+    this.file = file;
+  }
+  read() {
+    try {
+      const d = JSON.parse(readFileSync(this.file, "utf8"));
+      if (d && d.v === 1 && d.by && typeof d.by === "object" && !Array.isArray(d.by)) return d;
+    } catch { /* none yet, or not ours */ }
+    return { v: 1, by: {} };
+  }
+  // Those of an agent, still within FAILED_DAYS: model -> {why, at}.
+  of(agent, now = Date.now()) {
+    const since = now - FAILED_DAYS * 86400000;
+    const all = this.read().by[agent];
+    return new Map(Object.entries(all && typeof all === "object" ? all : {}).filter(([, e]) => typeof e?.why === "string" && (Number(e.at) || 0) >= since).map(([m, e]) => [m, { why: e.why, at: Number(e.at) }]));
+  }
+  // A model failed (why), or answered (null: it is forgotten).
+  set(agent, model, why, now = Date.now()) {
+    const d = this.read();
+    const all = d.by[agent] && typeof d.by[agent] === "object" ? d.by[agent] : {};
+    if (why === null && !all[model]) return;
+    if (why === null) delete all[model];
+    else all[String(model).slice(0, 120)] = { why: String(why).slice(0, 60), at: now };
+    d.by[agent] = all;
+    const since = now - FAILED_DAYS * 86400000;
+    for (const k of Object.keys(d.by)) {
+      const kept = Object.entries(d.by[k] && typeof d.by[k] === "object" ? d.by[k] : {}).filter(([, e]) => (Number(e?.at) || 0) >= since).sort((a, b) => (Number(b[1]?.at) || 0) - (Number(a[1]?.at) || 0)).slice(0, FAILED_MAX);
+      if (kept.length) d.by[k] = Object.fromEntries(kept);
+      else delete d.by[k];
+    }
+    try {
+      const dirOf = dirname(this.file);
+      mkdirSync(dirOf, { recursive: true, mode: 0o700 });
+      try { chmodSync(dirOf, 0o700); } catch { /* not ours to change */ }
+      const part = `${this.file}.${process.pid}.part`;
+      writeFileSync(part, JSON.stringify(d), { mode: 0o600 });
+      renameSync(part, this.file);
+    } catch (err) {
+      warn("which models failed was not kept:", err.message);
+    }
+  }
 }
 
 // Whether Claude Code is sure to ask the owner before it changes anything on
@@ -1603,6 +1728,7 @@ export class Bridge {
     this.how = session ? { command: null, version: "text" } : command ? { command, version: "custom" } : agentFactory ? { command: null, version: "app" } : agentCommand(this.known, env);
     this.sessions = new Map(); // room session id -> ACP session id (a terminal session's: the session it went to)
     this.store = new SessionStore(sessionStoreFile(env, page, dir || "."));
+    this.failed = new FailedModels(failedModelsFile(env));
     this.caps = {}; // what the agent said it offers (initialize)
     this.replaying = new Set(); // ACP sessions being taken up again: what they replay is not news
     this.commands = []; // the agent's slash commands, as it last listed them
@@ -1916,6 +2042,29 @@ export class Bridge {
       this.sendDefaults();
     }
   }
+  // The models of this agent that failed on this computer (FailedModels).
+  failedNow() {
+    return this.session ? new Map() : this.failed.of(this.agentId);
+  }
+  // The model a conversation's session is set to, as its agent says.
+  modelOf(sid) {
+    const sel = this.opts.get(sid)?.options.find((x) => x.id === "model" || x.category === "model");
+    return sel?.current || null;
+  }
+  // A turn on `model` failed for a reason of the model's (why), or it
+  // answered (null): kept, and the conversation's list said again in the
+  // order it goes in now (that one marked, or no longer).
+  modelSaid(sid, model, why) {
+    if (!model || this.session) return;
+    const was = this.failed.of(this.agentId).get(model)?.why ?? null;
+    if (why === was && why === null) return;
+    this.failed.set(this.agentId, model, why);
+    const o = this.opts.get(sid);
+    if (!o) return;
+    const failed = this.failedNow();
+    const options = o.options.map((x) => (x.id === "model" || x.category === "model" ? { ...x, options: modelOrder(x.options, x.current, failed) } : x));
+    this.gotOptions(sid, o.acp, { via: o.via, options });
+  }
   // For a new conversation: the last session's choices, with what was chosen
   // for the next one.
   sendDefaults() {
@@ -1945,7 +2094,7 @@ export class Bridge {
     } catch (err) {
       return this.send({ t: "option-refused", sid, id, error: cut(err.message, 300) });
     }
-    if (Array.isArray(r?.configOptions)) this.gotOptions(sid, o.acp, optionsOf(r));
+    if (Array.isArray(r?.configOptions)) this.gotOptions(sid, o.acp, optionsOf(r, this.failedNow()));
     else { sel.current = value; this.gotOptions(sid, o.acp, o); }
     // Kept for the conversation: a session taken up again (or begun anew for
     // it) is set the same way, as Lody hands its sessions their config.
@@ -2202,7 +2351,7 @@ export class Bridge {
       this.sayAsks();
     }
     this.sessions.set(p.sid, acp);
-    this.gotOptions(p.sid, acp, optionsOf(made));
+    this.gotOptions(p.sid, acp, optionsOf(made, this.failedNow()));
     // What was chosen for a new conversation before it had a session.
     if (how === "new") {
       for (const [id, value] of [...this.pending]) await this.setOption(p.sid, id, value, null).catch((err) => warn("a setting was not changed:", err.message));
@@ -2279,6 +2428,8 @@ export class Bridge {
       };
       if (!acp && !(await open())) return;
       turn.acp = acp;
+      // (The model it answers with, for what it says of it at the end.)
+      turn.model = this.modelOf(p.sid);
       // The plan as it is on the page now, in the agent's folder.
       await this.panel.pull();
       const planFile = !this.panel.off && this.panel.rev !== null ? this.panel.relative : null;
@@ -2319,13 +2470,18 @@ export class Bridge {
       if (changed) turn.record.parts.push(changed);
       const stop = turn.cancelled ? "cancelled" : String(answer?.stopReason || "end_turn");
       // Nothing said at all: the agent's own reason, where it keeps one (pi).
+      let failedWhy = null;
       if (!turn.cancelled && this.agentId === "pi" && !turn.record.parts.some((x) => x.k !== "note")) {
         const why = piLastError(acp, this.env, turn.at);
         if (why) {
           turn.record.parts.push({ k: "note", code: "agent-error", text: why });
           warn(`${this.known.name} ended without a word; its own error: ${why}`);
+          failedWhy = whyModelFailed(why);
         }
       }
+      // The model failed for a reason of its own, or it answered.
+      if (failedWhy) this.modelSaid(p.sid, turn.model, failedWhy);
+      else if (!turn.cancelled && turn.record.parts.some((x) => x.k === "text")) this.modelSaid(p.sid, turn.model, null);
       this.send({ t: "done", seq: p.seq, stop, record: turn.record.fit(this.limits.turn_bytes - 1024) });
       this.sendUsage(p.sid);
       log(`done (${stop})`);
@@ -2348,6 +2504,8 @@ export class Bridge {
         const signIn = (err.code === -32000 || /auth/i.test(err.message)) && SIGN_IN_WORDS.test(said) ? ` (${this.known.name} is not signed in on this computer: ${signInWords(this.known)}, then send again)` : "";
         this.send({ t: "error", seq: p.seq, error: cut(said + signIn, 1500) });
         warn("the agent could not answer:", said + signIn);
+        const why = signIn ? null : whyModelFailed(said);
+        if (why) this.modelSaid(p.sid, turn.model, why);
       }
     } finally {
       clearTimeout(turn.timer);
@@ -2389,7 +2547,7 @@ export class Bridge {
       const sid = [...this.opts].find(([, o]) => o.acp === params.sessionId)?.[0];
       const o = sid !== undefined ? this.opts.get(sid) : null;
       if (o) {
-        if (Array.isArray(u0.configOptions)) this.gotOptions(sid, o.acp, optionsOf({ configOptions: u0.configOptions }));
+        if (Array.isArray(u0.configOptions)) this.gotOptions(sid, o.acp, optionsOf({ configOptions: u0.configOptions }, this.failedNow()));
         else if (typeof u0.currentModeId === "string") {
           const mode = o.options.find((x) => x.id === "mode" || x.category === "mode");
           if (mode) { mode.current = u0.currentModeId; this.gotOptions(sid, o.acp, o); }
