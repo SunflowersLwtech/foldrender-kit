@@ -31,11 +31,11 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.16.5
+FR_CLI_VERSION=0.16.6
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=389cd4627bc2cdcce1717ffd2917fe54b05f2caa61856d476dc35e96bfbe0cf5
+FR_BRIDGE_SHA256=6a9a30e963c8bbbf924dd0f1d92cf419c31516393fbd0cb1d72391d95b6e0200
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880

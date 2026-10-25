@@ -36,7 +36,7 @@ import { basename, delimiter, dirname, extname, join, resolve, sep } from "node:
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const BRIDGE_VERSION = "0.15.11";
+export const BRIDGE_VERSION = "0.16.6";
 export const PROTOCOL = "fr-agent.1";
 
 // The agents this bridge starts, as the ACP registry
@@ -844,6 +844,43 @@ export class TurnRecord {
 // An update as it is passed on to the sidebar while it streams: what the
 // sidebar shows, without the parts that can be large and that it does not
 // (a tool's raw input and output: a whole file read, a command's output).
+// The folder the agent works in, for the owner's sidebar: its name, where it
+// is, and the git branch it is on (read from the checkout's HEAD: no git run,
+// no network), or none.
+export function workspaceOf(dir) {
+  let path;
+  try { path = realpathSync(dir); } catch { return null; }
+  return { name: basename(path) || path, path, branch: gitBranch(path) };
+}
+export function gitBranch(dir) {
+  const head = (file) => {
+    // (At most 300 bytes of it: a HEAD is one short line.)
+    let fd = null;
+    try { fd = openSync(file, "r"); const b = Buffer.alloc(300); return b.subarray(0, readSync(fd, b, 0, 300, 0)).toString("utf8"); } catch { return null; } finally { if (fd !== null) closeSync(fd); }
+  };
+  for (let at = dir, i = 0; i < 64; i++) {
+    const dot = join(at, ".git");
+    let st = null;
+    try { st = statSync(dot); } catch { st = null; }
+    if (st) {
+      let git = dot;
+      if (st.isFile()) {
+        // A worktree's .git names its folder: "gitdir: <path>".
+        const m = /^gitdir:\s*(.+?)\s*$/m.exec(head(dot) || "");
+        if (!m) return null;
+        git = resolve(at, m[1]);
+      }
+      const h = (head(join(git, "HEAD")) || "").trim();
+      const ref = /^ref:\s*refs\/heads\/(\S{1,200})$/.exec(h);
+      return ref ? ref[1] : /^[0-9a-f]{7,64}$/.test(h) ? h.slice(0, 7) : null;
+    }
+    const up = dirname(at);
+    if (up === at) return null;
+    at = up;
+  }
+  return null;
+}
+
 export function slim(u) {
   if (!u || typeof u !== "object") return null;
   const out = { ...u };
@@ -2001,7 +2038,10 @@ export class Bridge {
         // for the owner unless it is sure to.
         const asks = this.asksNow();
         this.asksSaid = asks;
-        this.send({ t: "hello", agent: { id: this.agentId, name: this.known.name, version: this.how?.version || "" }, host: hostname(), auto, asks, turn: busy, conflict, text });
+        // The folder the agent works in and its git branch, for the owner's
+        // sidebar (a terminal session works in a folder of its own: none).
+        this.workspaceSaid = this.session ? null : workspaceOf(this.dir);
+        this.send({ t: "hello", agent: { id: this.agentId, name: this.known.name, version: this.how?.version || "" }, host: hostname(), version: BRIDGE_VERSION, workspace: this.workspaceSaid, auto, asks, turn: busy, conflict, text });
         if (this.defaults) this.sendDefaults();
         if (this.commands.length) this.send({ t: "commands", commands: this.commands });
         for (const [sid, o] of this.opts) this.send({ t: "options", sid, options: o.options, auto: this.autoFor(o.options), asks: this.asksFor(o.options) });
@@ -2577,6 +2617,11 @@ export class Bridge {
     } finally {
       clearTimeout(turn.timer);
       if (this.turn === turn) this.turn = null;
+      // (A turn may have changed the branch: the room told if it did.)
+      if (!this.session) {
+        const w = workspaceOf(this.dir);
+        if (JSON.stringify(w) !== JSON.stringify(this.workspaceSaid ?? null)) { this.workspaceSaid = w; this.send({ t: "workspace", workspace: w }); }
+      }
     }
   }
 
