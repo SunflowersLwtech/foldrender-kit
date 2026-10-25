@@ -67,6 +67,8 @@ Pasted into a chat (Slack, Discord, Telegram, WhatsApp, iMessage, X, Feishu), a 
 
 Use `-` to publish from stdin: `foldrender publish - < page.html`.
 
+A Markdown file (`.md`, `.markdown`) is published as the page made of it, the way the FoldRender iOS app publishes one: `foldrender publish notes.md`. Headings, lists, task lists, tables, code and quotes become the page's HTML, and `read` gives them back as Markdown with its sections. The title is the front matter's `title:`, else the first `# ` heading, unless `--title` names one. Up to 256 KB; a larger file, or a page with styling of its own, publish as HTML.
+
 ## 4. Iterate on the same link
 
 Publish the same file path again and the command updates the same URL. Keep the file path stable while you work.

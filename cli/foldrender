@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.16.9
+FR_CLI_VERSION=0.16.10
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -464,23 +464,28 @@ map_set() {
   } > "$SLUG_MAP.tmp.$$" && mv -f "$SLUG_MAP.tmp.$$" "$SLUG_MAP"
 }
 
-# upload METHOD PATH FILE QUERY: the page, sent with this publish's
-# Idempotency-Key (PUB_KEY), tried up to UPLOAD_TRIES times. A dropped
-# connection, a 5xx, or a 409 in_progress (another request is writing this
-# page) is tried again with the same key, and the server answers a try whose
-# first attempt did arrive with the page that attempt made: a retry never makes
-# a second page.
+# upload METHOD PATH FILE QUERY: the page, as UPLOAD_TYPE (text/html, or
+# text/markdown for a Markdown file, which the server makes the page of), sent
+# with this publish's Idempotency-Key (PUB_KEY), tried up to UPLOAD_TRIES
+# times. A dropped connection, a 5xx, or a 409 in_progress (another request is
+# writing this page) is tried again with the same key, and the server answers a
+# try whose first attempt did arrive with the page that attempt made: a retry
+# never makes a second page.
 UPLOAD_TRIES=3
+UPLOAD_TYPE=text/html
 upload() {
   local try=1 rc wait extra=()
   require_token
   [ -z "${PUB_KEY:-}" ] || extra=(-H "Idempotency-Key: $PUB_KEY")
   while :; do
-    api_once "$1" "$2${4:+?$4}" -H "$(auth_header)" -H "Content-Type: text/html" ${extra[@]+"${extra[@]}"} --data-binary "@$3"
+    api_once "$1" "$2${4:+?$4}" -H "$(auth_header)" -H "Content-Type: $UPLOAD_TYPE" ${extra[@]+"${extra[@]}"} --data-binary "@$3"
     rc=$?
     if [ "$rc" -eq 0 ]; then
       update_note
       case "$STATUS" in
+        # The Worker cut off for its CPU limit (Cloudflare's error 1102): trying
+        # again runs the same conversion into the same limit, so it is not.
+        503) grep -qiE 'error code: 1102|error 1102|exceeded resource limits' "$TMP/body" && return 0 ;;
         500|502|503|504) ;;
         409) grep -q in_progress "$TMP/body" || return 0 ;;
         *) return 0 ;;
@@ -1331,6 +1336,13 @@ publish_one() {
     src="$file"
     rp="$(abs_path "$file")" || die 1 "cannot resolve the path of $file"
   fi
+  # A Markdown file (by its name) goes as Markdown: the server makes the page
+  # of it, as the iOS app does, and titles it from its front matter's title:
+  # or its first # heading.
+  UPLOAD_TYPE=text/html
+  case "$(printf '%s' "$file" | tr 'A-Z' 'a-z')" in
+    *.md|*.markdown|*.mdown|*.mkd) UPLOAD_TYPE=text/markdown ;;
+  esac
   bytes="$(wc -c < "$src" | tr -d ' ')"
   [ "$bytes" -gt 0 ] || die 2 "the page is empty: $file"
   [ "$bytes" -le "$MAX_BYTES" ] || die 5 "$file is $bytes bytes; the limit is 5 MB"
@@ -1354,7 +1366,7 @@ publish_one() {
   fi
   [ -z "$p_slug" ] || check_slug "$p_slug"
 
-  [ -n "$p_title" ] || p_title="$(title_from "$src")"
+  [ -n "$p_title" ] || [ "$UPLOAD_TYPE" = text/markdown ] || p_title="$(title_from "$src")"
   # A new page is private unless told otherwise. A re-publish sends only the
   # flags it was given, so the page keeps the visibility and sharing it has.
   # A slug alone does not say which of the two this is: the server makes a new
@@ -1418,6 +1430,10 @@ publish_one() {
   fi
   if [ "$STATUS" = 409 ]; then
     die 12 "${label}not published: another of your pages is already at that address (${name:+name $name}${folder:+, folder $folder}). Choose another with --name or --folder"
+  fi
+  if [ "$STATUS" = 503 ] && grep -qiE 'error code: 1102|error 1102|exceeded resource limits' "$TMP/body"; then
+    [ "$UPLOAD_TYPE" = text/markdown ] && die 1 "${label}not published: the server ran out of time converting this Markdown file (some shapes, such as a long line of mixed * and _, convert slowly); publish it as an HTML page"
+    die 1 "${label}not published: the server ran out of time on this page; try again in a while"
   fi
   if [ "$STATUS" = 422 ] && grep -q idempotency_key_reused "$TMP/body"; then
     die 2 "${label}not published: the Idempotency-Key $PUB_KEY was used within the last day for a publish of other content. Use a new key for a new page, or leave --idempotency-key out."
@@ -3247,6 +3263,8 @@ foldrender publish FILE...|- [options]
   published the same page within the last day, or this is a retry of a publish
   that did arrive); then other pages of yours with the same content or title,
   and the commands to change, read or delete the page.
+  A Markdown file (.md, .markdown) is published as the page made of it, as the
+  iOS app does: headings, lists, task lists, tables and code (up to 256 KB).
   Publishing the same file again updates the same page. A retry never makes a
   second page: each publish carries an Idempotency-Key, sent again on a retry
   (a dropped connection is retried twice by itself).
@@ -3256,7 +3274,8 @@ foldrender publish FILE...|- [options]
   --share a,b          only these GitHub logins
   --name NAME          the address's last part (default: from the title)
   --folder FOLDER      .../artifacts/LOGIN/FOLDER/NAME
-  --title TEXT         the title (default: the file's <title>)
+  --title TEXT         the title (default: the file's <title>; a Markdown
+                       file's front matter title:, else its first # heading)
   --slug ID|ADDRESS    publish to that page: update yours, or make a page whose
                        id and address (its last part) are ID. If ID is the
                        address of another of your pages, nothing is made and
@@ -3269,6 +3288,7 @@ foldrender publish FILE...|- [options]
                        content_hash, duplicates and same_title (other pages of
                        yours, {id, url}), requested_id and not_applied (exists)
 Examples: foldrender publish report.html --link
+          foldrender publish notes.md
           foldrender publish a.html b.html c.html --folder q3
 EOF
     ;;
