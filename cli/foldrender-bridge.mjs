@@ -853,6 +853,10 @@ export function slim(u) {
   if (from?.parent) out.fr_parent = from.parent;
   if (from?.agent) out.fr_agent = true;
   delete out.rawOutput;
+  // (An agent's _meta is its own: nothing on the page reads it, and pi's holds
+  // a long command's whole window of output each time, which with what it
+  // printed beside it made an update too large to pass on whole.)
+  delete out._meta;
   if (out.rawInput !== undefined) {
     const raw = JSON.stringify(out.rawInput);
     if (raw && raw.length > 2000) out.rawInput = { cut: cut(raw, 2000) };
@@ -1345,6 +1349,36 @@ export function commandLine(command, args, cwd, platform = process.platform) {
   if (args.length || !/\s/.test(command)) return [command, args];
   try { if (statSync(resolve(cwd || ".", command)).isFile()) return [command, args]; } catch { /* not a file */ }
   return platform === "win32" ? ["cmd.exe", ["/c", command]] : ["/bin/sh", ["-c", command]];
+}
+
+// What a command an agent runs with its own tool printed, gathered from the
+// pieces it sends (its last 8,001 characters). pi keeps a long command's
+// newest 2,000 lines or 50 KB, and once that window slides pi-acp sends it
+// whole again (its "delta" is the new window unless it starts with the last).
+// Only a piece of that shape (2,000 lines, or about 50 KB: a true delta is
+// smaller, but for the first) that begins with a long stretch (GATHER_OVERLAP)
+// of what is gathered is added from where that stretch ends, so no line is
+// shown twice; any other piece is added whole, as output that repeats itself
+// (a run of the same character) can look like a window resent.
+const GATHER_OVERLAP = 1024;
+const WINDOW_LINES = 2000;
+const WINDOW_BYTES = 45 * 1024;
+function windowShaped(piece) {
+  if (Buffer.byteLength(piece) >= WINDOW_BYTES) return true;
+  let n = 0;
+  for (let at = piece.indexOf("\n"); at >= 0 && n < WINDOW_LINES - 1; at = piece.indexOf("\n", at + 1)) n++;
+  return n >= WINDOW_LINES - 1;
+}
+export function gatherOutput(was, piece) {
+  if (was.length >= GATHER_OVERLAP && piece.length >= GATHER_OVERLAP && windowShaped(piece)) {
+    const tail = was.slice(-256);
+    for (let at = piece.lastIndexOf(tail); at >= 0; at = at > 0 ? piece.lastIndexOf(tail, at - 1) : -1) {
+      const end = at + tail.length;
+      const n = Math.min(was.length, end);
+      if (n >= GATHER_OVERLAP && piece.slice(end - n, end) === was.slice(-n)) return (was + piece.slice(end)).slice(-8001);
+    }
+  }
+  return (was + piece).slice(-8001);
 }
 
 // What the page is given of a command's output: its last 8,000 characters,
@@ -2819,7 +2853,7 @@ export class Bridge {
     const id = u?.toolCallId !== undefined && u?.toolCallId !== null ? String(u.toolCallId) : null;
     const said = u?._meta?.terminal_output;
     const theirs = said && typeof said.data === "string" && said.terminal_id !== undefined && said.terminal_id !== null && turn?.printed && !this.terms.open.has(String(said.terminal_id)) ? String(said.terminal_id) : null;
-    if (theirs !== null) turn.printed.set(theirs, ((turn.printed.get(theirs) || "") + said.data).slice(-8001));
+    if (theirs !== null) turn.printed.set(theirs, gatherOutput(turn.printed.get(theirs) || "", said.data));
     if (theirs !== null && !Array.isArray(u.content)) return { ...u, content: [{ type: "content", content: { type: "text", text: shownOutput(turn.printed.get(theirs)) } }] };
     if (!Array.isArray(u?.content) || !u.content.some((c) => c?.type === "terminal")) {
       const ran = id !== null && !turn?.named?.has(id) ? turn?.ran?.get(id) : null;
