@@ -31,11 +31,11 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.16.12
+FR_CLI_VERSION=0.16.13
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=a6db630e8c0aa4be19ad28e7de42e5a4527f5fc8cef057add38417e56f1e1df4
+FR_BRIDGE_SHA256=b94a0090cd3d3294817b5b9d170542581e16f04a4580594187df5123ab3a9d7a
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -3466,6 +3466,10 @@ foldrender bridge --page PAGE --channel
   lines added and removed, and each file's diff (the files its tool calls
   name or it writes through the bridge, compared with how they were when the
   turn first touched them; not those outside DIR, nor .foldrender/).
+  Your sidebar's bar above the message box shows DIR's name and its git
+  branch (read from its .git, no git run), what the conversation changed
+  there so far, and how much of the agent's context it holds; the others on
+  the page see no folder or branch.
   Only the page's owner runs a bridge on a page; a second one (another
   computer) takes over from the first. FoldRender runs no model: the agent
   runs here, signed in as you.
