@@ -31,11 +31,11 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.16.0
+FR_CLI_VERSION=0.16.1
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=fec58092a6f4d9aa5042e286b458fffa61a18825760a116e3b394620838b751e
+FR_BRIDGE_SHA256=9b69b703018bb240f1f0b690a0ee99f9d1c526c42b3d9ad52ee826586a44671e
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -3145,10 +3145,10 @@ cmd_bridge() {
   exec node "$file" --api "$API" --page "$PAGE_ID" --agent "$agent" --dir "$dir"
 }
 
-# foldrender reply --page PAGE [--to N] TEXT|-: a terminal session's answer to
+# foldrender reply --page PAGE [--to N] TEXT|-|--file FILE: a terminal session's answer to
 # a message in PAGE's agent sidebar (the bridge, --session, said how).
 cmd_reply() {
-  local target="" to="" text="" got_text=""
+  local target="" to="" text="" got_text="" file=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --page) need $# "$1"; target="$2"; shift 2 ;;
@@ -3156,13 +3156,23 @@ cmd_reply() {
         need $# "$1"
         case "$2" in ''|*[!0-9]*) die 2 "--to takes a message's number (the bridge's message says it)" ;; esac
         to="$2"; shift 2 ;;
+      --file) need $# "$1"; file="$2"; shift 2 ;;
       -) text="$(cat)"; got_text=1; shift ;;
       -*) die 2 "unknown option: $1" ;;
       *) [ -z "$got_text" ] || die 2 "reply takes one text (quote it)"; text="$1"; got_text=1; shift ;;
     esac
   done
+  if [ -n "$file" ]; then
+    [ -f "$file" ] || die 2 "no such file: $file"
+    if [ -L "$file" ]; then die 2 "refusing a symbolic link: $file"; fi
+    [ -O "$file" ] || die 2 "not your file: $file"
+    if [ -n "$(find "$file" -prune \( -perm -g+w -o -perm -o+w \) -print)" ]; then
+      die 2 "file is writable by group or others: $file"
+    fi
+    text="$(cat "$file")"; got_text=1
+  fi
   [ -n "$target" ] || die 2 "which page? foldrender reply --page PAGE [--to N] TEXT"
-  [ -n "$got_text" ] && [ -n "$text" ] || die 2 "what is the answer? foldrender reply --page PAGE [--to N] TEXT (or - for standard input)"
+  [ -n "$got_text" ] && [ -n "$text" ] || die 2 "what is the answer? foldrender reply --page PAGE [--to N] TEXT (or - for standard input, or --file FILE)"
   page_id "$target"
   printf '%s' "$text" > "$TMP/reply.txt"
   { printf '{"text":'; json_str "$TMP/reply.txt"; [ -z "$to" ] || printf ',"to":%s' "$to"; printf '}'; } > "$TMP/reply.json"
@@ -3457,7 +3467,7 @@ foldrender bridge --page PAGE --channel
 EOF
     ;;
     reply) cat <<'EOF'
-foldrender reply --page PAGE [--to N] TEXT|-
+foldrender reply --page PAGE [--to N] TEXT|-|--file FILE
   A terminal session's answer in PAGE's agent sidebar, where the session is
   connected by foldrender bridge --page PAGE --session NAME (each message it
   gets says the command, with --to the message it answers; - reads the answer

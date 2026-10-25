@@ -2716,14 +2716,14 @@ export class Bridge {
 // ~/.claude-mesh), and a message goes into one with the mesh's CLI
 // (`mesh-cli.mjs say --as <name> <session> -`), which delivers it as a channel
 // message. Nothing of the session (its files, its history) is read here.
-// How a terminal session answers: the CLI, its answer on standard input (no
-// quotes to get right, and no angle brackets, which the mesh escapes). The
-// heredoc's word is new for each message and appears nowhere else in it: an
-// answer, or words someone on the page wrote, that contain it cannot end the
-// heredoc early and have the rest run as commands in the owner's terminal.
-export function replyHint(page, seq, tag = `FR_ANSWER_${randomBytes(6).toString("hex").toUpperCase()}`) {
-  return [`To answer in the sidebar (text only), run this, with your answer in place of the middle line:`,
-    `foldrender reply --page ${page} --to ${seq} - <<'${tag}'`, "(your answer)", tag].join("\n");
+// How a terminal session answers: write the answer to a private file in your
+// own cache directory, then hand that file to the CLI. No shell quoting, no
+// angle brackets (which the mesh escapes), and no shared /tmp name another
+// local user could tamper with.
+export function replyHint(page, seq) {
+  const file = join(homedir(), ".cache", "foldrender", "replies", `reply-${randomBytes(16).toString("hex")}.txt`);
+  return [`To answer in the sidebar (text only), write your answer to ${file}, then run:`,
+    `foldrender reply --page ${page} --to ${seq} --file ${file}`].join("\n");
 }
 
 export function meshSession(name, { cli = "", env = process.env, fetchImpl = fetch, run = spawn } = {}) {
@@ -2869,6 +2869,13 @@ async function main() {
     warn(`--dir ${args.dir} is not a folder`);
     return 2;
   }
+  // A terminal session's answers go through a private directory in the user's
+  // own cache, so no other local user can tamper with them.
+  try {
+    const repliesDir = join(homedir(), ".cache", "foldrender", "replies");
+    mkdirSync(repliesDir, { recursive: true, mode: 0o700 });
+    try { chmodSync(repliesDir, 0o700); } catch { /* not ours to change */ }
+  } catch { /* best effort */ }
   // A terminal session's bridge: text into an open session on the mesh, or
   // (--channel) into the Claude Code session that started this as a channel.
   let session = null;
