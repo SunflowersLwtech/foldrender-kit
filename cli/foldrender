@@ -31,11 +31,11 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.16.10
+FR_CLI_VERSION=0.16.12
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=4e692759e440b7b0d6635a54c4584faf92614384409c79dd6dee6c4fe7ef584b
+FR_BRIDGE_SHA256=a6db630e8c0aa4be19ad28e7de42e5a4527f5fc8cef057add38417e56f1e1df4
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -2926,12 +2926,16 @@ cmd_desk() {
       api_auth POST "/api/desk" -H "Content-Type: application/json" --data-binary "@$TMP/req"
       expect_2xx
       [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
-      sed -n 's/.*"url" *: *"\([^"]*\)".*/\1/p' "$TMP/body"
+      # The address on a line of its own: the answer is one line of JSON with
+      # no newline at its end, and sed keeps the line as it came.
+      printf '%s\n' "$(sed -n 's/.*"url" *: *"\([^"]*\)".*/\1/p' "$TMP/body")"
       local id
       id="$(sed -n 's/.*"slug" *: *"\([^"]*\)".*/\1/p' "$TMP/body")"
       if grep -q '"created":true' "$TMP/body"; then note "made your desk, id $id; give it agents with: foldrender desk token add --role agent --name NAME"
       else note "you have this desk already, id $id"; fi
-      [ "$id" = desk ] || note "its id is $id: pass --desk $id (or set FOLDRENDER_DESK=$id) to the other desk commands"
+      # The desk named desk is every desk command's default, whatever its id;
+      # another is named with --desk.
+      [ "${name:-desk}" = desk ] || note "its id is $id: pass --desk $id (or set FOLDRENDER_DESK=$id) to the other desk commands"
       ;;
     token)
       local op="${1:-ls}" role="" name=""
@@ -3374,7 +3378,8 @@ foldrender desk COMMAND [--desk ID] [--json]
   older revision is refused). Anything that looks like a secret (a key, a
   token, a link's ?k=) is refused whole; links go to foldrender.dev,
   github.com and Feishu only. Write sentences and numbers, never terminal
-  output. --desk ID (or FOLDRENDER_DESK) names the desk (default: desk).
+  output. --desk ID (or FOLDRENDER_DESK) names another desk; the default is
+  your own desk (the one named desk; with a desk token, that token's desk).
   FOLDRENDER_DESK_TOKEN: a desk token (frdk_...) instead of your sign-in; keep
   it in the environment or a 600 file, never in a command line.
 Examples: foldrender desk ask aws-pay --title "Bind a card for the new models?" \

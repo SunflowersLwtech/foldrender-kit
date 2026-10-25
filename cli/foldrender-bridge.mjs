@@ -36,7 +36,7 @@ import { basename, delimiter, dirname, extname, join, resolve, sep } from "node:
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const BRIDGE_VERSION = "0.16.8";
+export const BRIDGE_VERSION = "0.16.11";
 export const PROTOCOL = "fr-agent.1";
 
 // The agents this bridge starts, as the ACP registry
@@ -364,6 +364,28 @@ export function whyModelFailed(text) {
   if (!why) return null;
   const code = s.match(/\b(40[0-9]|429|5[0-9]{2})\b/)?.[1];
   return code ? `${why} (${code})` : why;
+}
+
+// An agent that has used up its allowance for now (Claude Code: "You've hit
+// your session limit · resets 2pm (Asia/Shanghai)", "... weekly limit · resets
+// Mon 9am"; others: a usage limit, a quota, 429): {resets} with when it says it
+// is back, on a 24-hour clock ("14:00 (Asia/Shanghai)", "Mon 09:00"), or
+// resets: "" when it does not say; null for any other error. The page is told
+// that in words of ours (the room keeps the code, and the sidebar says it in
+// the reader's language), never the agent's own text, which can carry anything
+// and reads as an engineer's: that stays in the bridge's log. Only a time and a
+// zone in plain characters come out of it.
+export function usageLimit(text) {
+  const s = String(text || "");
+  if (!/hit your [a-z0-9 -]{0,20}limit/i.test(s) && whyModelFailed(s)?.startsWith("usage limit reached") !== true) return null;
+  const m = /\bresets?\s+(?:at\s+)?([A-Za-z0-9 ,:]{1,24}?)\s*(?:\(([A-Za-z_/+-]{1,32})\))?\s*(?:[.·∙|]|$)/m.exec(s);
+  if (!m) return { resets: "" };
+  const clock = m[1].trim().replace(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/gi, (_, h, min, ap) => {
+    const hour = (Number(h) % 12) + (/pm/i.test(ap) ? 12 : 0);
+    return `${String(hour).padStart(2, "0")}:${min || "00"}`;
+  });
+  if (!/\d/.test(clock)) return { resets: "" };
+  return { resets: m[2] ? `${clock} (${m[2]})` : clock };
 }
 
 // The models that failed on this computer, by agent: a file of the bridge's
@@ -2675,7 +2697,16 @@ export class Bridge {
         // told what to run. Another answer with that code (Gemini CLI's
         // "no longer supported" for a personal account) is passed on as said.
         const signIn = (err.code === -32000 || /auth/i.test(err.message)) && SIGN_IN_WORDS.test(said) ? ` (${this.known.name} is not signed in on this computer: ${signInWords(this.known)}, then send again)` : "";
-        this.send({ t: "error", seq: p.seq, error: cut(said + signIn, 1500) });
+        // Out of its allowance: words of ours and when it is back, with a code
+        // the sidebar says in the reader's language; what the agent said stays
+        // in this log.
+        const limit = signIn ? null : usageLimit(said);
+        if (limit) {
+          const back = limit.resets ? `; it is back at about ${limit.resets}` : "; send again later";
+          this.send({ t: "error", seq: p.seq, error: `${this.known.name} on this computer has used up its usage for now${back}.`, code: "usage-limit", resets: limit.resets });
+        } else {
+          this.send({ t: "error", seq: p.seq, error: cut(said + signIn, 1500) });
+        }
         warn("the agent could not answer:", said + signIn);
         const why = signIn ? null : whyModelFailed(said);
         if (why) this.modelSaid(p.sid, turn.model, why);

@@ -58,7 +58,7 @@ Publishing the same content again within a day never makes a second page. Run th
 
 Pick the visibility:
 
-- Default for a new page: private. Only the owner can see it.
+- Default for a new page: private. Only the owner can see it. (The command sends private itself; a request to the HTTP API that names no access makes a link page.)
 - `--share alice,bob`: only those GitHub logins can see it. Use this when the user names people.
 - `--link`: anyone who has the link. The link ends in `?k=…`, a key; without the key the address opens nothing, and the page is listed nowhere. Use it when the user wants a link to send.
 - `--public`: anyone, and the page is listed on the user's page, `…/artifacts/<login>/`. Use it only when the user asks for public.
@@ -220,7 +220,7 @@ The card has no colours of its own: it shows the page's. A page that declares a 
 
 - `data-fr-choice="ID"`: a short id, unique on the page (letters, digits, `. _ -`), the one the user will say ("D1"). `data-fr-option="VALUE"` on each answer inside it, any element (a button, a span, a list item); its text is its label.
 - `data-fr-suggested` on the option you recommend. Write the suggestion in the text as well: readers who cannot answer see the page as written, with the options as plain text.
-- `data-fr-multi`: any number of options, sent with a Send button. `data-fr-note`: the answerer may add a sentence (the attribute's value is the field's placeholder); a block with `data-fr-note` and no options is an open question.
+- `data-fr-multi`: any number of options, sent with a button the card adds under them: 「提交」 on a page whose `<html lang>` is Chinese (`zh…`), "Send" on any other. Tell the user that name when you point them at it. `data-fr-note`: the answerer may add a sentence (the attribute's value is the field's placeholder); a block with `data-fr-note` and no options is an open question.
 - The question's text is `data-fr-question` (an element inside, or the attribute's value), else the block's first heading.
 - A quiz: `data-fr-correct` on the right option(s); an element with `data-fr-explain` inside the block shows once it is answered; `data-fr-topic` and `data-fr-set` (on the block or an ancestor) group questions.
 - Up to 50 questions a page, 20 options each. `foldrender read` says when a block cannot be asked as written.
@@ -290,7 +290,7 @@ foldrender read desk                       # the whole desk as text
 - Write sentences and numbers only: no terminal output, command lines, paths, environment variables or secrets. Anything that looks like a secret (a key, a token, a link's `?k=`) is refused whole (exit 1, `looks_like_secret`); links go to foldrender.dev, github.com and Feishu only.
 - Tokens: the user (or you, with their sign-in) makes one for each agent with `foldrender desk token add --role agent --name NAME` (printed once) and for a script that reports machines and sessions with `--role feed` (it sends `foldrender desk feed SOURCE file.json` and reads nothing). Pass it as `FOLDRENDER_DESK_TOKEN` from a secret store or a 600 file, never on a command line. `foldrender desk token ls` / `token rm ID`.
 - Where it is: for an account with the desk app, at `https://foldrender.dev/desk` (the page bar shows a Desk tab beside Artifacts and Repos), and its old address goes there; otherwise at the address `foldrender desk init` prints. `foldrender read desk` reads the signed-in account's own desk as text wherever it is (`FOLDRENDER_DESK` names another), and so does `foldrender read https://foldrender.dev/desk`; a desk's id is not `desk` unless the account made the first desk, so never read it by the id `desk`. It is not one of the user's pages: `foldrender ls` does not list it, and it takes no page's place or storage.
-- `--desk ID` (or `FOLDRENDER_DESK`) names another desk; the default is `desk`. `foldrender help desk` has every option.
+- `--desk ID` (or `FOLDRENDER_DESK`) names another desk; the default is the user's own desk (the one named desk, whatever its id; with a desk token, that token's desk), so a user who has one desk never needs `--desk`. `foldrender help desk` has every option.
 
 ## 9. Free plan limits
 
