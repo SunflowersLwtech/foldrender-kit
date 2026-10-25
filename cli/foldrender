@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.16.1
+FR_CLI_VERSION=0.16.2
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -571,7 +571,7 @@ whose_token() {
 # login whose /api/me failed), that one is kept, and the old one is revoked on
 # the server before it goes: never a good token nobody here knows of.
 migrate_legacy() {
-  local t a had
+  local t a had rc
   [ -f "$LEGACY_TOKEN" ] || return 0
   t="$(head -n 1 "$LEGACY_TOKEN" | tr -d ' \t\r\n')"
   if [ -z "$t" ]; then
@@ -589,7 +589,13 @@ migrate_legacy() {
   had="$(head -n 1 "$ACCOUNTS_DIR/$WHO" 2>/dev/null | tr -d ' \t\r\n')"
   if [ -n "$had" ] && [ "$had" != "$t" ]; then
     # Revoked, or kept here to try again: never dropped while it is still good.
-    revoke_token "$t" || return 0
+    # A GitHub token cannot be revoked by FoldRender: it is dropped here, said once.
+    revoke_token "$t"; rc=$?
+    if [ "$rc" = 2 ]; then
+      note "the sign-in from before 0.16.0 was a GitHub token, no longer used here: revoke it on GitHub if it is not needed (https://github.com/settings/tokens)"
+    elif [ "$rc" != 0 ]; then
+      return 0
+    fi
     rm -f "$LEGACY_TOKEN"
     [ "$ACCOUNT_FROM" != saved ] || use_account "$WHO" default
     return 0
