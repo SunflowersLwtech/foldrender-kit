@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.16.8
+FR_CLI_VERSION=0.16.9
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -361,7 +361,7 @@ page_id() {
       path="${path%%[?#]*}"
       # The desk app: the signed-in account's own desk.
       if [ "$path" = "/desk" ]; then
-        resolve_address /desk "$1"
+        resolve_address /desk "$1" "no desk for this account at $1 (foldrender desk init makes one)"
         return
       fi
       case "$path" in
@@ -375,9 +375,10 @@ page_id() {
   esac
 }
 
-# resolve_address PATH TARGET: sets PAGE_ID to the id of the page at PATH (an
-# address under /artifacts, or /desk), as the API resolves it for this account;
-# TARGET is what the user gave, for the messages.
+# resolve_address PATH TARGET [NOT_FOUND]: sets PAGE_ID to the id of the page at
+# PATH (an address under /artifacts, or /desk: the signed-in account's own desk),
+# as the API resolves it for this account; TARGET is what the user gave, for the
+# messages, and NOT_FOUND what a 404 says instead of the usual words.
 resolve_address() {
   if [ -n "$TOKEN" ]; then
     api GET "/api/resolve?path=$(urlencode "$1")${PAGE_K:+&k=$PAGE_K}" -H "$(auth_header)"
@@ -387,7 +388,7 @@ resolve_address() {
   case "$STATUS" in
     200) PAGE_ID="$(sed -n 's/.*"id" *: *"\([^"]*\)".*/\1/p' "$TMP/body" | head -n 1)" ;;
     401) die 3 "$2 is not public. Sign in to use it: foldrender login" ;;
-    404) die 7 "no page at $2, or it is not visible to this account" ;;
+    404) die 7 "${3:-no page at $2, or it is not visible to this account}" ;;
     *) fail_http ;;
   esac
   [ -n "$PAGE_ID" ] || die 1 "the server did not say which page $2 is"
@@ -2085,7 +2086,18 @@ cmd_read() {
   # read never requests the URL itself: a private page's link redirects to the
   # content host, where a client without a cookie jar loses the token and is
   # sent back, round and round. An address is resolved to its id instead.
-  page_id "$target"
+  # `read desk` is the signed-in account's desk, as the desk commands' default
+  # (FOLDRENDER_DESK, when set, names it): not the page whose id is "desk",
+  # which, ids being one namespace for every account, is someone's.
+  if [ "$target" = desk ] && [ -n "${FOLDRENDER_DESK:-}" ] && [ "$FOLDRENDER_DESK" != desk ]; then
+    target="$FOLDRENDER_DESK"
+  fi
+  if [ "$target" = desk ]; then
+    PAGE_K=""
+    resolve_address /desk desk "this account has no desk (foldrender desk init makes one)"
+  else
+    page_id "$target"
+  fi
   slug="$PAGE_ID"
   check_slug "$slug"
   case "$slug" in
@@ -3332,8 +3344,8 @@ foldrender desk COMMAND [--desk ID] [--json]
   feed SOURCE FILE.json|-   a snapshot: {"every_s": 60, "items": [{key, kind:
                        session|host|seat|alert|timer, title, product?, state?,
                        body?}]}; what it no longer names is removed
-  ls                   the desk as text (also: foldrender read DESK, or
-                       foldrender read https://foldrender.dev/desk)
+  ls                   the desk as text (also: foldrender read desk, your
+                       own desk wherever it is; FOLDRENDER_DESK names another)
   inbox [--all] [--after ID]
                        your answers that count and no agent has taken yet
   ack ID --sent | --doing | --done "what was done"
