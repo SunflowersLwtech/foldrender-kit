@@ -36,7 +36,7 @@ import { basename, delimiter, dirname, extname, join, resolve, sep } from "node:
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const BRIDGE_VERSION = "0.16.7";
+export const BRIDGE_VERSION = "0.16.8";
 export const PROTOCOL = "fr-agent.1";
 
 // The agents this bridge starts, as the ACP registry
@@ -1575,6 +1575,8 @@ export const CHANGES_FILES_MAX = 200; // files a turn tracks
 export const CHANGES_SHOWN_MAX = 50; // files a turn's record lists
 export const CHANGES_FILE_LINES = 400; // a file's diff lines kept (more cut)
 export const CHANGES_TURN_LINES = 2000;
+export const BASELINE_BYTES = 32 * 1024 * 1024; // files as a conversation found them, all conversations
+export const BASELINE_CONVERSATIONS = 200; // conversations whose files are kept so
 
 // The lines of a and b, as Myers's diff orders them: [" ", line] kept, ["-",
 // line] gone, ["+", line] added. Past maxD changes, one block between what the
@@ -1684,6 +1686,52 @@ const linesIn = (t) => (t === null || t === "" ? [] : String(t).replace(/\n$/, "
 
 // The kinds of call that read and do not write (ACP's ToolKind).
 const READ_ONLY_KINDS = new Set(["read", "search", "fetch", "think"]);
+// What each conversation's files were before it first changed them, so that
+// what a conversation has changed so far is the net of its turns: a line added
+// in one turn and edited in the next is one line added, not two added and one
+// removed. In memory, at most CHANGES_FILES_MAX files a conversation and
+// BASELINE_BYTES (and BASELINE_CONVERSATIONS) in all, the conversation used
+// longest ago let go first; not kept across a restart, so each file's says the
+// turn it was taken in (since), and the page counts the turns before that one
+// as they were.
+export class Baselines {
+  constructor(max = BASELINE_BYTES, conversations = BASELINE_CONVERSATIONS) {
+    this.max = max;
+    this.conversations = conversations;
+    this.bytes = 0;
+    this.by = new Map(); // sid -> Map(real path -> {text, since, size})
+  }
+  drop(sid) {
+    const m = this.by.get(sid);
+    if (!m) return;
+    for (const b of m.values()) this.bytes -= b.size;
+    this.by.delete(sid);
+  }
+  // The file as the conversation found it before it first changed it: the one
+  // given now when it has none yet. Null when it cannot be kept.
+  take(sid, abs, before, seq) {
+    if (!sid) return null;
+    let m = this.by.get(sid);
+    if (m) this.by.delete(sid);
+    else m = new Map();
+    this.by.set(sid, m); // (the conversation used last goes last)
+    if (m.has(abs)) return m.get(abs);
+    if (m.size >= CHANGES_FILES_MAX || before === NOT_TEXT) return null;
+    const size = typeof before === "string" ? Buffer.byteLength(before) : 0;
+    if (size > this.max) return null;
+    const b = { text: before, since: seq, size };
+    m.set(abs, b);
+    this.bytes += size;
+    for (const old of this.by.keys()) {
+      if (this.bytes <= this.max && this.by.size <= this.conversations) break;
+      if (old !== sid) this.drop(old);
+    }
+    // (This conversation's own files alone over: this one is not kept.)
+    if (this.bytes > this.max) { m.delete(abs); this.bytes -= size; return null; }
+    return b;
+  }
+}
+
 export class TurnChanges {
   constructor(root) {
     this.root = root;
@@ -1724,8 +1772,10 @@ export class TurnChanges {
     const mine = this.mine(abs);
     if (mine && !this.files.has(mine) && this.files.size < CHANGES_FILES_MAX) this.files.set(mine, { before: old });
   }
-  // The turn's record of them: each file changed, with its diff; null when none.
-  part() {
+  // The turn's record of them: each file changed, with its diff and, given the
+  // conversation's baselines (net: {base, sid, seq}), what the conversation has
+  // changed in it so far (net: {add, del, since}); null when none.
+  part(net = null) {
     const files = [];
     let add = 0;
     let del = 0;
@@ -1738,11 +1788,13 @@ export class TurnChanges {
       if (after === NOT_TEXT || t.before === NOT_TEXT) { files.push({ path, shown: false, large: true }); continue; }
       const h = hunksOf(lineDiff(linesIn(t.before), linesIn(after)));
       if (!h.add && !h.del) continue;
+      const b = net?.base ? net.base.take(net.sid, abs, t.before, net.seq) : null;
+      const n = b ? (b.text === t.before ? h : hunksOf(lineDiff(linesIn(b.text), linesIn(after)))) : null;
       add += h.add;
       del += h.del;
       const keep = Math.max(0, Math.min(CHANGES_FILE_LINES, budget));
       budget -= Math.min(keep, h.lines.length);
-      files.push({ path, add: h.add, del: h.del, ...(t.before === null ? { made: true } : {}), ...(after === null ? { gone: true } : {}), lines: h.lines.slice(0, keep), ...(h.lines.length > keep ? { cut: true } : {}) });
+      files.push({ path, add: h.add, del: h.del, ...(n ? { net: { add: n.add, del: n.del, since: b.since } } : {}), ...(t.before === null ? { made: true } : {}), ...(after === null ? { gone: true } : {}), lines: h.lines.slice(0, keep), ...(h.lines.length > keep ? { cut: true } : {}) });
     }
     if (!files.length) return null;
     return { k: "changes", files: files.slice(0, CHANGES_SHOWN_MAX), more: Math.max(0, files.length - CHANGES_SHOWN_MAX), add, del };
@@ -1864,6 +1916,7 @@ export class Bridge {
     this.agent = null;
     this.ws = null;
     this.turn = null; // {seq, sid, acp, record, pending: Map, batch: []}
+    this.baselines = new Baselines(); // what each conversation's files were before it changed them
     this.queue = Promise.resolve();
     this.stopped = false;
     this.limits = { event_bytes: 65536, turn_bytes: 65536, rate: 20, permission_s: 600 };
@@ -2586,7 +2639,7 @@ export class Bridge {
       for (const [req, w] of turn.pending) this.answer(turn, req, w, null, null);
       for (const req of [...turn.elicits.keys()]) this.elicited(turn, req, null, null);
       // What it changed in the folder, for the turn's record.
-      const changed = turn.changes.part();
+      const changed = turn.changes.part({ base: this.baselines, sid: p.sid, seq: p.seq });
       if (changed) turn.record.parts.push(changed);
       const stop = turn.cancelled ? "cancelled" : String(answer?.stopReason || "end_turn");
       // Nothing said at all: the agent's own reason, where it keeps one (pi).
@@ -2611,7 +2664,7 @@ export class Bridge {
       for (const req of [...turn.elicits.keys()]) this.elicited(turn, req, null, null);
       if (turn.cancelled) {
         // (Stopped: what it had changed by then.)
-        const changed = turn.changes.part();
+        const changed = turn.changes.part({ base: this.baselines, sid: p.sid, seq: p.seq });
         if (changed) turn.record.parts.push(changed);
         this.send({ t: "done", seq: p.seq, stop: "cancelled", record: turn.record.fit(this.limits.turn_bytes - 1024) });
       } else {
