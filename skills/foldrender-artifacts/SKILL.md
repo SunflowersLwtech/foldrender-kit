@@ -63,6 +63,8 @@ Pick the visibility:
 - `--link`: anyone who has the link. The link ends in `?k=…`, a key; without the key the address opens nothing, and the page is listed nowhere. Use it when the user wants a link to send.
 - `--public`: anyone, and the page is listed on the user's page, `…/artifacts/<login>/`. Use it only when the user asks for public.
 
+Pasted into a chat (Slack, Discord, Telegram, WhatsApp, iMessage, X, Feishu), a link shows a preview card. A public or link page's card shows its title and the owner's login, never the page's text, and a link page's card never its key; a private or shared page's card says only that it is a private FoldRender page. Everyone in that chat reads the card, so give a page you will send a title that is fine for them to see.
+
 Use `-` to publish from stdin: `foldrender publish - < page.html`.
 
 ## 4. Iterate on the same link
