@@ -31,11 +31,15 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.16.14
+FR_CLI_VERSION=0.16.15
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
 FR_BRIDGE_SHA256=b94a0090cd3d3294817b5b9d170542581e16f04a4580594187df5123ab3a9d7a
+# The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
+# released one is served at install/desk-agent/<its sha256>.mjs), pinned as
+# the bridge is.
+FR_DESK_AGENT_SHA256=fe475227b9f76645ed1d9c2d3e38d9afb22716046264aa41e05198bba8f6a362
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -2897,6 +2901,11 @@ desk_written() {
 cmd_desk() {
   local sub="${1:-}" mode=text key="" a
   [ $# -eq 0 ] || shift
+  # A machine's, not a desk page's: no --desk.
+  case "$sub" in
+    agent) cmd_desk_agent "$@"; return ;;
+    machine) cmd_desk_machine "$@"; return ;;
+  esac
   DESK_ID="${FOLDRENDER_DESK:-desk}"
   # --desk and --json may come anywhere.
   local rest=()
@@ -3116,6 +3125,191 @@ cmd_desk() {
       ;;
     *) die 2 "unknown desk command: $sub (foldrender help desk)" ;;
   esac
+}
+
+# A machine's name on the desk: 1 to 32 letters, digits, dots, underscores and
+# hyphens, starting with a letter or a digit.
+check_machine_name() {
+  case "$1" in
+    ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*) die 2 "a machine's name is letters, digits, . _ and -, starting with a letter or digit: $1" ;;
+  esac
+  [ "${#1}" -le 32 ] || die 2 "a machine's name is at most 32 characters: $1"
+}
+
+# This computer's name, as a machine's name: its short host name, with what a
+# machine's name cannot hold made a hyphen.
+default_machine_name() {
+  local n
+  n="$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf 'machine')"
+  n="$(printf '%s' "$n" | tr -c 'A-Za-z0-9._-' '-' | cut -c 1-32)"
+  while :; do case "$n" in [!A-Za-z0-9]*) n="${n#?}" ;; *) break ;; esac; done
+  printf '%s' "${n:-machine}"
+}
+
+# machine_add NAME [REPLACE]: a new machine on the desk, its token in the body
+# ($TMP/body, this run's private folder).
+machine_add() {
+  printf '{"name":%s%s}' "$(json_arg "$1")" "${2:+,\"replace\":true}" > "$TMP/req"
+  ACCEPT="application/json"
+  api_auth POST "/api/desk/machines" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+  ACCEPT="text/plain"
+  case "$STATUS" in
+    201|200) grep -q '"token" *: *"frdm_' "$TMP/body" || die 1 "the desk made machine $1 but sent no token" ;;
+    409) die 1 "the desk has a machine named $1 already (id $(json_get str id 2>/dev/null || printf '?')); --replace gives it a new token and revokes the old one" ;;
+    403) if grep -q '"full"' "$TMP/body"; then die 4 "$(error_text)"; fi; fail_http ;;
+    400) die 2 "$(error_text)" ;;
+    404) die 1 "this account has no desk with machines ($(error_text))" ;;
+    *) fail_http ;;
+  esac
+}
+
+# foldrender desk machine add NAME [--replace] | ls | rm ID: the machines that
+# report what runs on them to the desk, each with a token of its own (frdm_...)
+# that can do nothing but that. add prints the token once, alone on stdout.
+cmd_desk_machine() {
+  local op="${1:-ls}" name="" replace="" mode=text
+  [ $# -eq 0 ] || shift
+  case "$op" in
+    add)
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --replace) replace=1; shift ;;
+          --json) mode=json; shift ;;
+          -*) die 2 "desk machine add: unknown option $1" ;;
+          *) [ -z "$name" ] || die 2 "desk machine add takes one NAME"; name="$1"; shift ;;
+        esac
+      done
+      [ -n "$name" ] || die 2 "which machine? foldrender desk machine add NAME"
+      check_machine_name "$name"
+      machine_add "$name" "$replace"
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      json_get str token
+      printf '\n'
+      note "machine $name (id $(json_get str id 2>/dev/null || printf '?')): its token is shown once. Keep it in a 600 file or a secret store, never in a command line; on that machine: foldrender desk agent install --token-file FILE (or foldrender desk agent install there, signed in, which makes and keeps its own)"
+      ;;
+    ls)
+      while [ $# -gt 0 ]; do case "$1" in --json) mode=json; shift ;; *) die 2 "desk machine ls [--json]" ;; esac; done
+      ACCEPT="application/json"
+      api_auth GET "/api/desk/machines"
+      ACCEPT="text/plain"
+      expect_2xx
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      node_json_lines "$TMP/body" || cat "$TMP/body"
+      ;;
+    rm)
+      [ $# -eq 1 ] || die 2 "desk machine rm ID (desk machine ls)"
+      case "$1" in ''|*[!0-9a-f]*) die 2 "a machine's id is 16 hex characters (desk machine ls)" ;; esac
+      [ "${#1}" -eq 16 ] || die 2 "a machine's id is 16 hex characters (desk machine ls)"
+      api_auth DELETE "/api/desk/machines/$1"
+      case "$STATUS" in
+        2??) printf 'revoked machine %s: its agent is disconnected, and what it reported is gone from the desk\n' "$1" ;;
+        404) die 7 "no machine $1 on this desk that is not revoked already (desk machine ls)" ;;
+        *) fail_http ;;
+      esac
+      ;;
+    *) die 2 "desk machine add NAME | ls | rm ID (foldrender help desk)" ;;
+  esac
+}
+
+# The machines' list, a line each: ID  NAME  made …  last heard …  [revoked]
+# (node reads the JSON; without node, the JSON is printed as it came).
+node_json_lines() {
+  command -v node >/dev/null 2>&1 || return 1
+  node -e '
+    const b = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+    const ms = Array.isArray(b.machines) ? b.machines : [];
+    if (!ms.length) console.log("no machines yet: foldrender desk agent install (on the machine), or foldrender desk machine add NAME");
+    for (const m of ms) console.log([m.id, m.name, "made " + (m.created_at || "?"), "last heard " + (m.last_used_at || "never"), m.revoked_at ? "revoked " + m.revoked_at : ""].filter(Boolean).join("  "));
+  ' "$1"
+}
+
+# The foldrender command itself, by its absolute path (what a service runs).
+cli_path() {
+  local p="$0" d
+  case "$p" in */*) ;; *) p="$(command -v -- "$p" 2>/dev/null)" || p="$0" ;; esac
+  d="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)" || die 1 "cannot tell where this foldrender command is"
+  printf '%s/%s' "$d" "$(basename "$p")"
+}
+
+# foldrender desk agent run|install|status|uninstall: the program that tells
+# the desk what runs on this computer (herdr's agents and the machine's load),
+# kept running by install. It is a Node program (foldrender-desk-agent.mjs)
+# fetched from the site once, checked against FR_DESK_AGENT_SHA256 and kept in
+# the cache folder, as the bridge is. Its token is the machine's (frdm_), in a
+# 600 file; install makes one with your sign-in when there is none.
+cmd_desk_agent() {
+  local op="${1:-}" node_major file cache url got cli want_token="" name="" replace="" a
+  [ $# -eq 0 ] || shift
+  case "$op" in
+    run|install|status|uninstall) ;;
+    '') die 2 "desk agent run | install | status | uninstall (foldrender help desk)" ;;
+    *) die 2 "unknown desk agent command: $op (run, install, status, uninstall)" ;;
+  esac
+  command -v node >/dev/null 2>&1 || die 2 "the desk agent needs Node 22 or later (https://nodejs.org); it is not installed"
+  node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null)"
+  case "$node_major" in ''|*[!0-9]*) node_major=0 ;; esac
+  [ "$node_major" -ge 22 ] || die 2 "the desk agent needs Node 22 or later; this is $(node -v 2>/dev/null)"
+  if [ -n "${FOLDRENDER_DESK_AGENT:-}" ]; then
+    file="$FOLDRENDER_DESK_AGENT"
+    [ -f "$file" ] || die 2 "FOLDRENDER_DESK_AGENT=$file is not a file"
+  else
+    cache="${XDG_CACHE_HOME:-$HOME/.cache}/foldrender"
+    file="$cache/desk-agent-$FR_DESK_AGENT_SHA256.mjs"
+    if [ ! -f "$file" ] || [ "$(sha256_of "$file")" != "$FR_DESK_AGENT_SHA256" ]; then
+      mkdir -p "$cache" || die 1 "cannot make $cache"
+      url="${API%/artifacts}/install/desk-agent/$FR_DESK_AGENT_SHA256.mjs"
+      curl -fsS --connect-timeout 15 --max-time 120 -o "$TMP/desk-agent.mjs" "$url" 2>"$TMP/err" || die 6 "cannot fetch the desk agent from $url ($(curl_error))"
+      got="$(sha256_of "$TMP/desk-agent.mjs")"
+      [ "$got" = "$FR_DESK_AGENT_SHA256" ] || die 1 "the desk agent at $url is not the one this foldrender ($FR_CLI_VERSION) runs; update foldrender: curl -fsSL ${API%/artifacts}/install.sh | sh"
+      mv "$TMP/desk-agent.mjs" "$file" || die 1 "cannot write $file"
+    fi
+  fi
+  cli="$(cli_path)"
+  if [ -n "${FOLDRENDER_API:-}" ]; then set -- --cli "$cli" --api "$API" "$@"; else set -- --cli "$cli" "$@"; fi
+  case "$op" in
+    run)
+      # The service's own process from here (signals reach it), and nothing
+      # of this run left behind: cron starts this every minute.
+      rm -rf "$TMP"
+      exec node "$file" run "$@"
+      ;;
+    install)
+      for a in "$@"; do
+        case "$a" in
+          --token-file) want_token=given ;;
+          --replace) replace=1 ;;
+        esac
+      done
+      # --replace and --name are this command's; the program takes --name.
+      local args=() prev=""
+      for a in "$@"; do
+        if [ "$prev" = --name ]; then name="$a"; fi
+        prev="$a"
+        [ "$a" = --replace ] || args+=("$a")
+      done
+      if [ -z "$want_token" ] && { [ -n "$replace" ] || ! desk_agent_token_ok; }; then
+        # No token here yet (or --replace): one made now with your sign-in,
+        # handed to the program on its standard input, never printed.
+        require_token
+        [ -n "$name" ] || { name="$(default_machine_name)"; args+=(--name "$name"); }
+        check_machine_name "$name"
+        machine_add "$name" "$replace"
+        json_get str token > "$TMP/machine-token" || die 1 "the desk sent no token"
+        node "$file" install "${args[@]}" --token-file - < "$TMP/machine-token"
+        a=$?
+        rm -f "$TMP/machine-token"
+        return "$a"
+      fi
+      node "$file" install "${args[@]}"
+      ;;
+    *) node "$file" "$op" "$@" ;;
+  esac
+}
+
+# Whether this computer has a machine token for the desk agent already.
+desk_agent_token_ok() {
+  local f="${FOLDRENDER_DESK_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/foldrender/desk-agent}/token"
+  [ -f "$f" ] && head -n 1 "$f" | grep -Eq '^frdm_[A-Za-z0-9_-]{20,200}$'
 }
 
 # foldrender bridge --page PAGE [--agent NAME] [--dir DIR]: connects a coding
@@ -3374,6 +3568,24 @@ foldrender desk COMMAND [--desk ID] [--json]
                        your answers that count and no agent has taken yet
   ack ID --sent | --doing | --done "what was done"
                        mark an answer; the page shows each step under it
+  machine add NAME [--replace] | machine ls | machine rm ID
+                       the machines that report to the desk, each with a token
+                       of its own (frdm_..., printed once by add, alone on
+                       stdout) that does nothing else; rm revokes it, and what
+                       that machine reported leaves the desk
+  agent install [--name NAME] [--replace] [--token-file FILE|-] [--no-start]
+                       on a machine, keeps the desk agent running: a LaunchAgent
+                       on a Mac, a systemd user unit on Linux (crontab, at boot
+                       and every minute, where a user unit would stop at logout
+                       or there is none). It tells the desk what runs in herdr
+                       here (each agent, its state, the last line it printed)
+                       and how loaded the machine is, only when that changed,
+                       with tokens, keys and passwords made [redacted] before
+                       anything leaves. With no token here it makes the machine
+                       with your sign-in (NAME: this host's name); --replace
+                       gives it a new token. Needs Node 22 or later
+  agent status         installed? running? connected? (exit 1: not running)
+  agent uninstall [--keep-token] | agent run [--detach]
   The same KEY again changes the thing (its revision goes up; an answer to an
   older revision is refused). Anything that looks like a secret (a key, a
   token, a link's ?k=) is refused whole; links go to foldrender.dev,
@@ -3708,7 +3920,7 @@ help_asked() {
       --section|--card|--from|--max-tokens|--max-chars|--meta|--access|-n|--add|--rm|--note|--owner|\
       --confirm|--token|--timeout|--after|--notify|--ack|--to|--idempotency-key|--page|--agent|--dir|\
       --desk|--role|--context|--suggest|--option|--deadline|--product|--state|--device|--minutes|--session|\
-      --next|--at|--match|--until|--reply-url|--lang|--done) skip=1 ;;
+      --next|--at|--match|--until|--reply-url|--lang|--done|--token-file|--log|--cli|--api) skip=1 ;;
       --link) [ "$cmd" != canvas ] || skip=1 ;;
     esac
   done
