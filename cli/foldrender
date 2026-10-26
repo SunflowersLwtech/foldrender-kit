@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.16.16
+FR_CLI_VERSION=0.16.17
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -39,7 +39,7 @@ FR_BRIDGE_SHA256=2c84e0e03270282d731935416436b439f9ebfeab85bf63637ac43ea97887092
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=ebd4c6b6a003844cb535da373f07cbaf85d3f03ef68049c627b05ab7804812fe
+FR_DESK_AGENT_SHA256=2a5a89f102d8bd80041a4587a9a34cd66e81b2e35620f647f1ab68e515b159b2
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -2905,6 +2905,7 @@ cmd_desk() {
   case "$sub" in
     agent) cmd_desk_agent "$@"; return ;;
     machine) cmd_desk_machine "$@"; return ;;
+    owner) cmd_desk_owner "$@"; return ;;
   esac
   DESK_ID="${FOLDRENDER_DESK:-desk}"
   # --desk and --json may come anywhere.
@@ -3166,6 +3167,39 @@ machine_add() {
 # foldrender desk machine add NAME [--replace] | ls | rm ID: the machines that
 # report what runs on them to the desk, each with a token of its own (frdm_...)
 # that can do nothing but that. add prints the token once, alone on stdout.
+# What the desk calls its owner (<api>/desk/owner): the owner's sign-in or
+# token, or the desk's agent token (FOLDRENDER_DESK_TOKEN).
+cmd_desk_owner() {
+  local name="" set="" mode=text n
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) need $# "$1"; name="$2"; set=1; shift 2 ;;
+      --clear) name=""; set=1; shift ;;
+      --json) mode=json; shift ;;
+      *) die 2 "desk owner [--name NAME | --clear] [--json]" ;;
+    esac
+  done
+  ACCEPT="application/json"
+  if [ -n "$set" ]; then
+    printf '{"name":%s}' "$(json_arg "$name")" > "$TMP/req"
+    api POST "/api/desk/owner" -H "$(desk_auth)" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+  else
+    api GET "/api/desk/owner" -H "$(desk_auth)"
+  fi
+  ACCEPT="text/plain"
+  case "$STATUS" in
+    2??) ;;
+    401) die 3 "not signed in, or the token was rejected ($(error_text))" ;;
+    403) die 3 "this token may not name the desk's owner: use your sign-in, your API token or the desk's agent token ($(error_text))" ;;
+    404) die 7 "no desk for this account (foldrender desk init makes one)" ;;
+    422) die 1 "refused: the name is one line of at most 32 characters, and nothing that looks like a secret" ;;
+    *) fail_http ;;
+  esac
+  [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+  n="$(json_get str name 2>/dev/null || true)"
+  if [ -n "$n" ]; then printf 'the desk calls you %s\n' "$n"; else printf 'no name: the desk shows your login'"'"'s first letter\n'; fi
+}
+
 cmd_desk_machine() {
   local op="${1:-ls}" name="" replace="" mode=text
   [ $# -eq 0 ] || shift
@@ -3573,6 +3607,11 @@ foldrender desk COMMAND [--desk ID] [--json]
                        of its own (frdm_..., printed once by add, alone on
                        stdout) that does nothing else; rm revokes it, and what
                        that machine reported leaves the desk
+  owner [--name NAME | --clear]
+                       what the desk calls you (one line, at most 32
+                       characters); its page shows the first character, and
+                       your login's first letter while there is none. With no
+                       option, prints it
   agent install [--name NAME] [--replace] [--token-file FILE|-] [--no-start]
                        on a machine, keeps the desk agent running: a LaunchAgent
                        on a Mac, a systemd user unit on Linux (crontab, at boot
