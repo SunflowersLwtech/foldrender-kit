@@ -36,7 +36,7 @@ import { basename, delimiter, dirname, extname, join, resolve, sep } from "node:
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const BRIDGE_VERSION = "0.16.13";
+export const BRIDGE_VERSION = "0.16.16";
 export const PROTOCOL = "fr-agent.1";
 
 // The agents this bridge starts, as the ACP registry
@@ -1989,6 +1989,7 @@ export class Bridge {
     this.usageAt = new Map();
     this.introduced = new Set(); // ACP sessions told where they are (a slash command is not)
     this.untold = new Map(); // ACP session -> {history, missed} not yet told it
+    this.startup = new Map(); // ACP session -> what its adapter said it starts by saying (pi-acp), not yet seen
     // What each conversation's session may be set to, as its agent reports it
     // (room session id -> {acp, via, options}); the last reported, for a new
     // conversation; and what was chosen for the next new conversation.
@@ -2697,6 +2698,18 @@ export class Bridge {
     }
     if (!made) made = await agent.request("session/new", { cwd: this.dir, mcpServers: this.mcpServers() });
     const acp = String(made.sessionId);
+    // What pi-acp says as a new session starts, which it then sends as the
+    // agent's words: not taken as its answer (taken so, they hid pi's own
+    // error when its model call failed). Of it, only the line that says a
+    // newer pi is out, as a note of the turn's: the rest (pi's version, its
+    // context file, skills and extensions, by their paths on the owner's
+    // computer; the notice last, after all of them) is not for the page.
+    const startup = made?._meta?.piAcp?.startupInfo;
+    if (how === "new" && typeof startup === "string" && startup.trim()) {
+      this.startup.set(acp, startup);
+      const notice = startup.split("\n").map((l) => l.trim()).filter((l) => /^New version available\b/.test(l)).join("\n");
+      if (notice) turn.record.parts.push({ k: "note", code: "agent-notice", text: cut(notice, 400) });
+    }
     // The mode the session actually started in (the organisation's policy,
     // or a setting read where the bridge does not look; for one taken up
     // again, the mode it was left in): one that does not ask, and it is no
@@ -2876,6 +2889,7 @@ export class Bridge {
       }
     } finally {
       clearTimeout(turn.timer);
+      if (turn.acp) this.startup.delete(turn.acp);
       if (this.turn === turn) this.turn = null;
       // (A turn may have changed the branch: the room told if it did.)
       if (!this.session) {
@@ -2895,6 +2909,12 @@ export class Bridge {
     // remembering, not news for the page (nor a change of its mode now: the
     // answer to the load says the mode it is in).
     if (this.replaying.has(params?.sessionId)) return;
+    // (What its adapter said it starts by saying, as words: kept as a note when the session opened.)
+    const startup = this.startup.get(params?.sessionId);
+    if (startup !== undefined && params.update?.sessionUpdate === "agent_message_chunk" && params.update.content?.type === "text" && params.update.content.text === startup) {
+      this.startup.delete(params.sessionId);
+      return;
+    }
     // Its title, as the agent names a session (pi's /name), and what its
     // context holds now (and what it cost, when the agent says): for the
     // conversation the session is in.

@@ -31,15 +31,15 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.16.15
+FR_CLI_VERSION=0.16.16
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=b94a0090cd3d3294817b5b9d170542581e16f04a4580594187df5123ab3a9d7a
+FR_BRIDGE_SHA256=2c84e0e03270282d731935416436b439f9ebfeab85bf63637ac43ea97887092c
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=fe475227b9f76645ed1d9c2d3e38d9afb22716046264aa41e05198bba8f6a362
+FR_DESK_AGENT_SHA256=ebd4c6b6a003844cb535da373f07cbaf85d3f03ef68049c627b05ab7804812fe
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
