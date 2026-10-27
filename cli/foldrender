@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.16.19
+FR_CLI_VERSION=0.16.20
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -39,7 +39,7 @@ FR_BRIDGE_SHA256=2c84e0e03270282d731935416436b439f9ebfeab85bf63637ac43ea97887092
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=15f8e6a0b408ddadceb0572cf5b4f508a3237afa57513bf986efe6c29372d6f1
+FR_DESK_AGENT_SHA256=de74b172e79e847f31af492a71fef7e083d99d5499dc10cb327550529eed0254
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -47,15 +47,17 @@ CARD_MAX_BYTES=2097152
 CANVAS_MAX_CARDS=24
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/foldrender"
 # Saved accounts (0.16.0): accounts/<login> holds that account's token (mode
-# 600) and accounts/<login>.slugs its slug map; "active" names the default.
-# A command's account is, first to last: FOLDRENDER_TOKEN (a token: its account
-# is not looked up, and its slug map is CONFIG_DIR/slugs, as before), --as LOGIN
-# or FOLDRENDER_ACCOUNT (a saved account: an agent pins one, so that switching
-# in a terminal does not move it), the default. Before 0.16.0 a machine had one,
-# CONFIG_DIR/token with CONFIG_DIR/slugs: it is used as the default until a
-# command that names accounts (login, logout, auth, whoami) learns whose it is
-# and moves it under its login, its slug map copied (CONFIG_DIR/slugs stays for
-# FOLDRENDER_TOKEN runs).
+# 600), accounts/<login>.slugs its slug map and accounts/<login>.desk the id of
+# its desk (desk init writes it, so the desk commands send it without --desk);
+# "active" names the default. A command's account is, first to last:
+# FOLDRENDER_TOKEN (a token: its account is not looked up, and its slug map is
+# CONFIG_DIR/slugs, as before; no desk file: whose desk is the server's),
+# --as LOGIN or FOLDRENDER_ACCOUNT (a saved account: an agent pins one, so that
+# switching in a terminal does not move it), the default. Before 0.16.0 a
+# machine had one, CONFIG_DIR/token with CONFIG_DIR/slugs: it is used as the
+# default until a command that names accounts (login, logout, auth, whoami)
+# learns whose it is and moves it under its login, its slug map copied
+# (CONFIG_DIR/slugs stays for FOLDRENDER_TOKEN runs).
 ACCOUNTS_DIR="$CONFIG_DIR/accounts"
 ACTIVE_FILE="$CONFIG_DIR/active"
 LEGACY_TOKEN="$CONFIG_DIR/token"
@@ -66,6 +68,7 @@ ACCOUNT=""
 ACCOUNT_FROM=""
 ACCOUNT_ERROR=""
 AS_LOGIN=""
+DESK_FILE=""
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/foldrender.XXXXXX")" || exit 1
 trap 'rm -rf "$TMP"' EXIT
@@ -122,6 +125,7 @@ use_account() {
   ACCOUNT_FROM="$2"
   TOKEN_FILE="$ACCOUNTS_DIR/$1"
   SLUG_MAP="$ACCOUNTS_DIR/$1.slugs"
+  DESK_FILE="$ACCOUNTS_DIR/$1.desk"
   TOKEN="$(head -n 1 "$TOKEN_FILE" | tr -d ' \t\r\n')"
 }
 
@@ -132,7 +136,7 @@ use_account() {
 # command that needs no token (help, version) still runs.
 select_account() {
   local login="" from=""
-  TOKEN=""; ACCOUNT=""; ACCOUNT_FROM=""; ACCOUNT_ERROR=""; TOKEN_FILE=""; SLUG_MAP="$CONFIG_DIR/slugs"
+  TOKEN=""; ACCOUNT=""; ACCOUNT_FROM=""; ACCOUNT_ERROR=""; TOKEN_FILE=""; SLUG_MAP="$CONFIG_DIR/slugs"; DESK_FILE=""
   if [ -n "${FOLDRENDER_TOKEN:-}" ]; then
     TOKEN="$FOLDRENDER_TOKEN"
     ACCOUNT_FROM=FOLDRENDER_TOKEN
@@ -950,7 +954,7 @@ cmd_logout() {
       printf 'Signed out of %s here, but its token could not be revoked on the server (%s). Revoke it under Account & CLI tokens: %s/account\n' "$l" "${STATUS:-$(curl_error)}" "$API"
       failed=1
     fi
-    rm -f "$ACCOUNTS_DIR/$l"
+    rm -f "$ACCOUNTS_DIR/$l" "$ACCOUNTS_DIR/$l.desk"
   done
   a="$(active_login)"
   if ! { valid_login "$a" && [ -f "$ACCOUNTS_DIR/$a" ]; }; then
@@ -1261,7 +1265,7 @@ cmd_account() {
   tokens="$(json_number tokens)"
   # Its sign-in here, and its slug map; the default moves to another account.
   [ -z "$TOKEN_FILE" ] || rm -f "$TOKEN_FILE"
-  rm -f "$ACCOUNTS_DIR/$login" "$ACCOUNTS_DIR/$login.slugs" "$SLUG_MAP" "$SLUG_MAP.tmp"
+  rm -f "$ACCOUNTS_DIR/$login" "$ACCOUNTS_DIR/$login.slugs" "$ACCOUNTS_DIR/$login.desk" "$SLUG_MAP" "$SLUG_MAP.tmp"
   if [ "$(active_login)" = "$login" ]; then
     rm -f "$ACTIVE_FILE"
     [ -z "$(saved_logins | head -n 1)" ] || set_active "$(saved_logins | head -n 1)"
@@ -2837,6 +2841,7 @@ cmd_answers() {
 # desk token is read from FOLDRENDER_DESK_TOKEN, never from the command line;
 # without one, the saved sign-in is used.
 DESK_ID=""
+DESK_KEPT=""
 desk_auth() {
   if [ -n "${FOLDRENDER_DESK_TOKEN:-}" ]; then
     case "$FOLDRENDER_DESK_TOKEN" in frdk_*) ;; *) die 2 "FOLDRENDER_DESK_TOKEN is a desk token (frdk_...)" ;; esac
@@ -2847,10 +2852,30 @@ desk_auth() {
     auth_header
   fi
 }
+# desk_send METHOD PATH [curl args...]: the request to the desk's PATH. A kept
+# id (DESK_KEPT) the server answers 404 for is tried once more as "desk", the
+# account's own desk. When that answers, the kept id is stale (the desk was
+# deleted, maybe made again elsewhere) and is dropped; desk init keeps the
+# desk's id again. When it does not (the 404 was for what PATH names), the kept
+# id stays.
+desk_send() {
+  local method="$1" path="$2" kept
+  shift 2
+  api "$method" "/api/desk/$DESK_ID$path" "$@"
+  [ "$STATUS" = 404 ] && [ -n "$DESK_KEPT" ] || return 0
+  kept="$DESK_ID"; DESK_ID=desk; DESK_KEPT=""
+  api "$method" "/api/desk/$DESK_ID$path" "$@"
+  if [ "${STATUS#2}" != "$STATUS" ]; then
+    rm -f "$DESK_FILE"
+    note "the desk id kept for this account ($kept) is gone; this went to your own desk (foldrender desk init keeps its id again)"
+  else
+    DESK_ID="$kept"
+  fi
+}
 desk_api() {
   local method="$1" path="$2"
   shift 2
-  api "$method" "/api/desk/$DESK_ID$path" -H "$(desk_auth)" "$@"
+  desk_send "$method" "$path" -H "$(desk_auth)" "$@"
 }
 # A desk's answer that is not 2xx, with what the server said.
 desk_fail() {
@@ -2907,7 +2932,11 @@ cmd_desk() {
     machine) cmd_desk_machine "$@"; return ;;
     owner) cmd_desk_owner "$@"; return ;;
   esac
-  DESK_ID="${FOLDRENDER_DESK:-desk}"
+  # The default desk is the account's own: the id desk init kept for a saved
+  # account, or "desk", which the API reads as the caller's own (the desk a
+  # desk token is for; the account's when there is no saved account).
+  # --desk and FOLDRENDER_DESK name another.
+  DESK_ID="${FOLDRENDER_DESK:-}"
   # --desk and --json may come anywhere.
   local rest=()
   while [ $# -gt 0 ]; do
@@ -2917,6 +2946,19 @@ cmd_desk() {
       *) rest+=("$1"); shift ;;
     esac
   done
+  # With neither, the kept id; a desk token is for one desk, which is the
+  # server's to say, so the kept id of whichever account is saved here is not
+  # read for it. Only a kept id that is not one gives way to "desk": what
+  # --desk or FOLDRENDER_DESK says is read as given below (an address is turned
+  # into its id, anything else that is not an id refused).
+  DESK_KEPT=""
+  if [ -z "$DESK_ID" ]; then
+    if [ -n "$DESK_FILE" ] && [ -z "${FOLDRENDER_DESK_TOKEN:-}" ]; then
+      DESK_ID="$(head -n 1 "$DESK_FILE" 2>/dev/null | tr -d ' \t\r\n')"
+      case "$DESK_ID" in ''|*[!A-Za-z0-9_-]*) DESK_ID="" ;; *) DESK_KEPT=1 ;; esac
+    fi
+    [ -n "$DESK_ID" ] || DESK_ID=desk
+  fi
   set -- ${rest[@]+"${rest[@]}"}
   case "$DESK_ID" in http://*|https://*) page_id "$DESK_ID"; DESK_ID="$PAGE_ID" ;; esac
   check_slug "$DESK_ID"
@@ -2943,8 +2985,13 @@ cmd_desk() {
       id="$(sed -n 's/.*"slug" *: *"\([^"]*\)".*/\1/p' "$TMP/body")"
       if grep -q '"created":true' "$TMP/body"; then note "made your desk, id $id; give it agents with: foldrender desk token add --role agent --name NAME"
       else note "you have this desk already, id $id"; fi
-      # The desk named desk is every desk command's default, whatever its id;
-      # another is named with --desk.
+      # This account's desk commands default to the desk named desk: when the
+      # account is saved here, its id is kept beside its token, so the other
+      # desk commands send it without --desk.
+      if [ "${name:-desk}" = desk ] && [ -n "$DESK_FILE" ]; then
+        printf '%s\n' "$id" > "$DESK_FILE" 2>/dev/null || true
+      fi
+      # A desk of another name is named with --desk.
       [ "${name:-desk}" = desk ] || note "its id is $id: pass --desk $id (or set FOLDRENDER_DESK=$id) to the other desk commands"
       ;;
     token)
@@ -2963,7 +3010,7 @@ cmd_desk() {
           [ -n "$name" ] || die 2 "--name names who holds it, e.g. --name secretary"
           printf '{"role":"%s","name":%s}' "$role" "$(json_arg "$name")" > "$TMP/req"
           require_token
-          api POST "/api/desk/$DESK_ID/tokens" -H "$(auth_header)" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+          desk_send POST /tokens -H "$(auth_header)" -H "Content-Type: application/json" --data-binary "@$TMP/req"
           [ "${STATUS#2}" != "$STATUS" ] || desk_fail
           [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
           sed -n 's/.*"token" *: *"\(frdk_[^"]*\)".*/\1/p' "$TMP/body"
@@ -2973,7 +3020,7 @@ cmd_desk() {
           ACCEPT="text/plain"
           [ "$mode" != json ] || ACCEPT="application/json"
           require_token
-          api GET "/api/desk/$DESK_ID/tokens" -H "$(auth_header)"
+          desk_send GET /tokens -H "$(auth_header)"
           [ "${STATUS#2}" != "$STATUS" ] || desk_fail
           cat "$TMP/body"
           ;;
@@ -2981,7 +3028,7 @@ cmd_desk() {
           [ $# -ge 1 ] || die 2 "desk token rm ID"
           case "$1" in *[!0-9a-f]*|'') die 2 "a token's id is 16 hex characters (desk token ls)" ;; esac
           require_token
-          api DELETE "/api/desk/$DESK_ID/tokens/$1" -H "$(auth_header)"
+          desk_send DELETE "/tokens/$1" -H "$(auth_header)"
           [ "${STATUS#2}" != "$STATUS" ] || desk_fail
           printf 'revoked %s\n' "$1"
           ;;
@@ -3826,7 +3873,8 @@ foldrender desk COMMAND [--desk ID] [--json]
   token, a link's ?k=) is refused whole; links go to foldrender.dev,
   github.com and Feishu only. Write sentences and numbers, never terminal
   output. --desk ID (or FOLDRENDER_DESK) names another desk; the default is
-  your own desk (the one named desk; with a desk token, that token's desk).
+  your own desk (the one named desk; with a desk token, that token's desk),
+  its id kept by desk init.
   FOLDRENDER_DESK_TOKEN: a desk token (frdk_...) instead of your sign-in; keep
   it in the environment or a 600 file, never in a command line.
 Examples: foldrender desk ask aws-pay --title "Bind a card for the new models?" \
