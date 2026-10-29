@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.18.0
+FR_CLI_VERSION=0.18.1
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -39,7 +39,7 @@ FR_BRIDGE_SHA256=2c84e0e03270282d731935416436b439f9ebfeab85bf63637ac43ea97887092
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=90e4de40edbc3e12f478fb4537d02278d25d1daf72b0dd50a0c0f2fe1144979a
+FR_DESK_AGENT_SHA256=e7e682328873fb5f3fda827dfaad4b7e57510b93548905fc59bf1241746395cc
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -3425,6 +3425,53 @@ cmd_desk_mem() {
       [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
       printf 'obs %s\n' "$(sed -n 's/.*"id":\([0-9]*\).*/\1/p' "$TMP/body" | head -n 1)"
       ;;
+    import)
+      # Observations from a file, one JSON object a line (as `desk mem note`
+      # sends one), 100 to a request at most. With basis "imported" and a source of
+      # its own, each is kept once: the file sent again (after a stop, a
+      # quota or a failure) adds only what is not there yet, and what is
+      # already there costs none of the day's writes. One the owner forgot
+      # (desk mem forget) stays forgotten.
+      [ -n "$file" ] || file="${1:--}"
+      if [ "$file" = - ]; then cat > "$TMP/import"; file="$TMP/import"; fi
+      [ -f "$file" ] || die 2 "no file $file"
+      grep -v '^[[:space:]]*$' "$file" > "$TMP/import.lines" || true
+      # Each item's line in the file, blank lines counted, for where it stopped.
+      grep -n -v '^[[:space:]]*$' "$file" | cut -d: -f1 > "$TMP/import.nums" || true
+      local total sent=0 added=0 unchanged=0 forgotten=0 part n again at
+      total=$(wc -l < "$TMP/import.lines" | tr -d ' ')
+      [ "$total" -gt 0 ] || die 2 "desk mem import: $file has no lines (one JSON object a line)"
+      # At most 100 to a request and under the API's 64 KB a request (bytes,
+      # so C); a line that is more on its own goes alone and is refused.
+      LC_ALL=C awk -v pre="$TMP/import.part." -v max=60000 '
+        { b = length($0) + 1
+          if (n == 100 || (n > 0 && size + b > max)) { close(f); k++; n = 0; size = 0 }
+          f = sprintf("%s%06d", pre, k); print > f; n++; size += b }' "$TMP/import.lines"
+      for part in "$TMP"/import.part.*; do
+        { printf '{"obs":['; paste -sd, "$part"; printf ']}'; } > "$TMP/req"
+        n=$(wc -l < "$part" | tr -d ' ')
+        api POST "/api/desk/mem/obs" -H "$(desk_auth)" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+        if [ "${STATUS#2}" = "$STATUS" ]; then
+          [ "$mode" = json ] || [ "$total" -le 100 ] || printf '\n' >&2
+          # A day's quota: the same command after 00:00 UTC goes on (what is
+          # kept costs nothing then); sent again today it is refused again.
+          again="Run it again to go on."
+          [ "$STATUS" != 429 ] || ! grep -q -E '"code" *: *"quota"|^code: *quota' "$TMP/body" || again="Run it again after 00:00 UTC to go on; until then it is refused again."
+          at=$((sent + $(sed -n -e 's/^index: *\([0-9][0-9]*\).*/\1/p' -e 's/.*"index":\([0-9][0-9]*\).*/\1/p' "$TMP/body" | head -n 1 | grep . || echo 0) + 1))
+          printf 'desk mem import: stopped at line %s of %s; added %s, unchanged %s before it. %s\n' \
+            "$(sed -n "${at}p" "$TMP/import.nums")" "$(awk 'END { print NR }' "$file")" "$added" "$unchanged" "$again" >&2
+          mem_fail
+        fi
+        added=$((added + $(grep -o '"result":"added"' "$TMP/body" | wc -l)))
+        unchanged=$((unchanged + $(grep -o '"result":"unchanged"' "$TMP/body" | wc -l)))
+        forgotten=$((forgotten + $(grep -o '"result":"forgotten"' "$TMP/body" | wc -l)))
+        sent=$((sent + n))
+        [ "$mode" = json ] || [ "$total" -le 100 ] || printf '\r%s of %s' "$sent" "$total" >&2
+      done
+      [ "$mode" = json ] || [ "$total" -le 100 ] || printf '\n' >&2
+      [ "$mode" = json ] && { printf '{"lines":%s,"added":%s,"unchanged":%s,"forgotten":%s}\n' "$total" "$added" "$unchanged" "$forgotten"; return 0; }
+      printf 'added: %s, unchanged: %s%s (of %s)\n' "$added" "$unchanged" "$([ "$forgotten" = 0 ] || printf ', forgotten: %s' "$forgotten")" "$total"
+      ;;
     forget)
       # Hide what came from one source (a card's answer, a message).
       [ -n "${source:-}" ] || die 2 "desk mem forget --source SOURCE (e.g. card:KEY:bN, thread:KEY)"
@@ -4563,6 +4610,20 @@ foldrender desk mem COMMAND [--json]
                          from your answers on the desk.
   forget --source S      hide what one source wrote: card:KEY:bN (an
                          answer), thread:KEY (a message), or a note's source
+  import FILE|- [--json] many items: one JSON object a line, as note sends
+                         one ({"kind","basis","source","text","quote","at"}),
+                         up to 100 (and 60 KB) a request. With
+                         "basis":"imported" and a source of each item's own,
+                         each is kept once, so the same file sent again
+                         (after a quota or a failure) adds only what is not
+                         there yet; what is already there costs none of the
+                         day's writes, and an item forgotten (forget
+                         --source) stays forgotten. Stopped by the day's
+                         quota, run it again after 00:00 UTC. A batch with
+                         an item the API refuses is not written at all; it
+                         says which line. From
+                         claude-mem: the repository's
+                         scripts/claude-mem-export.mjs makes the file.
   install [--agent claude|codex|all] [--remove]
                          on this machine, the hooks that feed the memory
                          (default claude and codex): a session's start prints
@@ -4597,6 +4658,7 @@ Examples: foldrender desk mem install --agent claude
           printf '%s' "$LAST_REPLY" | foldrender desk mem say - --kind stop --agent grok --machine devdesk
           foldrender desk mem search "release window"
           foldrender desk mem note "the retry loop was the bug" --kind discovery --source claude:fr-desk
+          foldrender desk mem import claude-mem.jsonl
 EOF
     ;;
     answers) cat <<'EOF'
