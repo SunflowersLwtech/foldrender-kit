@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.16.20
+FR_CLI_VERSION=0.18.0
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -39,7 +39,7 @@ FR_BRIDGE_SHA256=2c84e0e03270282d731935416436b439f9ebfeab85bf63637ac43ea97887092
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=de74b172e79e847f31af492a71fef7e083d99d5499dc10cb327550529eed0254
+FR_DESK_AGENT_SHA256=90e4de40edbc3e12f478fb4537d02278d25d1daf72b0dd50a0c0f2fe1144979a
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -2931,6 +2931,8 @@ cmd_desk() {
     agent) cmd_desk_agent "$@"; return ;;
     machine) cmd_desk_machine "$@"; return ;;
     owner) cmd_desk_owner "$@"; return ;;
+    image) cmd_desk_image "$@"; return ;;
+    mem) cmd_desk_mem "$@"; return ;;
   esac
   # The default desk is the account's own: the id desk init kept for a saved
   # account, or "desk", which the API reads as the caller's own (the desk a
@@ -3214,6 +3216,46 @@ machine_add() {
 # foldrender desk machine add NAME [--replace] | ls | rm ID: the machines that
 # report what runs on them to the desk, each with a token of its own (frdm_...)
 # that can do nothing but that. add prints the token once, alone on stdout.
+# A picture a question may show (<api>/desk/images): the file's bytes, its type
+# by its name; prints the image's id (its SHA-256) for the card's images.
+cmd_desk_image() {
+  local file="" mode=text type size
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) mode=json; shift ;;
+      -*) die 2 "desk image FILE [--json]" ;;
+      *) [ -z "$file" ] || die 2 "desk image takes one FILE"; file="$1"; shift ;;
+    esac
+  done
+  [ -n "$file" ] || die 2 "which picture? foldrender desk image FILE (a PNG, JPEG or WebP, at most 200 KB)"
+  [ -f "$file" ] && [ -r "$file" ] || die 2 "cannot read $file"
+  case "$(printf '%s' "$file" | tr '[:upper:]' '[:lower:]')" in
+    *.png) type=image/png ;;
+    *.jpg|*.jpeg) type=image/jpeg ;;
+    *.webp) type=image/webp ;;
+    *) die 2 "a question's picture is a .png, .jpg or .webp file (an SVG is not taken: export it as a PNG)" ;;
+  esac
+  size="$(wc -c < "$file" | tr -d ' ')"
+  [ "$size" -le 204800 ] || die 2 "$file is $((size / 1024)) KB: a question's picture is at most 200 KB (make it smaller first)"
+  ACCEPT="application/json"
+  api POST "/api/desk/images" -H "$(desk_auth)" -H "Content-Type: $type" --data-binary "@$file"
+  ACCEPT="text/plain"
+  case "$STATUS" in
+    2??) ;;
+    401) die 3 "not signed in, or the token was rejected ($(error_text))" ;;
+    403) die 1 "$(error_text)" ;;
+    404) die 7 "no desk for this account (foldrender desk init makes one)" ;;
+    413) die 1 "the desk takes a picture of at most 200 KB" ;;
+    415) die 1 "$file is not a PNG, JPEG or WebP inside" ;;
+    429) die 1 "$(error_text)" ;;
+    *) fail_http ;;
+  esac
+  [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+  json_get str id
+  printf '\n'
+  note "put it in a question: \"images\": [{\"id\": \"<that id>\", \"label\": \"A ...\"}] (at most 3)"
+}
+
 # What the desk calls its owner (<api>/desk/owner): the owner's sign-in or
 # token, or the desk's agent token (FOLDRENDER_DESK_TOKEN).
 cmd_desk_owner() {
@@ -3245,6 +3287,358 @@ cmd_desk_owner() {
   [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
   n="$(json_get str name 2>/dev/null || true)"
   if [ -n "$n" ]; then printf 'the desk calls you %s\n' "$n"; else printf 'no name: the desk shows your login'"'"'s first letter\n'; fi
+}
+
+# foldrender desk mem ...: the desk's memory (src/desk-mem.js on the Worker):
+# sessions, events and observations kept in your desk's room — what your
+# agents saw, and the decisions only your answers on the desk make. Read with the
+# desk's agent token (FOLDRENDER_DESK_TOKEN) or your sign-in, as the cards are.
+mem_fail() {
+  local msg
+  msg="$(error_text)"
+  case "$STATUS" in
+    401) die 3 "not signed in, or the token was rejected ($msg)" ;;
+    403) die 3 "agents write the desk's memory with a token (foldrender desk token add --role agent), not from a page ($msg)" ;;
+    404) die 7 "${msg:-not found}: this account has no desk app, or no such memory path (foldrender.dev/desk)" ;;
+    413) die 5 "too large: $msg" ;;
+    429) die 4 "$msg" ;;
+    400|422) die 1 "refused ($msg)$(sed -n 's/.*"field" *: *"\([^"]*\)".*/, field \1/p' "$TMP/body" | head -n 1)" ;;
+    *) fail_http ;;
+  esac
+}
+
+cmd_desk_mem() {
+  case "${1:-}" in --help|-h|help) cmd_help desk-mem; return 0 ;; esac
+  local sub="${1:-status}" mode=text a q="" limit="" kind="" basis="" repo="" file="" key="" text="" source="" by="" via="" at="" ref="" session="" agent="" machine="" expires=""
+  [ $# -eq 0 ] || shift
+  [ "$sub" != install ] || { cmd_desk_mem_install "$@"; return; }
+  local rest=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) mode=json; shift ;;
+      --limit) need $# "$1"; limit="$2"; shift 2 ;;
+      --kind) need $# "$1"; kind="$2"; shift 2 ;;
+      --basis) need $# "$1"; basis="$2"; shift 2 ;;
+      --repo) need $# "$1"; repo="$2"; shift 2 ;;
+      --file) need $# "$1"; file="$2"; shift 2 ;;
+      --key) need $# "$1"; key="$2"; shift 2 ;;
+      --text) need $# "$1"; text="$2"; shift 2 ;;
+      --source) need $# "$1"; source="$2"; shift 2 ;;
+      --by) need $# "$1"; by="$2"; shift 2 ;;
+      --via) need $# "$1"; via="$2"; shift 2 ;;
+      --at) need $# "$1"; at="$(desk_when "$2")"; shift 2 ;;
+      --ref) need $# "$1"; ref="$2"; shift 2 ;;
+      --session) need $# "$1"; session="$2"; shift 2 ;;
+      --agent) need $# "$1"; agent="$2"; shift 2 ;;
+      --machine) need $# "$1"; machine="$2"; shift 2 ;;
+      --expires) need $# "$1"; expires="$(desk_when "$2")"; shift 2 ;;
+      --help|-h) cmd_help desk-mem; return 0 ;;
+      -) rest+=("$1"); shift ;;
+      -*) die 2 "desk mem $sub: unknown option $1 (foldrender help desk-mem)" ;;
+      *) rest+=("$1"); shift ;;
+    esac
+  done
+  set -- ${rest[@]+"${rest[@]}"}
+  mem_opt() { [ -z "$2" ] || printf ',"%s":%s' "$1" "$(json_arg "$2")"; }
+  case "$sub" in
+    status)
+      api GET "/api/desk/mem/status" -H "$(desk_auth)"
+      [ "${STATUS#2}" != "$STATUS" ] || mem_fail
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      cat "$TMP/body"; printf '\n'
+      ;;
+    inject)
+      q=""; [ -z "$repo" ] || q="?repo=$(urlencode "$repo")"
+      api GET "/api/desk/mem/inject$q" -H "$(desk_auth)"
+      [ "${STATUS#2}" != "$STATUS" ] || mem_fail
+      cat "$TMP/body"
+      ;;
+    search)
+      local qs="?q=$(urlencode "${1:-}")"
+      [ -z "$kind" ] || qs="$qs&kind=$(urlencode "$kind")"
+      [ -z "$basis" ] || qs="$qs&basis=$(urlencode "$basis")"
+      [ -z "$limit" ] || qs="$qs&limit=$(urlencode "$limit")"
+      api GET "/api/desk/mem/search$qs" -H "$(desk_auth)"
+      [ "${STATUS#2}" != "$STATUS" ] || mem_fail
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      cat "$TMP/body"; printf '\n'
+      ;;
+    obs)
+      [ -n "${1:-}" ] || die 2 "desk mem obs ID[,ID...]"
+      api GET "/api/desk/mem/obs?id=$(urlencode "$1")" -H "$(desk_auth)"
+      [ "${STATUS#2}" != "$STATUS" ] || mem_fail
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      cat "$TMP/body"; printf '\n'
+      ;;
+    sessions)
+      api GET "/api/desk/mem/sessions" -H "$(desk_auth)"
+      [ "${STATUS#2}" != "$STATUS" ] || mem_fail
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      cat "$TMP/body"; printf '\n'
+      ;;
+    events)
+      local qs=""
+      [ -z "$session" ] || qs="${qs}&session=$(urlencode "$session")"
+      [ -z "$limit" ] || qs="${qs}&limit=$(urlencode "$limit")"
+      api GET "/api/desk/mem/events${qs:+?${qs#&}}" -H "$(desk_auth)"
+      [ "${STATUS#2}" != "$STATUS" ] || mem_fail
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      cat "$TMP/body"; printf '\n'
+      ;;
+    say)
+      # One event a hook would send: {kind, text, agent?, machine?, repo?,
+      # session?, by?, via?, at?, ref?}. kind is prompt|stop|summary|mark|tool.
+      kind="${kind:-mark}"
+      case "$kind" in prompt|stop|summary|mark|tool) ;; *) die 2 "desk mem say --kind prompt|stop|summary|mark|tool" ;; esac
+      [ -n "$text" ] || text="${1:-}"
+      if [ "$file" = - ] || [ "$text" = - ]; then text="$(cat)"
+      elif [ -n "$file" ]; then [ -f "$file" ] || die 2 "no file $file"; text="$(cat "$file")"
+      fi
+      [ -n "$text" ] || die 2 "desk mem say TEXT|--text T|--file F|- [--kind K] [--agent A] [--machine M] [--repo R] [--session ID] [--by N] [--via V] [--at WHEN] [--ref R]"
+      printf '{"kind":%s,"text":%s%s%s%s%s%s%s%s%s}' "$(json_arg "$kind")" "$(json_arg "$text")" "$(mem_opt agent "$agent")" "$(mem_opt machine "$machine")" "$(mem_opt repo "$repo")" "$(mem_opt session "$session")" "$(mem_opt by "$by")" "$(mem_opt via "$via")" "$(mem_opt at "$at")" "$(mem_opt ref "$ref")" > "$TMP/req"
+      api POST "/api/desk/mem/events" -H "$(desk_auth)" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+      [ "${STATUS#2}" != "$STATUS" ] || mem_fail
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      printf 'added: %s event(s)\n' "$(sed -n 's/.*"added":\([0-9]*\).*/\1/p' "$TMP/body")"
+      ;;
+    flush)
+      # A hook's batch of events: lines of JSON or {events:[...]} on a file/-.
+      [ -n "$file" ] || file="${1:--}"
+      if [ "$file" = - ]; then cat > "$TMP/flush"; file="$TMP/flush"; fi
+      [ -f "$file" ] || die 2 "no file $file"
+      api POST "/api/desk/mem/events" -H "$(desk_auth)" -H "Content-Type: application/json" --data-binary "@$file"
+      [ "${STATUS#2}" != "$STATUS" ] || mem_fail
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      printf 'added: %s, unchanged: %s\n' "$(sed -n 's/.*"added":\([0-9]*\).*/\1/p' "$TMP/body")" "$(sed -n 's/.*"unchanged":\([0-9]*\).*/\1/p' "$TMP/body")"
+      ;;
+    note)
+      # One observation: {kind, basis, source, quote, text}: a discovery, a
+      # change, a note or an ask. Never a decision (the API refuses one):
+      # those come only from the owner's answers on the desk.
+      kind="${kind:-note}"; basis="${basis:-inferred}"
+      [ -n "${text:-}" ] || die 2 "desk mem note TEXT --kind K --basis B --source S [--quote-file F] [--at WHEN] [--expires WHEN]"
+      local quote=""
+      [ -z "$file" ] || quote="$(cat "$file")"
+      printf '{"kind":%s,"basis":%s,"source":%s,"quote":%s,"text":%s%s%s}' "$(json_arg "$kind")" "$(json_arg "$basis")" "$(json_arg "${source:-cli}")" "$(json_arg "$quote")" "$(json_arg "$text")" "$(mem_opt at "$at")" "${expires:+,\"expires_at\":$(json_arg "$expires")}" > "$TMP/req"
+      api POST "/api/desk/mem/obs" -H "$(desk_auth)" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+      [ "${STATUS#2}" != "$STATUS" ] || mem_fail
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      printf 'obs %s\n' "$(sed -n 's/.*"id":\([0-9]*\).*/\1/p' "$TMP/body" | head -n 1)"
+      ;;
+    forget)
+      # Hide what came from one source (a card's answer, a message).
+      [ -n "${source:-}" ] || die 2 "desk mem forget --source SOURCE (e.g. card:KEY:bN, thread:KEY)"
+      printf '{"source":%s}' "$(json_arg "$source")" > "$TMP/req"
+      api POST "/api/desk/mem/obs/hide" -H "$(desk_auth)" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+      [ "${STATUS#2}" != "$STATUS" ] || mem_fail
+      printf 'hidden: %s\n' "$source"
+      ;;
+    *) die 2 "unknown desk mem command: $sub (foldrender help desk-mem)" ;;
+  esac
+}
+
+# foldrender desk mem install [--agent claude|codex|all] [--remove]: writes
+#   the hooks that feed the memory and hand a new session what it holds.
+#   Claude Code and Codex get hook entries (Codex asks you to trust them once
+#   in its /hooks); the others (agy, grok, pi, opencode) have no hook here yet
+#   and use desk mem say / inject by hand. The desk agent token (frdk_) is
+#   kept in a 600 file the hook reads, and what was said goes to the hook on
+#   stdin and on to the Worker in a file: neither is ever on a command line.
+cmd_desk_mem_install() {
+  local agents="" conf token="" remove=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --agent) need $# "$1"; agents="$agents,$2"; shift 2 ;;
+      --remove) remove=1; shift ;;
+      -*) die 2 "desk mem install: unknown option $1 (foldrender help desk-mem)" ;;
+      *) agents="$agents,$1"; shift ;;
+    esac
+  done
+  agents="${agents#,}"; agents="${agents:-claude,codex}"
+  case ",$agents," in *,all,*) agents="claude,codex" ;; esac
+  local a list=""
+  for a in $(printf '%s' "$agents" | tr ',' ' '); do
+    case "$a" in
+      claude|codex) list="$list $a" ;;
+      agy|gemini|grok|pi|opencode) note "$a: no hook yet; its sessions can still feed the memory with  foldrender desk mem say  and read it with  foldrender desk mem inject" ;;
+      *) die 2 "desk mem install --agent claude|codex|all (not $a)" ;;
+    esac
+  done
+  command -v python3 >/dev/null 2>&1 || die 1 "desk mem install needs python3 (it edits the agents' hook files)"
+  conf="${FOLDRENDER_DESK_MEM_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/foldrender/desk-mem}"
+  if [ "$remove" = 1 ]; then
+    [ -f "$conf/install.py" ] || die 7 "nothing installed under $conf"
+    [ -z "$list" ] || FR_MEM_CONF="$conf" python3 "$conf/install.py" --remove $list
+    return 0
+  fi
+  [ -n "$list" ] || return 0
+  # The desk's agent token (frdk_, role agent: what the memory's API takes),
+  # made with your sign-in and kept in a 600 file. It is never printed: the
+  # hook reads it from the file into FOLDRENDER_DESK_TOKEN when it runs.
+  ( umask 077 && mkdir -p "$conf" ) || die 1 "cannot make $conf"
+  if ! { [ -f "$conf/token" ] && head -n 1 "$conf/token" | grep -Eq '^frdk_[A-Za-z0-9_-]{20,200}$'; }; then
+    case "${FOLDRENDER_DESK_TOKEN:-}" in
+      frdk_*) token="$FOLDRENDER_DESK_TOKEN" ;;
+      *)
+        require_token
+        DESK_ID="${FOLDRENDER_DESK:-desk}"; check_slug "$DESK_ID" 2>/dev/null || DESK_ID=desk
+        printf '{"role":"agent","name":"mem-hook-%s"}' "$(default_machine_name | tr -cd 'A-Za-z0-9_.-' | cut -c1-40)" > "$TMP/req"
+        desk_send POST /tokens -H "$(auth_header)" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+        [ "${STATUS#2}" != "$STATUS" ] || mem_fail
+        token="$(json_get str token 2>/dev/null)" ;;
+    esac
+    case "$token" in frdk_*) ;; *) die 1 "no desk agent token: run  foldrender desk token add --role agent --name mem-hook  and put the frdk_... it prints into $conf/token (chmod 600)" ;; esac
+    ( umask 077 && printf '%s\n' "$token" > "$conf/token" ) || die 1 "cannot write $conf/token"
+    token=""
+  fi
+  # The hook: $1 is what happened (start|prompt|stop), $2 the agent; the
+  # agent's hook JSON comes on stdin.
+  cat > "$TMP/hook" <<'H'
+#!/bin/sh
+# foldrender desk mem hook, written by 'foldrender desk mem install'.
+# $1 is what happened (start, prompt, stop), $2 the agent; the agent's hook
+# JSON comes on stdin. The desk's agent token is read from the 600 file next
+# to this one, and what was said goes on in a 600 file: neither is ever on a
+# command line. It always exits 0 so the agent is never held up by it.
+umask 077
+conf="$(cd "$(dirname "$0")" && pwd)"
+FOLDRENDER_DESK_TOKEN="$(head -n 1 "$conf/token" 2>/dev/null)"; export FOLDRENDER_DESK_TOKEN
+# The command and the API it was installed with (an API only when one was named).
+cli="${FOLDRENDER_CLI:-$(head -n 1 "$conf/cli" 2>/dev/null)}"; cli="${cli:-foldrender}"
+if [ -z "${FOLDRENDER_API:-}" ] && [ -s "$conf/api" ]; then FOLDRENDER_API="$(head -n 1 "$conf/api")"; export FOLDRENDER_API; fi
+log="$conf/hook.log"
+t="$(umask 077 && mktemp "${TMPDIR:-/tmp}/fr-mem.XXXXXX")" || exit 0
+cat > "$t"
+case "$1" in
+  start)
+    # What a new session is handed, on stdout (the agent adds it to the context).
+    repo="$(python3 -I "$conf/event.py" repo "${2:-other}" < "$t" 2>>"$log")"
+    rm -f "$t"
+    "$cli" desk mem inject ${repo:+--repo "$repo"} 2>>"$log" || true ;;
+  prompt|stop)
+    if python3 -I "$conf/event.py" "$1" "${2:-other}" < "$t" > "$t.json" 2>>"$log"; then
+      # Sent in the background: a slow network never holds the agent up.
+      ( "$cli" desk mem flush "$t.json" >/dev/null 2>>"$log"; rm -f "$t" "$t.json" ) </dev/null >/dev/null 2>&1 &
+    else rm -f "$t" "$t.json"; fi ;;
+  *) rm -f "$t" ;;
+esac
+exit 0
+H
+  cat > "$TMP/event" <<'PY'
+# foldrender desk mem: the agent's hook JSON (stdin) to the event the desk keeps.
+import hashlib, json, os, socket, subprocess, sys
+what, agent = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else "other")
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+if not isinstance(d, dict):
+    d = {}
+cwd = str(d.get("cwd") or os.getcwd())
+# The repository's name: the folder that holds its .git, which a worktree
+# shares with its main checkout; else the folder the session runs in.
+repo = os.path.basename(cwd.rstrip("/"))
+try:
+    g = subprocess.run(["git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True, timeout=3)
+    common = g.stdout.strip()
+    if g.returncode == 0 and common:
+        top = os.path.dirname(common.rstrip("/")) if os.path.basename(common.rstrip("/")) == ".git" else common
+        repo = os.path.basename(top.rstrip("/")) or repo
+except Exception:
+    pass
+repo = repo[:128]
+if what == "repo":
+    print(repo)
+    sys.exit(0)
+def last_reply():
+    t = d.get("last_assistant_message")
+    if isinstance(t, str) and t.strip():
+        return t
+    p = d.get("transcript_path")
+    if not isinstance(p, str) or not os.path.isfile(p):
+        return ""
+    with open(p, "rb") as f:
+        f.seek(0, 2)
+        f.seek(max(0, f.tell() - 4 * 1024 * 1024))
+        lines = f.read().decode("utf-8", "replace").splitlines()
+    for line in reversed(lines):
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        m = o.get("message") if isinstance(o, dict) else None
+        if o.get("type") != "assistant" or not isinstance(m, dict):
+            continue
+        c = m.get("content")
+        if isinstance(c, str) and c.strip():
+            return c
+        if isinstance(c, list):
+            s = "\n".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text").strip()
+            if s:
+                return s
+    return ""
+text = (d.get("prompt") or "") if what == "prompt" else last_reply()
+text = str(text).strip()[:4000]
+if not text:
+    sys.exit(1)
+sid = str(d.get("session_id") or "")
+# 24 hex digits (96 bits): a longer run would be taken for a secret and refused.
+ref = what[0] + "-" + hashlib.sha256((sid + "\0" + what + "\0" + text).encode("utf-8")).hexdigest()[:24]
+print(json.dumps({"events": [{"kind": what, "text": text, "agent": agent, "machine": socket.gethostname().split(".")[0][:64], "repo": repo, "ref": ref}]}, ensure_ascii=False))
+PY
+  # A writer for the agents' hook files: it adds or removes our entries and
+  # leaves everything else in them as it was.
+  cat > "$TMP/install" <<'PY'
+import json, os, sys
+HOME = os.path.expanduser("~")
+CONF = os.environ["FR_MEM_CONF"]
+HOOK = os.path.join(CONF, "desk-mem-hook.sh")
+FILES = {"claude": os.path.join(HOME, ".claude", "settings.json"), "codex": os.path.join(os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex"), "hooks.json")}
+EVENTS = {"SessionStart": "start", "UserPromptSubmit": "prompt", "Stop": "stop"}
+args = sys.argv[1:]
+remove = "--remove" in args
+def ours(h):
+    return isinstance(h, dict) and HOOK in str(h.get("command", ""))
+for agent in [a for a in args if a in FILES]:
+    path = FILES[agent]
+    try:
+        with open(path) as f:
+            d = json.load(f)
+    except FileNotFoundError:
+        d = {}
+    except Exception as e:
+        print(f"{agent}: {path} is not JSON ({e}); left as it is", file=sys.stderr)
+        continue
+    hooks = d.setdefault("hooks", {})
+    for event, what in EVENTS.items():
+        groups = hooks.get(event) if isinstance(hooks.get(event), list) else []
+        for g in groups:
+            if isinstance(g, dict) and isinstance(g.get("hooks"), list):
+                g["hooks"] = [h for h in g["hooks"] if not ours(h)]
+        groups = [g for g in groups if not (isinstance(g, dict) and isinstance(g.get("hooks"), list) and not g["hooks"])]
+        if not remove:
+            groups.append({"hooks": [{"type": "command", "command": f'"{HOOK}" {what} {agent}', "timeout": 15}]})
+        if groups:
+            hooks[event] = groups
+        else:
+            hooks.pop(event, None)
+    if not hooks:
+        d.pop("hooks", None)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".fr-mem.tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    if os.path.exists(path):
+        os.chmod(tmp, os.stat(path).st_mode & 0o777)
+    os.replace(tmp, path)
+    print(f"{agent}: {'removed from' if remove else 'hooks in'} {path}")
+PY
+  ( umask 077 && cp "$TMP/hook" "$conf/desk-mem-hook.sh" && chmod 700 "$conf/desk-mem-hook.sh" && cp "$TMP/event" "$conf/event.py" && cp "$TMP/install" "$conf/install.py" \
+    && cli_path > "$conf/cli" && if [ -n "${FOLDRENDER_API:-}" ]; then printf '%s\n' "$API" > "$conf/api"; else rm -f "$conf/api"; fi ) || die 1 "cannot write the hook under $conf"
+  FR_MEM_CONF="$conf" python3 "$conf/install.py" $list || die 1 "the agents' hook files could not be written"
+  case " $list " in *" codex "*) note "codex: open codex, run /hooks and trust the three foldrender desk mem hooks once; until then Codex does not run them" ;; esac
+  note "desk memory hooks are under $conf (token in $conf/token, 600). A new session is handed what  foldrender desk mem inject --repo REPO  prints; take them out with  foldrender desk mem install --remove"
 }
 
 cmd_desk_machine() {
@@ -3558,6 +3952,217 @@ cmd_thread() {
   esac
 }
 
+#   ------------------------------------------------------------------ pack
+
+# A context pack: what an agent picked out of this account's threads, pages
+# and files, kept as it was, to hand to another session. A file or a text is
+# checked here before anything is sent, so that a secret in it never leaves
+# this machine: the server's patterns that a short grep can hold (src/desk.js
+# SECRET_RES); the server checks again, long random runs too.
+PACK_ITEM_MAX=16384
+# The same prefixes as the server's (src/desk.js SECRET_RES), so that what the
+# server would refuse is never sent to it. A prefix added there goes here too.
+PACK_SECRET_RE='(sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{8,}|github_pat_|gh[ousr]_[A-Za-z0-9]{8,}|frat_[A-Za-z0-9]|frdk_[A-Za-z0-9]|AKIA[0-9A-Z]{12,}|xox[abprs]-[A-Za-z0-9-]*|tk_[0-9A-Z]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|[?&]k=[A-Za-z0-9_-]{6,}|glpat-[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{8,}|sk_live_[A-Za-z0-9]|hf_[A-Za-z0-9]{8,}|npm_[A-Za-z0-9]{8,}|SG\.[A-Za-z0-9_-]{8,}|frdm_[A-Za-z0-9_-]{8,})'
+pack_ref() {
+  case "$1" in
+    p-*) case "$1" in p-[a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9]) return 0 ;; esac ;;
+  esac
+  case "$1" in ''|*[!A-Za-z0-9_.:-]*|[!A-Za-z0-9]*) die 2 "a pack is its id (p-…) or its name (foldrender pack ls lists them): $1" ;; esac
+}
+# pack_secret FILE LABEL: refuse FILE, before anything is sent, if a line of
+# it looks like a secret (which line, never what is on it); with --redact,
+# the copy sent has each kept as [hidden].
+pack_secret() {
+  local line
+  line="$(grep -nE -- "$PACK_SECRET_RE|-----BEGIN [A-Z ]*KEY" "$1" | head -n 1 | cut -d: -f1)"
+  [ -n "$line" ] || return 0
+  [ -n "$PACK_REDACT" ] || die 2 "$2: line $line looks like it holds a secret (a key, a token, a private key, a link's ?k=); nothing was sent. Leave it out, or pass --redact to keep each as [hidden]"
+  sed -E "/-----BEGIN [A-Z ]*KEY/,/-----END [A-Z ]*KEY/ s/.*/[hidden]/; s/$PACK_SECRET_RE/[hidden]/g" "$1" > "$1.red" && mv -f "$1.red" "$1" || die 1 "cannot write $1"
+}
+pack_field() {
+  sed -n "s/.*\"$1\" *: *\"\{0,1\}\([^\",}]*\).*/\1/p; s/^$1: *//p" "$TMP/body" | head -n 1
+}
+pack_fail() {
+  local msg item line
+  msg="$(error_text)"
+  case "$STATUS" in
+    401) die 3 "not signed in, or the token was rejected ($msg). Run: foldrender login" ;;
+    403) die 3 "$msg" ;;
+    404) die 7 "${msg:-not found}" ;;
+    413) die 5 "too large: $msg" ;;
+    422)
+      item="$(pack_field item)"; line="$(pack_field line)"
+      if grep -q looks_like_secret "$TMP/body"; then
+        case "${item:-}" in 0|'') die 1 "refused: the $(pack_field field) looks like a secret; nothing was kept" ;; esac
+        die 1 "refused: item $item${line:+, line $line} looks like it holds a secret; nothing was kept. Leave it out, or pass --redact to keep each as [hidden]"
+      fi
+      die 1 "refused${item:+ (item $item)}: $msg" ;;
+    400) die 1 "refused ($msg)$(pack_field field | sed 's/^./, field &/')" ;;
+    429) die 4 "$msg" ;;
+    409|503) die 1 "$msg" ;;
+    *) fail_http ;;
+  esac
+}
+cmd_pack() {
+  case "${1:-}" in --help|-h|help) cmd_help pack; return 0 ;; esac
+  local sub="${1:-ls}" mode=text goal="" name="" dry="" i=0 kind spec key range from to f size sha req q local_q n p s ref
+  [ $# -eq 0 ] || shift
+  PACK_REDACT=""
+  local P_KIND=() P_ARG=() P_LABEL=() rest=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) mode=json; shift ;;
+      --goal) need $# "$1"; goal="$2"; shift 2 ;;
+      --name) need $# "$1"; name="$2"; shift 2 ;;
+      --dry-run) dry=1; shift ;;
+      --redact) PACK_REDACT=1; shift ;;
+      --thread|--page|--file|--text|--text-file)
+        need $# "$1"; P_KIND+=("${1#--}"); P_ARG+=("$2"); P_LABEL+=(""); shift 2 ;;
+      --label)
+        need $# "$1"
+        n=${#P_KIND[@]}
+        case "${P_KIND[$((n - 1))]:-}" in text|text-file) P_LABEL[$((n - 1))]="$2" ;; *) die 2 "--label names the --text (or --text-file) just before it" ;; esac
+        shift 2 ;;
+      --help|-h) cmd_help pack; return 0 ;;
+      -*) die 2 "pack $sub: unknown option $1 (foldrender help pack)" ;;
+      *) rest+=("$1"); shift ;;
+    esac
+  done
+  set -- ${rest[@]+"${rest[@]}"}
+  case "$sub" in
+    new)
+      [ $# -eq 0 ] || die 2 "pack new takes its items as options: --thread, --page, --file, --text (foldrender help pack)"
+      [ ${#P_KIND[@]} -gt 0 ] || die 2 "a pack holds at least one item: --thread t-...[#N-M], --page PAGE, --file FILE, --text TEXT"
+      [ ${#P_KIND[@]} -le 20 ] || die 2 "a pack holds at most 20 items"
+      [ -z "$name" ] || pack_ref "$name"
+      case "$name" in p-*) die 2 "--name is not a pack's id (p-…): choose another" ;; esac
+      # Everything is read and checked here first: nothing is sent until every item is.
+      : > "$TMP/items"
+      while [ $i -lt ${#P_KIND[@]} ]; do
+        kind="${P_KIND[$i]}"; spec="${P_ARG[$i]}"
+        [ $i -eq 0 ] || printf ',' >> "$TMP/items"
+        case "$kind" in
+          thread)
+            key="${spec%%#*}"; from=""; to=""
+            thread_key "$key"
+            if [ "$key" != "$spec" ]; then
+              range="${spec#*#}"
+              from="${range%%-*}"
+              case "$range" in *-*) to="${range#*-}" ;; *) to="$from" ;; esac
+              case "$from" in ''|*[!0-9]*) die 2 "--thread $spec: after # comes a message's number, or N-M, or N- (from N on)" ;; esac
+              case "$to" in *[!0-9]*) die 2 "--thread $spec: after # comes a message's number, or N-M, or N- (from N on)" ;; esac
+              [ "$from" -ge 1 ] || die 2 "--thread $spec: messages are numbered from 1"
+              [ -z "$to" ] || [ "$to" -ge "$from" ] || die 2 "--thread $spec: $from comes after $to"
+            fi
+            printf '{"thread":%s%s%s}' "$(json_arg "$key")" "${from:+,\"from\":$from}" "${to:+,\"to\":$to}" >> "$TMP/items" ;;
+          page)
+            page_id "$spec"
+            check_slug "$PAGE_ID"
+            printf '{"page":%s}' "$(json_arg "$PAGE_ID")" >> "$TMP/items" ;;
+          file)
+            [ -f "$spec" ] || die 2 "no such file: $spec"
+            [ -r "$spec" ] || die 2 "cannot read: $spec"
+            case "$spec" in *$'\t'*|*$'\n'*) die 2 "--file $spec: a path with a tab or a line break in it cannot be named in a pack" ;; esac
+            size="$(wc -c < "$spec" | tr -d ' ')"
+            sha="$(sha256_of "$spec")"
+            if [ "$size" -gt "$PACK_ITEM_MAX" ]; then
+              # Too large to keep in a pack: where it is, what it was, and nothing of what it says.
+              printf '{"file":%s,"sha256":"%s","bytes":%s}' "$(json_arg "$spec")" "$sha" "$size" >> "$TMP/items"
+            else
+              [ "$(tr -d '\000' < "$spec" | wc -c | tr -d ' ')" = "$size" ] || die 2 "--file $spec holds NUL bytes, so it is not text"
+              cat "$spec" > "$TMP/pf.$i"
+              pack_secret "$TMP/pf.$i" "--file $spec"
+              printf '{"file":%s,"sha256":"%s","text":%s}' "$(json_arg "$spec")" "$sha" "$(json_file "$TMP/pf.$i")" >> "$TMP/items"
+            fi ;;
+          text|text-file)
+            if [ "$kind" = text ]; then printf '%s' "$spec" > "$TMP/pf.$i"
+            elif [ "$spec" = - ]; then cat > "$TMP/pf.$i"
+            else [ -f "$spec" ] || die 2 "no such file: $spec"; cat "$spec" > "$TMP/pf.$i"; fi
+            [ -s "$TMP/pf.$i" ] || die 2 "--$kind: there is no text"
+            [ "$(wc -c < "$TMP/pf.$i" | tr -d ' ')" -le "$PACK_ITEM_MAX" ] || die 5 "--$kind: a text item is at most 16 KB; give a longer one as --file"
+            pack_secret "$TMP/pf.$i" "--$kind"
+            printf '{"text":%s%s}' "$(json_file "$TMP/pf.$i")" "${P_LABEL[$i]:+,\"label\":$(json_arg "${P_LABEL[$i]}")}" >> "$TMP/items" ;;
+        esac
+        i=$((i + 1))
+      done
+      if [ -n "$goal" ]; then
+        printf '%s' "$goal" > "$TMP/pgoal"
+        pack_secret "$TMP/pgoal" "--goal"
+        goal="$(cat "$TMP/pgoal")"
+      fi
+      { printf '{"items":['; cat "$TMP/items"; printf ']'
+        [ -z "$goal" ] || printf ',"goal":%s' "$(json_arg "$goal")"
+        [ -z "$name" ] || printf ',"name":%s' "$(json_arg "$name")"
+        [ -z "$PACK_REDACT" ] || printf ',"redact":true'
+        printf '}'; } > "$TMP/req"
+      ACCEPT="application/json"
+      [ -z "$dry" ] || ACCEPT="text/plain"
+      api POST "/api/packs${dry:+?dry_run=1}" -H "$(desk_auth)" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+      [ "${STATUS#2}" != "$STATUS" ] || pack_fail
+      if [ -n "$dry" ] || [ "$mode" = json ]; then cat "$TMP/body"; [ -n "$dry" ] || printf '\n'; return 0; fi
+      p="$(pack_field id)"
+      printf '%s\n' "$p"
+      n="$(pack_field pointers)"
+      if [ "$(pack_field result)" = unchanged ]; then
+        note "unchanged: the pack named $name holds these items already"
+      else
+        s="$(pack_field replaces)"
+        note "made pack $p: $(pack_field items) item(s), about $(pack_field tokens) tokens${s:+; it replaces $s under the name $name}"
+      fi
+      [ "${n:-0}" = 0 ] || note "$n item(s) kept only as where to find them (too large); the pack says where"
+      [ "$(pack_field hidden)" = 0 ] || note "$(pack_field hidden) piece(s) that looked like a secret were kept as [hidden]"
+      note "read it, or hand it to another session: foldrender pack show $p"
+      ;;
+    show)
+      [ $# -eq 1 ] || die 2 "pack show ID|NAME [--json]"
+      pack_ref "$1"; ref="$1"
+      if [ "$mode" = json ]; then
+        ACCEPT="application/json"
+        api GET "/api/packs/$ref?format=json" -H "$(desk_auth)"
+        [ "${STATUS#2}" != "$STATUS" ] || pack_fail
+        cat "$TMP/body"; printf '\n'
+        return 0
+      fi
+      # Its files, compared with this machine's at the same path: the server
+      # is told only same, changed or missing.
+      ACCEPT="text/plain"
+      api GET "/api/packs/$ref/files" -H "$(desk_auth)"
+      [ "${STATUS#2}" != "$STATUS" ] || pack_fail
+      local_q=""
+      while IFS="$(printf '\t')" read -r n s f; do
+        [ -n "$n" ] || continue
+        if [ -f "$f" ]; then
+          if [ "$(sha256_of "$f")" = "$s" ]; then q=same; else q=changed; fi
+        else q=missing; fi
+        local_q="${local_q:+$local_q,}$n:$q"
+      done < "$TMP/body"
+      api GET "/api/packs/$ref${local_q:+?local=$local_q}" -H "$(desk_auth)"
+      [ "${STATUS#2}" != "$STATUS" ] || pack_fail
+      cat "$TMP/body"
+      ;;
+    ls)
+      [ $# -eq 0 ] || die 2 "pack ls [--json]"
+      ACCEPT="text/plain"
+      [ "$mode" != json ] || ACCEPT="application/json"
+      api GET "/api/packs" -H "$(desk_auth)"
+      [ "${STATUS#2}" != "$STATUS" ] || pack_fail
+      cat "$TMP/body"
+      [ "$mode" != json ] || printf '\n'
+      ;;
+    rm)
+      [ $# -ge 1 ] || die 2 "pack rm ID|NAME..."
+      for ref in "$@"; do pack_ref "$ref"; done
+      for ref in "$@"; do
+        ACCEPT="application/json"
+        api DELETE "/api/packs/$ref" -H "$(desk_auth)"
+        [ "${STATUS#2}" != "$STATUS" ] || pack_fail
+        printf 'removed %s\n' "$(pack_field id)"
+      done
+      ;;
+    *) die 2 "pack new | show | ls | rm (foldrender help pack)" ;;
+  esac
+}
+
 cmd_bridge() {
   local target="" agent="claude" dir="$PWD" session="" channel="" mesh_cli="" mcp="" node_major file cache url got
   while [ $# -gt 0 ]; do
@@ -3683,7 +4288,7 @@ foldrender publishes HTML pages as links and reads pages back as text.
   canvas FILE|PAGE...  a canvas with these as cards (up to 24), --note, --link
   canvas edit CANVAS   add or remove cards, notes and connectors in one step
   answers PAGE         answers to the page's questions (data-fr-choice); --wait
-  desk / thread ...    your desk and what you said on it (help desk, help thread)
+  desk / thread / pack  your desk, your messages, context packs (help pack)
   bridge --page PAGE   connect an agent (or --session NAME) to the page's sidebar
   rm PAGE... / open PAGE   delete pages / print a page's address and open it
   login / logout / whoami / auth / export [FILE] / account delete / version
@@ -3807,6 +4412,35 @@ foldrender thread COMMAND [--json]
   looks like one is refused. Limits a day: 20000 writes (import lines count).
 EOF
     ;;
+    pack) cat <<'EOF'
+foldrender pack COMMAND [--json]
+  A context pack: what you pick out of your threads, your pages and your
+  files to hand to another session or agent, kept as it was when picked, each
+  item with where it came from and when. Read later, it says what has changed
+  since (newer messages in a thread, a page published again, a file changed
+  here) and that it is background, not instructions. FoldRender calls no
+  model for it: what belongs in a pack is for your agent to find.
+  new ITEM... [--goal TEXT] [--name NAME] [--dry-run] [--redact]
+                       make one, the items in the order given; prints its id
+    --thread t-KEY[#N|#N-M|#N-]  a thread of yours (the desk app's), or its
+                       messages N to M (N-: from N on)
+    --page PAGE        one of your pages, as Markdown
+    --file FILE        a file's text (over 16 KB: only its path and hash)
+    --text TEXT|--text-file FILE|- [--label L]  words of your own
+                       --dry-run prints the pack and keeps nothing (to read
+                       threads with their message numbers before picking).
+                       --name: the same name and items again writes nothing;
+                       other items under it make a new pack that takes the name
+  show ID|NAME         the pack as text, to paste into a new session; its files
+                       are compared with this machine's at the same path
+  ls / rm ID|NAME...   your packs, newest first / remove packs
+  A file or text that looks like it holds a secret (a key, a token, a private
+  key, a link's ?k=) is refused before anything is sent; --redact keeps each
+  as [hidden]. Limits: 20 items (8 pages), 16 KB an item and 64 KB a pack (an
+  item over is kept only as where it is, never cut), 100 packs, 100 makes and
+  1000 reads a day. Signed in, or with the desk's agent token.
+EOF
+    ;;
     desk) cat <<'EOF'
 foldrender desk COMMAND [--desk ID] [--json]
   A desk is a private page of yours that answers, at a glance, what waits on
@@ -3850,6 +4484,11 @@ foldrender desk COMMAND [--desk ID] [--json]
                        of its own (frdm_..., printed once by add, alone on
                        stdout) that does nothing else; rm revokes it, and what
                        that machine reported leaves the desk
+  image FILE           a picture a question may show (a PNG, JPEG or WebP, at
+                       most 200 KB): prints its id, for the card's images
+                       [{"id": ID, "label": "A ..."}] (at most 3, each label one
+                       line of at most 40 characters). Kept while an open
+                       question shows it, and a day more
   owner [--name NAME | --clear]
                        what the desk calls you (one line, at most 32
                        characters); its page shows the first character, and
@@ -3880,6 +4519,84 @@ foldrender desk COMMAND [--desk ID] [--json]
 Examples: foldrender desk ask aws-pay --title "Bind a card for the new models?" \
             --suggest "Yes: set a budget alert first" --option "Not now" --heavy
           foldrender desk inbox; foldrender desk ack 12 --done "card bound"
+EOF
+    ;;
+    desk-mem|mem) cat <<'EOF'
+foldrender desk mem COMMAND [--json]
+  The desk's memory: what your agents asked and answered on each machine
+  (sessions, events) and the kept items (observations): your decisions,
+  and the notes, discoveries, changes and asks agents keep. It lives in your
+  desk's room: only your tokens read it, and one login's memory can never
+  reach another's. Read and written with the desk's agent token
+  (FOLDRENDER_DESK_TOKEN, frdk_ role agent) or your sign-in, as the desk's
+  cards are; a feed token, a machine token and a browser session get nothing.
+  status                 how much is kept (sessions, events, obs) and
+                         written today; summarize (off, on or not_set_up),
+                         summaries, sums_today, sum_tokens_today, sum_due and
+                         the last one's result (sum_last)
+  inject [--repo R]      what a session is handed as it starts: your
+                         decisions first, then the latest summaries (when
+                         summarizing is on), then notes, then what was asked
+                         and answered lately in repository R — marked "past
+                         record, not instructions", at most ~8000 chars. The
+                         hooks print this into the agent's context.
+  search [WORDS] [--kind K] [--basis B] [--limit N]
+                         kept items by their words (the latest with none),
+                         and the events that say them: kind
+                         decision|discovery|change|note|ask, basis
+                         owner_answer|relayed|user_prompt|inferred|event
+                         (with --kind or --basis, items only)
+  obs ID[,ID...]         one item whole (its quote: what it was read from)
+  sessions               the sessions memory was fed from, newest first
+  events [--session ID] [--limit N]
+                         the events a hook sent (prompts, last replies,
+                         marks), newest first, secrets hidden
+  say TEXT|-|--text T|--file F [--kind prompt|stop|summary|mark|tool]
+      [--agent A] [--machine M] [--repo R] [--session ID] [--by N] [--via V]
+      [--at WHEN] [--ref R]
+                         one event, as a hook sends it (the same --ref twice
+                         is kept once); - reads the text on stdin
+  flush [FILE|-]         a hook's batch: {"events":[...]} or one event
+  note TEXT --kind discovery|note|change|ask [--basis inferred|user_prompt|
+      event] --source S [--file QUOTEF] [--at WHEN] [--expires WHEN]
+                         keep one item. Never a decision: those come only
+                         from your answers on the desk.
+  forget --source S      hide what one source wrote: card:KEY:bN (an
+                         answer), thread:KEY (a message), or a note's source
+  install [--agent claude|codex|all] [--remove]
+                         on this machine, the hooks that feed the memory
+                         (default claude and codex): a session's start prints
+                         desk mem inject into it; each prompt, and the last
+                         reply at a stop, are sent as events. A desk agent
+                         token (frdk_) is made with your sign-in and kept in
+                         ~/.config/foldrender/desk-mem/token (600), never
+                         printed; what was said reaches the hook on stdin,
+                         never a command line. Codex runs the hooks once you
+                         trust them in its /hooks. --remove takes them out.
+                         agy, grok, pi and opencode have no hook yet: use say
+                         and inject.
+  A decision comes only from your answer to a card on your own desk page
+  (owner_answer); nothing an agent sends can be one, whatever token it
+  holds, your own sign-in included (agents run this command signed in as
+  you). Taking the answer back takes the decision with it. A message on the
+  desk (foldrender thread new) is kept as a note of what you said, as it
+  was relayed. Secrets in what was sent are kept as [hidden] and counted; a
+  name that looks like one is refused. Events age out (~14 days); a whole
+  account's memory goes with the desk. A day's writes and reads are capped
+  (429 quota until the next UTC day).
+  Summarizing is off unless the desk's server turns it on: then, a little
+  after a session stops, a model reads what it said since it was last read
+  and keeps a summary (request, investigated, learned, completed, next
+  steps) and a few items, all
+  basis inferred, source sum:SESSION. A decision it reports is kept as a
+  note, one it calls sensitive not at all, and what it wrote is masked for
+  secrets again. Its calls and tokens are capped per day; nothing you run
+  calls it, and nothing here calls a model when it is off.
+Examples: foldrender desk mem install --agent claude
+          foldrender desk mem inject --repo foldrender
+          printf '%s' "$LAST_REPLY" | foldrender desk mem say - --kind stop --agent grok --machine devdesk
+          foldrender desk mem search "release window"
+          foldrender desk mem note "the retry loop was the bug" --kind discovery --source claude:fr-desk
 EOF
     ;;
     answers) cat <<'EOF'
@@ -4203,7 +4920,8 @@ help_asked() {
       --section|--card|--from|--max-tokens|--max-chars|--meta|--access|-n|--add|--rm|--note|--owner|\
       --confirm|--token|--timeout|--after|--notify|--ack|--to|--idempotency-key|--page|--agent|--dir|\
       --desk|--role|--context|--suggest|--option|--deadline|--product|--state|--device|--minutes|--session|\
-      --next|--at|--match|--until|--reply-url|--lang|--done|--token-file|--log|--cli|--api) skip=1 ;;
+      --next|--at|--match|--until|--reply-url|--lang|--done|--token-file|--log|--cli|--api|\
+      --repo|--source|--basis|--expires) skip=1 ;;
       --link) [ "$cmd" != canvas ] || skip=1 ;;
     esac
   done
@@ -4214,13 +4932,14 @@ main() {
   local cmd="${1:-help}"
   [ $# -eq 0 ] || shift
   case "$cmd" in
-    login|logout|auth|account|export|whoami|publish|edit|share|list|ls|read|cat|versions|restore|undo|canvas|answers|desk|bridge|rm|delete|open|version)
+    login|logout|auth|account|export|whoami|publish|edit|share|list|ls|read|cat|versions|restore|undo|canvas|answers|desk|pack|bridge|rm|delete|open|version)
       if help_asked "$cmd" "$@"; then
         case "$cmd" in
           list) cmd_help ls ;;
           cat) cmd_help read ;;
           auth) cmd_help login ;;
           version) cmd_help ;;
+          desk) if [ "${1:-}" = mem ]; then cmd_help desk-mem; else cmd_help desk; fi ;;
           *) cmd_help "$cmd" ;;
         esac
         return 0
@@ -4245,6 +4964,7 @@ main() {
     answers) cmd_answers "$@" ;;
     desk) cmd_desk "$@" ;;
     thread) cmd_thread "$@" ;;
+    pack) cmd_pack "$@" ;;
     bridge) cmd_bridge "$@" ;;
     reply) cmd_reply "$@" ;;
     rm|delete) cmd_rm "$@" ;;
@@ -4271,7 +4991,8 @@ while [ $# -gt 0 ]; do
     --confirm|--token|--timeout|--after|--notify|--ack|--to|--idempotency-key|--page|--agent|--dir|\
     --desk|--role|--context|--suggest|--option|--deadline|--product|--state|--device|--minutes|--session|\
     --next|--at|--match|--until|--reply-url|--lang|--done|--mesh-cli|--mcp|--id|\
-    --key|--text-file|--kind|--by|--via|--ref|--parent|--channel|--machine|--agent|--limit)
+    --key|--text-file|--kind|--by|--via|--ref|--parent|--channel|--machine|--agent|--limit|\
+    --goal|--thread|--file|--text|--label)
       ARGS+=("$1"); skip=1; shift ;;
     *) [ -n "$first" ] || case "$1" in -*) ;; *) first="$1" ;; esac; ARGS+=("$1"); shift ;;
   esac
