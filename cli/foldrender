@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.18.1
+FR_CLI_VERSION=0.18.2
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -39,7 +39,7 @@ FR_BRIDGE_SHA256=2c84e0e03270282d731935416436b439f9ebfeab85bf63637ac43ea97887092
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=e7e682328873fb5f3fda827dfaad4b7e57510b93548905fc59bf1241746395cc
+FR_DESK_AGENT_SHA256=eaf616fd29aaf4a870afdb2f5e80194a3af1255b2e9201c80b9105b1765faeb5
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -2923,6 +2923,31 @@ desk_written() {
   return 0
 }
 
+# The desk's second version ("Desk v2" in the Worker's README): questions as
+# cards of one shape (a one-line question, your suggestion, 0 to 2 other
+# options; the owner answers agree, another option, "not now" or their own
+# words), the owner's answers sent in batches when they press Send (nothing
+# else sends one), and those batches handed to their agents from the outbox.
+# Same sign-in or desk
+# token as the first version's; the paths are the account's, not a desk id's.
+desk2_api() {
+  local method="$1" path="$2"
+  shift 2
+  api "$method" "/api/desk$path" -H "$(desk_auth)" "$@"
+}
+desk2_fail() {
+  local msg field
+  msg="$(json_field error)"
+  field="$(json_field field)"
+  case "$STATUS" in
+    401|403) die 3 "${msg:-not signed in, or the token was rejected}" ;;
+    404) die 7 "${msg:-not found}: no such card or batch, or the desk's second version is not on for this account" ;;
+    409|422) die 1 "refused${field:+ ($field)}: ${msg:-$(error_text)}" ;;
+    429) die 1 "${msg:-$(error_text)}" ;;
+    *) fail_http ;;
+  esac
+}
+
 cmd_desk() {
   local sub="${1:-}" mode=text key="" a
   [ $# -eq 0 ] || shift
@@ -3173,6 +3198,161 @@ cmd_desk() {
       [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
       printf 'answer %s marked %s\n' "$id" "$st"
       ;;
+    card)
+      key="${1:-}"
+      [ $# -eq 0 ] || shift
+      # The room's rule for a key (desk-cards.js KEY_RE), checked here too: the
+      # key goes into the path of --close, where ? or / would change the request.
+      local key_re='^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$'
+      [[ "$key" =~ $key_re ]] || die 2 "desk card KEY --question Q --suggest S ...: KEY names the card (1 to 80 letters, digits, . _ : -, starting with a letter or digit), the same key again rewrites it"
+      local question="" suggest="" context="" product="" by="" machine="" deadline="" heavy="" close="" why=""
+      local opts=() links=() imgs=()
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --question) need $# "$1"; question="$2"; shift 2 ;;
+          --suggest) need $# "$1"; suggest="$2"; shift 2 ;;
+          --context) need $# "$1"; context="$2"; shift 2 ;;
+          --option) need $# "$1"; opts+=("$2"); shift 2 ;;
+          --product) need $# "$1"; product="$2"; shift 2 ;;
+          --by) need $# "$1"; by="$2"; shift 2 ;;
+          --machine) need $# "$1"; machine="$2"; shift 2 ;;
+          --deadline) need $# "$1"; deadline="$(desk_when "$2")" || exit 2; shift 2 ;;
+          --heavy) heavy=1; shift ;;
+          --link) need $# "$1"; links+=("$2"); shift 2 ;;
+          --image) need $# "$1"; imgs+=("$2"); shift 2 ;;
+          --close) close=1; shift ;;
+          --done) [ -n "$close" ] || die 2 "--done goes with --close"; why=done; shift ;;
+          --title|--hands|--input|--device|--minutes) die 2 "desk card has no $1: every card is answered the same way (agree, another option, not now, or the owner's own words); the question is --question, and what you would do is --suggest" ;;
+          *) die 2 "desk card: unknown option $1 (foldrender help desk)" ;;
+        esac
+      done
+      if [ -n "$close" ]; then
+        [ -z "$question$suggest$context$product$by$machine$deadline$heavy" ] && [ ${#opts[@]} -eq 0 ] && [ ${#links[@]} -eq 0 ] && [ ${#imgs[@]} -eq 0 ] \
+          || die 2 "--close takes only --done (a card is written, or taken off, not both)"
+        desk2_api DELETE "/cards/$key${why:+?why=done}"
+        [ "${STATUS#2}" != "$STATUS" ] || desk2_fail
+        [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+        # An answer the owner picked on it and had not sent stays theirs (the
+        # room's closeCard says one stands, unsent_draft): the card stays on
+        # their page with it, to send or drop.
+        local kept
+        kept="$(json_get raw unsent_draft 2>/dev/null)" || kept=""
+        if [ "$kept" = true ]; then
+          printf "took %s off the desk; the owner's draft on it was kept, not sent (theirs to send or drop)\n" "$key"
+        else
+          printf 'took %s off the desk\n' "$key"
+        fi
+        return 0
+      fi
+      [ -n "$question" ] || die 2 "desk card needs --question: the question, on one line"
+      [ -n "$suggest" ] || die 2 "desk card needs --suggest: what you would do (the owner agrees with one tap)"
+      [ ${#opts[@]} -le 2 ] || die 2 "at most 2 --option (the page adds \"not now, ask me tomorrow\" itself)"
+      [ ${#imgs[@]} -le 3 ] || die 2 "at most 3 --image (pictures to choose between)"
+      # --image FILE=LABEL (or FILE): every picture and its label checked here
+      # first, then each sent as desk image does, before the card that shows
+      # them. A label is one line of at most 40 characters, as the room has it
+      # (characters, not bytes: each UTF-8 byte that does not start one is dropped
+      # before counting, whatever the locale).
+      local il="" im ifile ilabel n
+      for im in ${imgs[@]+"${imgs[@]}"}; do
+        desk_image_arg "$im"
+        case "$ilabel" in *$'\n'*|*$'\r'*) die 2 "--image FILE=LABEL: a label is one line" ;; esac
+        n="$(printf '%s' "$ilabel" | LC_ALL=C tr -d '\200-\277' | wc -c | tr -d ' ')"
+        [ "$n" -le 40 ] || die 2 "--image FILE=LABEL: a label is at most 40 characters ($n here)"
+        desk_image_check "$ifile"
+      done
+      for im in ${imgs[@]+"${imgs[@]}"}; do
+        desk_image_arg "$im"
+        desk_image_put "$ifile"
+        il="$il${il:+,}{\"id\":$(json_get raw id),\"label\":$(json_arg "$ilabel")}"
+      done
+      local body ol="" o
+      for o in ${opts[@]+"${opts[@]}"}; do ol="$ol${ol:+,}$(json_arg "$o")"; done
+      body="\"key\":$(json_arg "$key"),\"question\":$(json_arg "$question"),\"suggest\":$(json_arg "$suggest")"
+      [ -z "$context" ] || body="$body,\"context\":$(json_arg "$context")"
+      [ -z "$ol" ] || body="$body,\"options\":[$ol]"
+      [ -z "$product" ] || body="$body,\"product\":$(json_arg "$product")"
+      [ -z "$by" ] || body="$body,\"by\":$(json_arg "$by")"
+      [ -z "$machine" ] || body="$body,\"machine\":$(json_arg "$machine")"
+      [ -z "$deadline" ] || body="$body,\"deadline\":$(json_arg "$deadline")"
+      [ -z "$heavy" ] || body="$body,\"heavy\":true"
+      [ ${#links[@]} -eq 0 ] || body="$body,\"links\":$(desk_links "${links[@]}")"
+      [ -z "$il" ] || body="$body,\"images\":[$il]"
+      printf '{"cards":[{%s}]}' "$body" > "$TMP/req"
+      desk2_api POST /cards -H "Content-Type: application/json" --data-binary "@$TMP/req"
+      [ "${STATUS#2}" != "$STATUS" ] || desk2_fail
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      grep -q '"code":"full"' "$TMP/body" && die 1 "the desk holds as many open questions as it can: take one off first (desk card KEY --close)"
+      printf '%s %s (revision %s)\n' "$(sed -n 's/.*"result":"\([a-z_]*\)".*/\1/p' "$TMP/body")" "$key" "$(sed -n 's/.*"rev":\([0-9]*\).*/\1/p' "$TMP/body")"
+      ;;
+    cards)
+      [ $# -eq 0 ] || die 2 "desk cards [--json]"
+      [ "$mode" = json ] && ACCEPT="application/json" || ACCEPT="text/plain"
+      desk2_api GET /cards
+      [ "${STATUS#2}" != "$STATUS" ] || desk2_fail
+      cat "$TMP/body"
+      [ "$mode" != json ] || printf '\n'
+      ;;
+    outbox)
+      if [ "${1:-}" = ack ]; then
+        shift
+        [ $# -ge 1 ] || die 2 "desk outbox ack ID... (the #IDs desk outbox printed)"
+        local ids="" i
+        for i in "$@"; do
+          i="${i#\#}"
+          case "$i" in ''|*[!0-9]*) die 2 "an outbox event's id is a number (desk outbox prints #ID)" ;; esac
+          # 10#: "01" is a number, but not a JSON number.
+          ids="$ids${ids:+,}$((10#$i))"
+        done
+        printf '{"ids":[%s]}' "$ids" > "$TMP/req"
+        desk2_api POST /outbox/ack -H "Content-Type: application/json" --data-binary "@$TMP/req"
+        [ "${STATUS#2}" != "$STATUS" ] || desk2_fail
+        [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+        printf 'handed on: %s\n' "$(sed -n 's/.*"acked":\[\([0-9,]*\)\].*/\1/p' "$TMP/body")"
+        return 0
+      fi
+      [ $# -eq 0 ] || die 2 "desk outbox [--json] | desk outbox ack ID..."
+      [ "$mode" = json ] && ACCEPT="application/json" || ACCEPT="text/plain"
+      desk2_api GET /outbox
+      [ "${STATUS#2}" != "$STATUS" ] || desk2_fail
+      cat "$TMP/body"
+      [ "$mode" != json ] || printf '\n'
+      ;;
+    mark)
+      local batch="${1:-}" st="${2:-}" result=""
+      [ $# -lt 2 ] || shift 2
+      case "$batch" in ''|*[!0-9]*) die 2 "desk mark BATCH read|doing|done [--result TEXT] [--key KEY]..." ;; esac
+      case "$st" in read|doing|done) ;; *) die 2 "desk mark BATCH read|doing|done [--result TEXT] [--key KEY]..." ;; esac
+      local keys=() kl="" k
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --result) need $# "$1"; result="$2"; shift 2 ;;
+          --key) need $# "$1"; keys+=("$2"); shift 2 ;;
+          *) die 2 "desk mark: unknown option $1 (foldrender help desk)" ;;
+        esac
+      done
+      [ -z "$result" ] || [ "$st" = done ] || die 2 "--result goes with done"
+      for k in ${keys[@]+"${keys[@]}"}; do kl="$kl${kl:+,}$(json_arg "$k")"; done
+      printf '{"state":"%s"%s%s}' "$st" "${result:+,\"result\":$(json_arg "$result")}" "${kl:+,\"keys\":[$kl]}" > "$TMP/req"
+      desk2_api POST "/batches/$batch/mark" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+      [ "${STATUS#2}" != "$STATUS" ] || desk2_fail
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      printf 'batch %s: %s marked %s\n' "$batch" "$(sed -n 's/.*"marked":\[\([^]]*\)\].*/\1/p' "$TMP/body" | tr -d '"')" "$st"
+      ;;
+    batches)
+      local limit=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --limit) need $# "$1"; case "$2" in ''|*[!0-9]*) die 2 "--limit is a number" ;; esac; limit="$2"; shift 2 ;;
+          *) die 2 "desk batches [--limit N] [--json]" ;;
+        esac
+      done
+      [ "$mode" = json ] && ACCEPT="application/json" || ACCEPT="text/plain"
+      desk2_api GET "/batches${limit:+?limit=$limit}"
+      [ "${STATUS#2}" != "$STATUS" ] || desk2_fail
+      cat "$TMP/body"
+      [ "$mode" != json ] || printf '\n'
+      ;;
     *) die 2 "unknown desk command: $sub (foldrender help desk)" ;;
   esac
 }
@@ -3228,15 +3408,43 @@ cmd_desk_image() {
     esac
   done
   [ -n "$file" ] || die 2 "which picture? foldrender desk image FILE (a PNG, JPEG or WebP, at most 200 KB)"
+  desk_image_check "$file"
+  desk_image_put "$file"
+  [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+  json_get str id
+  printf '\n'
+  note "put it in a question: \"images\": [{\"id\": \"<that id>\", \"label\": \"A ...\"}] (at most 3), or let desk card --image FILE=LABEL do both"
+}
+
+# desk_image_check FILE: a picture the desk may take (its name and size), or
+# exit 2 before anything is sent. desk_image_put FILE: sends it; the answer
+# ({id, ...}) is in $TMP/body.
+# --image FILE[=LABEL]: sets ifile and ilabel (the caller's). A file that is
+# there is the whole argument, whatever it holds; otherwise it is split at the
+# first =, and only when there is one (a missing FILE alone is said to be
+# missing, not taken for a label).
+desk_image_arg() {
+  ifile="$1"; ilabel=""
+  case "$1" in *=*) [ -f "$1" ] || { ifile="${1%%=*}"; ilabel="${1#*=}"; } ;; esac
+}
+
+desk_image_check() {
+  local file="$1" size
   [ -f "$file" ] && [ -r "$file" ] || die 2 "cannot read $file"
   case "$(printf '%s' "$file" | tr '[:upper:]' '[:lower:]')" in
-    *.png) type=image/png ;;
-    *.jpg|*.jpeg) type=image/jpeg ;;
-    *.webp) type=image/webp ;;
+    *.png|*.jpg|*.jpeg|*.webp) ;;
     *) die 2 "a question's picture is a .png, .jpg or .webp file (an SVG is not taken: export it as a PNG)" ;;
   esac
   size="$(wc -c < "$file" | tr -d ' ')"
   [ "$size" -le 204800 ] || die 2 "$file is $((size / 1024)) KB: a question's picture is at most 200 KB (make it smaller first)"
+}
+desk_image_put() {
+  local file="$1" type
+  case "$(printf '%s' "$file" | tr '[:upper:]' '[:lower:]')" in
+    *.png) type=image/png ;;
+    *.jpg|*.jpeg) type=image/jpeg ;;
+    *.webp) type=image/webp ;;
+  esac
   ACCEPT="application/json"
   api POST "/api/desk/images" -H "$(desk_auth)" -H "Content-Type: $type" --data-binary "@$file"
   ACCEPT="text/plain"
@@ -3250,10 +3458,6 @@ cmd_desk_image() {
     429) die 1 "$(error_text)" ;;
     *) fail_http ;;
   esac
-  [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
-  json_get str id
-  printf '\n'
-  note "put it in a question: \"images\": [{\"id\": \"<that id>\", \"label\": \"A ...\"}] (at most 3)"
 }
 
 # What the desk calls its owner (<api>/desk/owner): the owner's sign-in or
@@ -4566,6 +4770,47 @@ foldrender desk COMMAND [--desk ID] [--json]
 Examples: foldrender desk ask aws-pay --title "Bind a card for the new models?" \
             --suggest "Yes: set a budget alert first" --option "Not now" --heavy
           foldrender desk inbox; foldrender desk ack 12 --done "card bound"
+
+The desk's second version (its page at https://foldrender.dev/desk once it is
+on for your account; until then at /desk?v2=1). Every question is a card of
+one shape, answered the same way: agree to your suggestion, another option,
+"not now, ask me tomorrow" (the page adds it), or the owner's own words. An
+answer is a draft until the owner presses Send (发给你的 agent); nothing else
+sends it. What they send reaches their agents as one batch, from the outbox,
+and can be taken back until it is marked done.
+  card KEY --question "one line" --suggest "what you would do"
+      [--context TEXT (300)] [--option LABEL]... (at most 2) [--heavy]
+      [--deadline 2026-10-23[T10:00]] [--product P] [--by SESSION]
+      [--machine M] [--link URL[=LABEL]]... (at most 3)
+      [--image FILE[=LABEL]]... (at most 3)
+                       write the card (the same KEY again rewrites it: a new
+                       revision when its words change). No --title, --hands,
+                       --input: the question is --question, and what you would
+                       do (or the default, when you need the owner to tell you
+                       something) is --suggest. Refused: no suggestion, a
+                       question past 80 characters or on two lines, more than
+                       2 options, anything that looks like a secret.
+                       --image: a picture the question shows (a PNG, JPEG or
+                       WebP, at most 200 KB; LABEL one line of at most 40
+                       characters), sent first as desk image does
+  card KEY --close [--done]
+                       take it off the desk (it is not needed any more).
+                       Nothing is sent: an answer the owner picked on it and
+                       has not sent stays theirs, the card with it on their
+                       page, and the command says so
+  cards                the open cards: KEY, revision, how far its answer is
+  outbox               what the owner sent and you have not been handed: each
+                       #ID with the words to hand on (a batch of answers, an
+                       answer taken back, or a warning that too much waits)
+  outbox ack ID...     you have them (until then they are handed again)
+  mark BATCH read|doing|done [--result "one sentence"] [--key KEY]...
+                       how far you are with a batch's answers (all, or KEY's);
+                       the page shows it under each answer
+  batches [--limit N]  the batches sent, newest first
+Examples: foldrender desk card gw-caps --question "Raise the two monthly caps?" \
+            --suggest "Gateway to \$30, polyagent to \$20" --option "Only polyagent"
+          foldrender desk outbox; foldrender desk outbox ack 7
+          foldrender desk mark 12 done --result "both raised from next month"
 EOF
     ;;
     desk-mem|mem) cat <<'EOF'
