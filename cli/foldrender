@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.18.2
+FR_CLI_VERSION=0.18.3
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -39,7 +39,7 @@ FR_BRIDGE_SHA256=2c84e0e03270282d731935416436b439f9ebfeab85bf63637ac43ea97887092
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=eaf616fd29aaf4a870afdb2f5e80194a3af1255b2e9201c80b9105b1765faeb5
+FR_DESK_AGENT_SHA256=1b47f7135e29efb12599b96235adbf923fd693275a5f379730383d0c0d0fc56e
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -3318,6 +3318,25 @@ cmd_desk() {
       cat "$TMP/body"
       [ "$mode" != json ] || printf '\n'
       ;;
+    answers)
+      # What the owner sent, for this agent: its own cursor, kept by the desk
+      # for its token (none needed here), or --since NEXT from an earlier read.
+      local since="" alimit=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --since) need $# "$1"; case "$2" in ''|*[!0-9]*) die 2 "--since is the next an earlier read printed (a number)" ;; esac; since="$2"; shift 2 ;;
+          --limit) need $# "$1"; case "$2" in ''|*[!0-9]*) die 2 "--limit is a number" ;; esac; alimit="$2"; shift 2 ;;
+          *) die 2 "desk answers [--since NEXT] [--limit N] [--json]" ;;
+        esac
+      done
+      [ "$mode" = json ] && ACCEPT="application/json" || ACCEPT="text/plain"
+      local aq="${since:+since=$since}"
+      [ -z "$alimit" ] || aq="$aq${aq:+&}limit=$alimit"
+      desk2_api GET "/answers${aq:+?$aq}"
+      [ "${STATUS#2}" != "$STATUS" ] || desk2_fail
+      cat "$TMP/body"
+      [ "$mode" != json ] || printf '\n'
+      ;;
     mark)
       local batch="${1:-}" st="${2:-}" result=""
       [ $# -lt 2 ] || shift 2
@@ -4803,6 +4822,16 @@ and can be taken back until it is marked done.
                        #ID with the words to hand on (a batch of answers, an
                        answer taken back, or a warning that too much waits)
   outbox ack ID...     you have them (until then they are handed again)
+  answers [--since NEXT] [--limit N]
+                       what the owner sent, for you alone: each batch (and
+                       each answer they took back) after where your token got
+                       to, never a draft. Every agent with its own desk token
+                       reads on its own, so several read the same batches
+                       without taking them from each other; the last line says
+                       next (--since NEXT reads from there again). Your place
+                       moves when the desk answers: keep the next of the last
+                       read you handled, and after a read that failed, read
+                       again with --since that next
   mark BATCH read|doing|done [--result "one sentence"] [--key KEY]...
                        how far you are with a batch's answers (all, or KEY's);
                        the page shows it under each answer
