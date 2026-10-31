@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.18.3
+FR_CLI_VERSION=0.18.4
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -39,7 +39,7 @@ FR_BRIDGE_SHA256=2c84e0e03270282d731935416436b439f9ebfeab85bf63637ac43ea97887092
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=1b47f7135e29efb12599b96235adbf923fd693275a5f379730383d0c0d0fc56e
+FR_DESK_AGENT_SHA256=faacb425efc268b79f729ba046fc2b988dab6671a424982f4d4be0ef649ed72e
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -3338,25 +3338,43 @@ cmd_desk() {
       [ "$mode" != json ] || printf '\n'
       ;;
     mark)
-      local batch="${1:-}" st="${2:-}" result=""
+      # Which answers: --key each (with its own --result, one call a result),
+      # or --all of them alike; a batch of several with neither is refused
+      # (2026-10-30: one done with one result over a batch wrote it on every
+      # answer). --correct: an answer this token marked, set as it should be.
+      local batch="${1:-}" st="${2:-}" result="" all="" correct=""
       [ $# -lt 2 ] || shift 2
-      case "$batch" in ''|*[!0-9]*) die 2 "desk mark BATCH read|doing|done [--result TEXT] [--key KEY]..." ;; esac
-      case "$st" in read|doing|done) ;; *) die 2 "desk mark BATCH read|doing|done [--result TEXT] [--key KEY]..." ;; esac
-      local keys=() kl="" k
+      case "$batch" in ''|*[!0-9]*) die 2 "desk mark BATCH read|doing|done [--result TEXT] [--key KEY]... [--all] [--correct]" ;; esac
+      case "$st" in read|doing|done) ;; *) die 2 "desk mark BATCH read|doing|done [--result TEXT] [--key KEY]... [--all] [--correct]" ;; esac
+      local keys=() kl="" k marked unchanged
       while [ $# -gt 0 ]; do
         case "$1" in
           --result) need $# "$1"; result="$2"; shift 2 ;;
           --key) need $# "$1"; keys+=("$2"); shift 2 ;;
+          --all) all=1; shift ;;
+          --correct) correct=1; shift ;;
           *) die 2 "desk mark: unknown option $1 (foldrender help desk)" ;;
         esac
       done
-      [ -z "$result" ] || [ "$st" = done ] || die 2 "--result goes with done"
+      [ -z "$result" ] || [ "$st" != read ] || die 2 "--result goes with doing or done"
       for k in ${keys[@]+"${keys[@]}"}; do kl="$kl${kl:+,}$(json_arg "$k")"; done
-      printf '{"state":"%s"%s%s}' "$st" "${result:+,\"result\":$(json_arg "$result")}" "${kl:+,\"keys\":[$kl]}" > "$TMP/req"
+      [ -z "$all" ] || [ -z "$kl" ] || die 2 "--key or --all, not both"
+      printf '{"state":"%s"%s%s%s%s}' "$st" "${result:+,\"result\":$(json_arg "$result")}" "${kl:+,\"keys\":[$kl]}" "${all:+,\"all\":true}" "${correct:+,\"correct\":true}" > "$TMP/req"
       desk2_api POST "/batches/$batch/mark" -H "Content-Type: application/json" --data-binary "@$TMP/req"
-      [ "${STATUS#2}" != "$STATUS" ] || desk2_fail
+      if [ "${STATUS#2}" = "$STATUS" ]; then
+        # Which answers, and whose: the desk's own words (they name the keys).
+        case "$(json_field code)" in keys_needed|bad_keys|not_yours) die 1 "refused: $(json_field error)" ;; esac
+        desk2_fail
+      fi
       [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
-      printf 'batch %s: %s marked %s\n' "$batch" "$(sed -n 's/.*"marked":\[\([^]]*\)\].*/\1/p' "$TMP/body" | tr -d '"')" "$st"
+      marked="$(sed -n 's/.*"marked":\[\([^]]*\)\].*/\1/p' "$TMP/body" | tr -d '"')"
+      unchanged="$(sed -n 's/.*"unchanged":\[\([^]]*\)\].*/\1/p' "$TMP/body" | tr -d '"')"
+      if [ -n "$marked" ] && [ -n "$correct" ]; then printf 'batch %s: %s corrected to %s\n' "$batch" "$marked" "$st"
+      elif [ -n "$marked" ]; then printf 'batch %s: %s marked %s\n' "$batch" "$marked" "$st"; fi
+      if [ -n "$unchanged" ]; then
+        if grep -q '"hint"' "$TMP/body"; then printf 'batch %s: %s unchanged (marked already, with another result: the one who marked it changes it with --correct)\n' "$batch" "$unchanged"
+        else printf 'batch %s: %s unchanged (marked so already)\n' "$batch" "$unchanged"; fi
+      fi
       ;;
     batches)
       local limit=""
@@ -4832,14 +4850,25 @@ and can be taken back until it is marked done.
                        moves when the desk answers: keep the next of the last
                        read you handled, and after a read that failed, read
                        again with --since that next
-  mark BATCH read|doing|done [--result "one sentence"] [--key KEY]...
-                       how far you are with a batch's answers (all, or KEY's);
-                       the page shows it under each answer
+  mark BATCH read|doing|done [--result "one sentence"] [--key KEY]... [--all]
+                       how far you are with a batch's answers: KEY's (a
+                       --key each), or --all of them alike. A batch of one
+                       answer needs neither; one of several is refused
+                       without them (the error names its keys). --result goes
+                       with doing or done and is the same for every answer
+                       named: mark each answer with its own. The page shows it
+                       under each answer
+  mark BATCH read|doing|done --key KEY [--result "..."] --correct
+                       an answer you marked, set as it should be: back or
+                       forward, its result replaced (none if not given); what
+                       it said before is kept and the page says it was
+                       corrected. Only the token that marked it corrects it
   batches [--limit N]  the batches sent, newest first
 Examples: foldrender desk card gw-caps --question "Raise the two monthly caps?" \
             --suggest "Gateway to \$30, polyagent to \$20" --option "Only polyagent"
           foldrender desk outbox; foldrender desk outbox ack 7
-          foldrender desk mark 12 done --result "both raised from next month"
+          foldrender desk mark 12 done --key gw-caps --result "both raised from next month"
+          foldrender desk mark 12 doing --key gw-caps --result "raising them now" --correct
 EOF
     ;;
     desk-mem|mem) cat <<'EOF'
