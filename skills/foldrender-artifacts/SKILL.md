@@ -198,16 +198,16 @@ For a question the user decides (a plan's open points, "pick one of these"), use
 
 ```html
 <style>
-.fr-card{box-sizing:border-box;max-width:760px;margin:20px 0;padding:16px 18px;border:1px solid rgba(127,127,127,.28);border-left:4px solid #b8862c;border-radius:10px;background:transparent;color:inherit;font:15px/1.6 system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
-.fr-card .fr-card-id{display:inline-block;margin:0 0 6px;padding:1px 8px;border-radius:6px;background:rgba(184,134,44,.16);color:inherit;font:600 12px/1.6 system-ui,sans-serif}
-.fr-card h3{margin:0 0 8px;font-size:17px;line-height:1.45}
+.fr-card{box-sizing:border-box;max-width:760px;margin:20px 0;padding:16px 18px 16px 20px;border-left:2px solid #43629c;background:rgba(127,127,127,.08);color:inherit;font:15px/1.6 system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+.fr-card .fr-card-id{display:inline-block;margin:0 0 6px;font:400 13px/1.6 system-ui,sans-serif;opacity:.7}
+.fr-card h3{margin:0 0 8px;font-size:17px;font-weight:500;line-height:1.45}
 .fr-card .fr-card-why{margin:0 0 12px;opacity:.78}
-.fr-card .fr-card-opt{display:block;margin:8px 0;padding:10px 12px;border:1px solid rgba(127,127,127,.28);border-radius:8px}
-.fr-card .fr-card-opt b{display:block;font-weight:600}
+.fr-card .fr-card-opt{display:block;margin:8px 0;padding:10px 12px;background:rgba(127,127,127,.1)}
+.fr-card .fr-card-opt b{display:block;font-weight:500}
 .fr-card .fr-card-opt::before{float:right;margin-left:8px}
 .fr-card .fr-card-opt small{display:block;margin-top:2px;font-size:13px;opacity:.7}
-.fr-card .fr-card-tag{margin-left:6px;padding:0 6px;border-radius:5px;background:rgba(22,163,74,.16);color:inherit;font:600 12px/1.6 system-ui,sans-serif}
-.fr-card .fr-card-suggest{margin:12px 0 0;padding:10px 12px;border-radius:8px;background:rgba(184,134,44,.1)}
+.fr-card .fr-card-tag{margin-left:6px;font:400 13px/1.6 system-ui,sans-serif;opacity:.7}
+.fr-card .fr-card-suggest{margin:12px 0 0;padding:10px 12px;background:rgba(127,127,127,.1)}
 </style>
 <section class="fr-card" data-fr-choice="ID" data-fr-note="NOTE PROMPT">
   <div class="fr-card-id">ID</div>
