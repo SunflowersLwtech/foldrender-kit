@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.18.5
+FR_CLI_VERSION=0.18.6
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -39,7 +39,7 @@ FR_BRIDGE_SHA256=2c84e0e03270282d731935416436b439f9ebfeab85bf63637ac43ea97887092
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=7ea36949bd5eb0074113038e7726042337bd175ba0826e6cc5c2deaabf7b06ff
+FR_DESK_AGENT_SHA256=71cad8fe747328d57b48f8259415b9a2373844464f40edc4805dad3d1abe398d
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -1278,9 +1278,10 @@ cmd_account() {
 # publish FILE... [options]: each file to its page, one address a line on
 # stdout, in order; on stderr one line a page saying what the publish changed.
 cmd_publish() {
-  local files=() title="" slug="" vis="" share="" name="" folder="" folder_set="" as_json="" key="" allow_dup="" f n=0
+  local files=() title="" slug="" vis="" share="" name="" folder="" folder_set="" as_json="" key="" allow_dup="" message="" f n=0
   while [ $# -gt 0 ]; do
     case "$1" in
+      -m|--message) need $# "$1"; message="$2"; shift 2 ;;
       --title) need $# "$1"; title="$2"; shift 2 ;;
       --slug|--id) need $# "$1"; slug="$2"; shift 2 ;;
       --idempotency-key) need $# "$1"; key="$2"; shift 2 ;;
@@ -1406,6 +1407,7 @@ publish_one() {
   [ -z "$name" ] || query="${query:+$query&}name=$name"
   [ -z "$folder_set" ] || query="${query:+$query&}folder=$folder"
   [ -z "$allow_dup" ] || query="${query:+$query&}allow_duplicate=1"
+  [ -z "$message" ] || query="${query:+$query&}m=$(urlencode "$message")"
 
   [ -z "$as_json" ] || ACCEPT="application/json"
   if [ -n "$p_slug" ]; then
@@ -1544,7 +1546,7 @@ publish_report() {
 # them as JSON: an array of {"old": ..., "new": ...}, or the request's object.
 # --base REV refuses to edit a page that has moved on from that revision.
 cmd_edit() {
-  local target="" base="" title="" efile="" n=0 have_old="" as_json="" c
+  local target="" base="" title="" efile="" n=0 have_old="" as_json="" c message=""
   : > "$TMP/edits.json"
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1569,6 +1571,7 @@ cmd_edit() {
         case "$2" in ''|*[!0-9]*) die 2 "--base takes a revision number (see: foldrender versions PAGE)" ;; esac
         base="$2"; shift 2 ;;
       --title) need $# "$1"; title="$2"; shift 2 ;;
+      -m|--message) need $# "$1"; message="$2"; shift 2 ;;
       --json) as_json=1; shift ;;
       -*) die 2 "unknown option: $1" ;;
       *) [ -z "$target" ] || die 2 "edit takes one page"; target="$1"; shift ;;
@@ -1604,6 +1607,10 @@ cmd_edit() {
       printf '%s' "$title" > "$TMP/title"
       { printf ',"title":'; json_str "$TMP/title"; } >> "$TMP/edit.json"
     fi
+    if [ -n "$message" ]; then
+      printf '%s' "$message" > "$TMP/message"
+      { printf ',"message":'; json_str "$TMP/message"; } >> "$TMP/edit.json"
+    fi
     printf '}' >> "$TMP/edit.json"
   fi
   [ -z "$as_json" ] || ACCEPT="application/json"
@@ -1624,24 +1631,49 @@ cmd_edit() {
   publish_report "" "" ""
 }
 
-# versions PAGE: the page's revision and the versions it kept, newest first,
-# each with the id restore takes.
-cmd_versions() {
-  local target="" as_json=""
+# log PAGE: the page's history, newest first — a line a revision: when, who
+# and from which client, the lines it added and removed, its message, and
+# gone:trimmed|deleted once its body is gone (a page keeps the bodies of its
+# newest 10 versions; the log keeps them all). `versions` is its old name.
+cmd_log() {
+  local target="" as_json="" before="" query=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --json) as_json=1; shift ;;
+      --before)
+        [ $# -ge 2 ] || die 2 "--before takes a revision number"
+        before="$2"; shift 2 ;;
       -*) die 2 "unknown option: $1" ;;
-      *) [ -z "$target" ] || die 2 "versions takes one page"; target="$1"; shift ;;
+      *) [ -z "$target" ] || die 2 "log takes one page"; target="$1"; shift ;;
     esac
   done
-  [ -n "$target" ] || die 2 "usage: foldrender versions PAGE [--json]"
+  [ -n "$target" ] || die 2 "usage: foldrender log PAGE [--before REV] [--json]"
   require_token
   page_id "$target"
   check_slug "$PAGE_ID"
+  case "$before" in "") : ;; *[!0-9]*) die 2 "--before takes a revision number, not: $before" ;; *) query="?before=$(urlencode "$before")" ;; esac
   [ -z "$as_json" ] || ACCEPT="application/json"
-  api_auth GET "/api/artifacts/$PAGE_ID/versions"
-  [ "$STATUS" != 404 ] || die 7 "no page named $PAGE_ID among yours"
+  api_auth GET "/api/artifacts/$PAGE_ID/log$query"
+  if [ "$STATUS" = 404 ]; then
+    # Either no such page, or a server from before the log: its kept-versions
+    # list says which (and is all it can show).
+    api_auth GET "/api/artifacts/$PAGE_ID/versions"
+    [ "$STATUS" != 404 ] || die 7 "no page named $PAGE_ID among yours"
+    expect_2xx
+    if [ -n "$as_json" ] || [ "$(head -c 1 "$TMP/body")" = "{" ]; then
+      cat "$TMP/body"
+      printf '\n'
+      return 0
+    fi
+    awk -F'\t' -v page="$target" '
+      NR == 1 { sub(/^rev=/, ""); printf "%s is at rev %s\n", page, $0; next }
+      { d = $2; sub(/T/, " ", d); printf "%s  %s  %7.1f KB  %s\n", $1, substr(d, 1, 16), $3 / 1024, $4 }
+      END {
+        if (NR <= 1) print "no earlier versions"
+        else printf "put one back: foldrender restore %s VERSION (or foldrender undo %s for the newest)\n", page, page
+      }' "$TMP/body"
+    return 0
+  fi
   expect_2xx
   if [ -n "$as_json" ] || [ "$(head -c 1 "$TMP/body")" = "{" ]; then
     cat "$TMP/body"
@@ -1650,43 +1682,112 @@ cmd_versions() {
   fi
   awk -F'\t' -v page="$target" '
     NR == 1 { sub(/^rev=/, ""); printf "%s is at rev %s\n", page, $0; next }
-    { d = $2; sub(/T/, " ", d); printf "%s  %s  %7.1f KB  %s\n", $1, substr(d, 1, 16), $3 / 1024, $4 }
+    {
+      d = $2; sub(/T/, " ", d)
+      gone = ""; vid = ""
+      for (i = 5; i <= NF; i++) {
+        if ($i ~ /^gone:/) gone = "  [" substr($i, 6) "]"
+        else if ($i ~ /^v[0-9a-f]{16}$/) vid = "  " $i
+      }
+      if ($1 == "0") { printf "  … %s%s\n", $5, ($2 ? "  (" substr($2, 1, 16) ")" : ""); next }
+      printf "rev %-4s %s  %-28s %7s  %s%s%s\n", $1, substr(d, 1, 16), $3, $4, $5, gone, vid
+    }
+    /^…older revisions:/ { sub(/PAGE/, page); print; next }
     END {
-      if (NR <= 1) print "no earlier versions"
-      else printf "put one back: foldrender restore %s VERSION (or foldrender undo %s for the newest)\n", page, page
+      if (NR <= 1) print "no history yet"
+      else printf "put a revision back: foldrender restore %s REV (undo %s for the one before)\n", page, page
     }' "$TMP/body"
 }
 
-# restore PAGE VERSION: that version becomes the page again; the body it
-# replaces is kept as a version, so a restore can be undone.
+# diff PAGE [A [B]] [--html]: revision A to B as a unified diff, of the text a
+# read gives (or of the stored HTML with --html); with no revisions, the one
+# before the current against it.
+cmd_diff() {
+  local target="" a="" b="" html="" as_json="" query
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --html) html=1; shift ;;
+      --json) as_json=1; shift ;;
+      -*) die 2 "unknown option: $1" ;;
+      *) if [ -z "$target" ]; then target="$1"; elif [ -z "$a" ]; then a="$1"; elif [ -z "$b" ]; then b="$1"; else die 2 "diff takes a page and at most two revisions"; fi; shift ;;
+    esac
+  done
+  [ -n "$target" ] || die 2 "usage: foldrender diff PAGE [REV [REV]] [--html] [--json]"
+  require_token
+  page_id "$target"
+  check_slug "$PAGE_ID"
+  query=""
+  [ -z "$a" ] || query="a=$a"
+  [ -z "$b" ] || query="${query:+$query&}b=$b"
+  [ -z "$html" ] || query="${query:+$query&}html=1"
+  [ -z "$as_json" ] || ACCEPT="application/json"
+  api_auth GET "/api/artifacts/$PAGE_ID/diff${query:+?$query}"
+  [ "$STATUS" != 404 ] || die 7 "no page named $PAGE_ID among yours"
+  if [ "$STATUS" = 410 ]; then
+    die 1 "that version's body is gone ($(json_field rev 2>/dev/null || true)$(json_field gone 2>/dev/null | sed 's/^/, /')); its log entry stays (foldrender log $target)"
+  fi
+  expect_2xx
+  if [ -n "$as_json" ] || [ "$(head -c 1 "$TMP/body")" = "{" ]; then
+    if [ -z "$as_json" ] && grep -q '"too_large":true' "$TMP/body"; then
+      note "the diff is too large to show; the counts: $(json_field added) added, $(json_field removed) removed"
+      return 0
+    fi
+    cat "$TMP/body"
+    printf '\n'
+    return 0
+  fi
+  cat "$TMP/body"
+}
+
+# restore PAGE REV|VERSION: that revision (by number, or by a kept version's
+# id) becomes the page again, as its next commit — the history only grows, so
+# a restore can itself be undone.
 cmd_restore() {
-  [ $# -eq 2 ] || die 2 "usage: foldrender restore PAGE VERSION (see: foldrender versions PAGE)"
+  [ $# -eq 2 ] || die 2 "usage: foldrender restore PAGE REV|VERSION (see: foldrender log PAGE)"
   require_token
   page_id "$1"
   check_slug "$PAGE_ID"
   case "$2" in
-    ''|*[!0-9a-f]*) die 2 "not a version id: $2 (see: foldrender versions $1)" ;;
+    v[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) set -- "$1" "${2#v}" ;;
+  esac
+  case "$2" in
+    ''|*[!0-9a-f]*) die 2 "not a revision or version id: $2 (see: foldrender log $1)" ;;
   esac
   restore_version "$1" "$2"
 }
 
 restore_version() {
   api_auth POST "/api/artifacts/$PAGE_ID/versions/$2/restore"
-  [ "$STATUS" != 404 ] || die 7 "no version $2 of $1 (see: foldrender versions $1)"
+  [ "$STATUS" != 404 ] || die 7 "no version $2 of $1 (see: foldrender log $1)"
+  [ "$STATUS" != 409 ] || die 1 "rev $2 is already the page"
+  [ "$STATUS" != 410 ] || die 1 "the body of rev $2 is gone; its log entry stays (foldrender log $1)"
   expect_2xx
   read_page_url
   printf '%s\n' "$PAGE_URL"
-  note "restored version $2${PAGE_ID:+ of $PAGE_ID}$( [ -n "$(field rev)" ] && printf ' as rev %s' "$(field rev)")"
+  case "$2" in *[!0-9]*) what="version" ;; *) what="rev" ;; esac
+  note "restored $what $2${PAGE_ID:+ of $PAGE_ID}$( [ -n "$(field rev)" ] && printf ' as rev %s' "$(field rev)")"
 }
 
-# undo PAGE: puts back the newest version kept, the body before the current
-# one. The current body is kept in turn, so undo twice is back where it was.
+# undo PAGE: puts back the revision before the current one. The current body
+# is kept in turn, so undo twice is back where it was.
 cmd_undo() {
   [ $# -eq 1 ] || die 2 "usage: foldrender undo PAGE"
-  local vid
+  local vid rev
   require_token
   page_id "$1"
   check_slug "$PAGE_ID"
+  api_auth GET "/api/artifacts/$PAGE_ID/log"
+  if [ "$STATUS" = 200 ]; then
+    rev="$(sed -n '1s/^rev=//p' "$TMP/body")"
+    # The newest revision before the current one whose body is still kept.
+    vid="$(awk -F'\t' -v cur="$rev" 'NR > 1 && $1 < cur && $0 !~ /gone:/ { print $1; exit }' "$TMP/body")"
+    case "$vid" in
+      ''|*[!0-9]*) die 1 "$1 has no earlier revision with a body to go back to (see: foldrender log $1)" ;;
+    esac
+    restore_version "$1" "$vid"
+    return 0
+  fi
+  # A server from before the log: the newest kept version, as before.
   api_auth GET "/api/artifacts/$PAGE_ID/versions"
   [ "$STATUS" != 404 ] || die 7 "no page named $PAGE_ID among yours"
   expect_2xx
@@ -1914,15 +2015,32 @@ list_duplicates() {
 # rm PAGE...: one line a page on stdout, saying which page went by both its
 # names (id and address) and its title; --json the API's answer, one a line.
 cmd_rm() {
-  local t failed=0 as_json="" targets=() url title
-  for t in "$@"; do
-    case "$t" in
-      --json) as_json=1 ;;
-      -*) die 2 "unknown option: $t" ;;
-      *) targets+=("$t") ;;
+  local t failed=0 as_json="" targets=() url title rev="" vid=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) as_json=1; shift ;;
+      --rev) need $# "$1"; case "$2" in ''|*[!0-9]*) die 2 "--rev takes a revision number (see: foldrender log)" ;; esac; rev="$2"; shift 2 ;;
+      --version) need $# "$1"; vid="$2"; shift 2 ;;
+      -*) die 2 "unknown option: $1" ;;
+      *) targets+=("$1"); shift ;;
     esac
   done
-  [ ${#targets[@]} -ge 1 ] || die 2 "usage: foldrender rm PAGE... [--json]"
+  [ ${#targets[@]} -ge 1 ] || die 2 "usage: foldrender rm PAGE... [--rev REV | --version ID] [--json]"
+  if [ -n "$rev$vid" ]; then
+    # One version's body, not the page: its log entry stays, marked deleted.
+    [ ${#targets[@]} -eq 1 ] || die 2 "--rev and --version name one page"
+    [ -z "$rev" ] || [ -z "$vid" ] || die 2 "--rev and --version do not go together"
+    page_id "${targets[0]}"
+    check_slug "$PAGE_ID"
+    api_auth DELETE "/api/artifacts/$PAGE_ID/versions/${rev:-$vid}"
+    [ "$STATUS" != 404 ] || die 7 "no version ${rev:-$vid} of $PAGE_ID (see: foldrender log $PAGE_ID)"
+    [ "$STATUS" != 409 ] || die 1 "rev $rev is the current revision — the page is it; delete the page itself: foldrender rm $PAGE_ID"
+    [ "$STATUS" != 410 ] || die 1 "that version's body is already gone; its log entry stays (foldrender log $PAGE_ID)"
+    expect_2xx
+    if [ -n "$as_json" ]; then cat "$TMP/body"; printf '\n'; return 0; fi
+    note "deleted version ${rev:-$vid} of $PAGE_ID; its log entry stays (foldrender log $PAGE_ID)"
+    return 0
+  fi
   for t in "${targets[@]}"; do
     page_id "$t"
     check_slug "$PAGE_ID"
@@ -4748,7 +4866,7 @@ foldrender publishes HTML pages as links and reads pages back as text.
                        ink) when signed in; stops at ~6k tokens (--section N)
   ls [WORDS]           your newest pages, id and address (--all, --duplicates)
   share PAGE...        +login -login --public --link --private --reset-link
-  versions PAGE        kept versions; restore PAGE VERSION; undo PAGE
+  log PAGE             the page's history (`versions`); restore REV; undo; diff; rm --rev
   canvas FILE|PAGE...  a canvas with these as cards (up to 24), --note, --link
   canvas edit CANVAS   add or remove cards, notes and connectors in one step
   answers PAGE         answers to the page's questions (data-fr-choice); --wait
@@ -5445,10 +5563,24 @@ foldrender account delete [--confirm LOGIN]
   Run foldrender export first to keep a copy.
 EOF
     ;;
-    versions|restore|undo) cat <<'EOF'
-foldrender versions PAGE       the page's revision and the versions it kept, newest first
-foldrender restore PAGE VERSION   put a version back (the current body is kept in turn)
-foldrender undo PAGE           put back the newest kept version; undo again to return
+    versions|restore|undo|log|diff) cat <<'EOF'
+foldrender log PAGE            the page's history, a line a revision: when, who · client,
+                               +added/-removed, its message, gone: once a body is gone;
+                               `versions` is its old name. A page keeps the bodies of its
+                               newest 10 versions; past 1000 revisions the oldest are
+                               folded into one line. A page of 100 rows at a time: the
+                               last line says how to ask for the ones before it
+                               (--before REV, as it names).
+foldrender diff PAGE [REV [REV]] [--html]   rev A to B as a unified diff (the text a
+                               read gives, or the stored HTML with --html); with no
+                               revisions, the one before the current against it
+foldrender restore PAGE REV|VERSION   put a revision (or kept version id) back, as the
+                               page's next commit ("restore rev N" in the log)
+foldrender undo PAGE           put back the revision before the current; undo again to return
+foldrender rm PAGE --rev REV|--version ID   delete one version's body: its link then says
+                               it was deleted; its log entry stays
+foldrender publish FILE -m MSG, foldrender edit PAGE ... -m MSG
+                               the publish or edit's message in the log
 EOF
     ;;
     exit) cat <<'EOF'
@@ -5521,7 +5653,8 @@ main() {
     share) cmd_share "$@" ;;
     list|ls) cmd_list "$@" ;;
     read|cat) cmd_read "$@" ;;
-    versions) cmd_versions "$@" ;;
+    log|versions) cmd_log "$@" ;;
+    diff) cmd_diff "$@" ;;
     restore) cmd_restore "$@" ;;
     undo) cmd_undo "$@" ;;
     canvas) cmd_canvas "$@" ;;

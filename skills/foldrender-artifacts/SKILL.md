@@ -85,12 +85,15 @@ foldrender edit <page> --old 'Q3 total: 41' --new 'Q3 total: 42'
 
 Each `--old` must be in the page's HTML exactly once; several `--old`/`--new` pairs apply in order, all or none. `--base REV` (the `rev` a publish or edit reported) refuses if the page changed since. Exit 10 means nothing changed: read the page again and redo it.
 
-Every publish and edit keeps the version before it:
+Every publish and edit is a commit in the page's history (`publish -m "..."` and `edit -m "..."` give it a message; without one it is named after the command). A page keeps the bodies of its newest 10 versions; the history keeps its newest 1000 revisions (older ones fold into one line), saying `gone:trimmed` or `gone:deleted` once a body is gone. `log` shows 100 revisions at a time and ends a full page with the command for the next one:
 
 ```
-foldrender versions <page>           the versions kept, newest first
-foldrender undo <page>               put back the newest kept version (undo again to return)
-foldrender restore <page> VERSION    put back that version
+foldrender log <page>                the history, a line a revision (versions is its old name)
+foldrender log <page> --before REV   the revisions older than REV, the next page back
+foldrender diff <page> [REV [REV]]   rev A to B as a unified diff of the read text (--html for the stored HTML)
+foldrender restore <page> REV        put that revision back as the next commit (a kept version id works too)
+foldrender undo <page>               put back the revision before the current (undo again to return)
+foldrender rm <page> --rev REV       delete one version's body (its ?v= link then says it was deleted)
 ```
 
 ## 5. Change access or manage pages
