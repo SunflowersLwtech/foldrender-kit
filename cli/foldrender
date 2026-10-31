@@ -1108,9 +1108,11 @@ export_abort() {
   fail_http
 }
 
-# export [FILE.zip]: every page and a manifest in one zip; pages that add up to
-# more than one download holds (64 MB), in parts FILE-1-of-K.zip ..., each
-# with the manifest of its own pages. The default name is
+# export [FILE.zip]: every page as <slug>.html and a manifest in one zip, with
+# what was written on and kept of each — <slug>.annotations.json, .panel.md,
+# .answers.json and .versions/<id>.html beside .versions.json. Pages that add
+# up to more than one download holds (64 MB), in parts FILE-1-of-K.zip ...,
+# each with the manifest of its own pages. The default name is
 # foldrender-artifacts-<login>-<date>.zip. Refuses to overwrite. Prints each
 # path it saved, one a line, once the set is whole.
 #
