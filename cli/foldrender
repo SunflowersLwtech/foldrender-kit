@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.18.4
+FR_CLI_VERSION=0.18.5
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -39,7 +39,7 @@ FR_BRIDGE_SHA256=2c84e0e03270282d731935416436b439f9ebfeab85bf63637ac43ea97887092
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=faacb425efc268b79f729ba046fc2b988dab6671a424982f4d4be0ef649ed72e
+FR_DESK_AGENT_SHA256=7ea36949bd5eb0074113038e7726042337bd175ba0826e6cc5c2deaabf7b06ff
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -4128,7 +4128,8 @@ thread_hidden() {
 }
 cmd_thread() {
   case "${1:-}" in --help|-h|help) cmd_help thread; return 0 ;; esac
-  local sub="${1:-ls}" mode=text a key="" text="" tfile="" kind="" by="" via="" at="" ref="" parent="" channel="" machine="" agent="" closed="" limit="" body
+  local sub="${1:-ls}" mode=text a key="" text="" tfile="" kind="" by="" via="" at="" ref="" rref="" into="" seq="" parent="" channel="" machine="" agent="" closed="" limit="" body
+  local adds=()
   [ $# -eq 0 ] || shift
   local rest=()
   while [ $# -gt 0 ]; do
@@ -4141,6 +4142,10 @@ cmd_thread() {
       --via) need $# "$1"; via="$2"; shift 2 ;;
       --at) need $# "$1"; at="$(desk_when "$2")"; shift 2 ;;
       --ref) need $# "$1"; ref="$2"; shift 2 ;;
+      --reply-to-ref) need $# "$1"; rref="$2"; shift 2 ;;
+      --add) need $# "$1"; adds+=("$2"); shift 2 ;;
+      --into) need $# "$1"; into="$2"; shift 2 ;;
+      --seq) need $# "$1"; seq="$2"; shift 2 ;;
       --parent) need $# "$1"; parent="$2"; shift 2 ;;
       --channel) need $# "$1"; channel="$2"; shift 2 ;;
       --machine) need $# "$1"; machine="$2"; shift 2 ;;
@@ -4162,21 +4167,32 @@ cmd_thread() {
       [ -z "$key" ] || thread_key "$key"
       [ -z "$parent" ] || thread_key "$parent"
       body="$(thread_text "${1:-}" "$tfile")"
-      printf '{"text":%s%s%s%s%s%s%s}' "$body" "$(thread_opt key "$key")" "$(thread_opt at "$at")" "$(thread_opt by "$by")" "$(thread_opt parent "$parent")" "$(thread_opt channel "$channel")" "$(thread_opt ref "$ref")" > "$TMP/req"
+      printf '{"text":%s%s%s%s%s%s%s%s}' "$body" "$(thread_opt key "$key")" "$(thread_opt at "$at")" "$(thread_opt by "$by")" "$(thread_opt parent "$parent")" "$(thread_opt channel "$channel")" "$(thread_opt ref "$ref")" "$(thread_opt parent_ref "$rref")" > "$TMP/req"
       thread_post "" "$mode" || return 0
       printf '%s\n' "$(sed -n 's/.*"key" *: *"\([^"]*\)".*/\1/p' "$TMP/body")"
       grep -q '"result":"unchanged"' "$TMP/body" && note "this thread was there already (same key or ref): nothing written"
       thread_hidden
       ;;
     reply)
-      [ $# -ge 1 ] || die 2 "thread reply KEY TEXT [--kind reply|progress|result|ask] [--via SESSION] [--by NAME] [--at WHEN] [--ref REF]"
+      body="$(thread_text "${2:-${1:-}}" "$tfile")"
+      case "$kind" in ''|reply|progress|result|ask) ;; *) die 2 "--kind is reply, progress, result or ask" ;; esac
+      if [ -n "$rref" ]; then
+        printf '{"reply_to_ref":%s,"text":%s%s%s%s%s%s}' "$(json_arg "$rref")" "$body" "$(thread_opt kind "$kind")" "$(thread_opt by "$by")" "$(thread_opt via "$via")" "$(thread_opt at "$at")" "$(thread_opt ref "$ref")" > "$TMP/req"
+        thread_post "/reply" "$mode" || return 0
+        key="$(sed -n 's/.*"key" *: *"\([^"]*\)".*/\1/p' "$TMP/body")"
+        if grep -q '"result":"unchanged"' "$TMP/body"; then printf 'unchanged: %s already has this reply (--ref)\n' "$key"
+        else printf 'added reply %s to %s\n' "$(sed -n 's/.*"seq" *: *\([0-9]*\).*/\1/p' "$TMP/body")" "$key"; fi
+        thread_hidden
+        return 0
+      fi
+      [ $# -ge 1 ] || die 2 "thread reply KEY TEXT [--kind reply|progress|result|ask] [--via SESSION] [--by NAME] [--at WHEN] [--ref REF] (or: thread reply --reply-to-ref REF TEXT)"
       thread_key "$1"; key="$1"; shift
       body="$(thread_text "${1:-}" "$tfile")"
-      case "$kind" in ''|reply|progress|result|ask) ;; *) die 2 "--kind is reply, progress, result or ask" ;; esac
       printf '{"text":%s%s%s%s%s%s}' "$body" "$(thread_opt kind "$kind")" "$(thread_opt by "$by")" "$(thread_opt via "$via")" "$(thread_opt at "$at")" "$(thread_opt ref "$ref")" > "$TMP/req"
       thread_post "/$key/reply" "$mode" || return 0
-      if grep -q '"result":"unchanged"' "$TMP/body"; then printf 'unchanged: %s already has this reply (--ref)\n' "$key"
-      else printf 'added reply %s to %s\n' "$(sed -n 's/.*"seq" *: *\([0-9]*\).*/\1/p' "$TMP/body")" "$key"; fi
+      a="$(sed -n 's/.*"key" *: *"\([^"]*\)".*/\1/p' "$TMP/body")"
+      if grep -q '"result":"unchanged"' "$TMP/body"; then printf 'unchanged: %s already has this reply (--ref)\n' "${a:-$key}"
+      else printf 'added reply %s to %s\n' "$(sed -n 's/.*"seq" *: *\([0-9]*\).*/\1/p' "$TMP/body")" "${a:-$key}"; fi
       thread_hidden
       ;;
     link)
@@ -4236,7 +4252,43 @@ cmd_thread() {
       printf 'imported %s threads, %s replies, %s links, %s sessions; %s unchanged, %s skipped, %s with no thread\n' "$total_t" "$total_r" "$total_l" "$total_s" "$total_u" "$total_k" "$total_n"
       [ "$total_h" = 0 ] || note "$total_h piece(s) that looked like a secret were kept as [hidden]"
       ;;
-    *) die 2 "thread new | reply | link | status | ls | import (foldrender help thread)" ;;
+    ref)
+      [ $# -ge 1 ] || die 2 "thread ref KEY[#seq] --add REF... : the chat ids a message came to have"
+      case "$1" in *#*) key="${1%%#*}"; seq="${1##*#}" ;; *) key="$1" ;; esac
+      thread_key "$key"
+      case "${seq:-0}" in ''|*[!0-9]*) die 2 "#seq is a reply's number" ;; esac
+      [ ${#adds[@]} -gt 0 ] || die 2 "thread ref $1 --add REF..."
+      a=""; for r2 in "${adds[@]}"; do a="${a}${a:+,}$(json_arg "$r2")"; done
+      printf '{"add":[%s]%s}' "$a" "${seq:+,\"seq\":$seq}" > "$TMP/req"
+      thread_post "/$key/ref" "$mode" || return 0
+      grep -o '"added":\[[^]]*\]' "$TMP/body" | sed 's/"added":\[\(.*\)\]/kept: \1/;s/","/", "/g;s/"//g'
+      ;;
+    find)
+      [ -n "$ref" ] || die 2 "thread find --ref REF : which message a chat id became"
+      ACCEPT="application/json"
+      api GET "/api/desk/threads/find?ref=$(urlencode "$ref")" -H "$(desk_auth)"
+      [ "${STATUS#2}" != "$STATUS" ] || thread_fail
+      [ "$mode" != json ] || { cat "$TMP/body"; printf '\n'; return 0; }
+      sed -n 's/.*"address" *: *"\([^"]*\)".*/\1/p' "$TMP/body"
+      ;;
+    move)
+      [ $# -ge 1 ] && [ -n "$into" ] || die 2 "thread move KEY --into KEY : a thread opened by mistake goes into another"
+      thread_key "$1"; thread_key "$into"
+      printf '{"into":%s}' "$(json_arg "$into")" > "$TMP/req"
+      thread_post "/$1/move" "$mode" || return 0
+      printf '%s went into %s\n' "$1" "$into"
+      ;;
+    show)
+      [ $# -ge 1 ] || die 2 "thread show KEY"
+      thread_key "$1"
+      ACCEPT="application/json"
+      api GET "/api/desk/threads/$1" -H "$(desk_auth)"
+      [ "${STATUS#2}" != "$STATUS" ] || thread_fail
+      [ "$mode" != json ] || { cat "$TMP/body"; printf '\n'; return 0; }
+      thread_show "$TMP/body"
+      ;;
+    hook) cmd_thread_hook "$@" ;;
+    *) die 2 "thread new | reply | link | status | ls | show | ref | find | move | import | hook (foldrender help thread)" ;;
   esac
 }
 
@@ -4449,6 +4501,130 @@ cmd_pack() {
       ;;
     *) die 2 "pack new | show | ls | rm (foldrender help pack)" ;;
   esac
+}
+
+# One thread as text (thread show): the words, then each session and reply.
+# With Node to read the JSON; else the answer as it came.
+thread_show() {
+  if command -v node >/dev/null 2>&1; then
+    node -e '
+      const t = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+      const cut = (s, n) => { s = String(s || "").replace(/\s+/g, " ").trim(); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
+      console.log(`[${t.key}] ${t.state} · ${t.at}${t.by ? ` · ${t.by}` : ""}${t.parent ? ` · follows ${t.parent}` : ""}${t.moved ? ` · moved into this one from ${t.moved}` : ""}`);
+      console.log(t.text);
+      for (const s of t.sessions || []) console.log(`  session ${s.name}${s.machine ? ` on ${s.machine}` : ""}${s.parent ? ` (for ${s.parent})` : ""}${s.closed ? " closed" : ""}`);
+      for (const e of t.events || []) console.log(`  #${e.seq} ${e.at} ${e.via ? `${e.via} reported` : e.by || "assistant"} (${e.kind}): ${cut(e.text, 200)}`);
+      if (t.more) console.log(`  … and ${t.more} older replies`);
+    ' "$1" || cat "$1"
+  else
+    cat "$1"
+  fi
+}
+
+# foldrender thread hook claude|codex prompt|stop: what an agent's hooks run
+# (UserPromptSubmit, Stop). prompt: the user's words become a thread (or a
+# report from a session a thread was handed to is added to it), and the agent
+# is told the address; stop: the turn's last reply goes under it. Never in the
+# agent's way: anything that fails is silent (exit 0, nothing on stderr), and
+# each call waits 6 seconds at most. FOLDRENDER_THREAD_AUTHOR names the user,
+# FOLDRENDER_THREAD_CHANNEL where the words came from,
+# FOLDRENDER_THREAD_SESSION the session's own name (bound to the thread),
+# FOLDRENDER_THREAD_SKIP a file of prompt beginnings to leave out (one a
+# line: a scheduled prompt's), FOLDRENDER_THREAD_AGENT the reply's author.
+cmd_thread_hook() {
+  local agent="${1:-}" event="${2:-}" sid state addr body
+  case "$agent" in claude|codex) ;; install) shift; thread_hook_install "$@"; return ;; *) die 2 "thread hook claude|codex prompt|stop (or: thread hook install claude|codex)" ;; esac
+  cat > "$TMP/in" 2>/dev/null || exit 0
+  sid="$(json_get str session_id "$TMP/in" 2>/dev/null)"
+  case "$sid" in ''|*[!A-Za-z0-9_.:-]*) exit 0 ;; esac
+  state="$CONFIG_DIR/threads/$agent-$sid"
+  mkdir -p "$CONFIG_DIR/threads" 2>/dev/null || exit 0
+  [ -n "$TOKEN" ] || [ -n "${FOLDRENDER_DESK_TOKEN:-}" ] || exit 0
+  case "$event" in
+    prompt)
+      rm -f "$state"
+      json_get str prompt "$TMP/in" > "$TMP/text" 2>/dev/null || exit 0
+      [ -s "$TMP/text" ] || exit 0
+      printf '{"event":"prompt","prompt":%s,"author":%s,"channel":%s,"session":%s' "$(json_file "$TMP/text")" "$(json_arg "${FOLDRENDER_THREAD_AUTHOR:-owner}")" "$(json_arg "${FOLDRENDER_THREAD_CHANNEL:-$agent}")" "$(json_arg "${FOLDRENDER_THREAD_SESSION:-}")" > "$TMP/req.json"
+      if [ -f "${FOLDRENDER_THREAD_SKIP:-}" ]; then
+        printf ',"skip":[' >> "$TMP/req.json"
+        head -n 20 "$FOLDRENDER_THREAD_SKIP" | awk 'NF' > "$TMP/skip"
+        local first=1 line
+        while IFS= read -r line; do printf '%s' "$line" > "$TMP/one"; [ $first = 1 ] || printf ',' >> "$TMP/req.json"; first=0; json_str "$TMP/one" >> "$TMP/req.json"; done < "$TMP/skip"
+        printf ']' >> "$TMP/req.json"
+      fi
+      printf '}' >> "$TMP/req.json"
+      api_once POST "/api/desk/threads/hook" -H "$(desk_auth)" -H "Content-Type: application/json" --data-binary "@$TMP/req.json" --max-time 6 || exit 0
+      [ "${STATUS#2}" != "$STATUS" ] || exit 0
+      addr="$(json_get str address "$TMP/body" 2>/dev/null)"
+      [ -n "$addr" ] || exit 0
+      printf '%s\n' "$addr" > "$state"
+      json_get str context "$TMP/body" > "$TMP/ctx" 2>/dev/null || exit 0
+      [ -s "$TMP/ctx" ] || exit 0
+      printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":%s}}\n' "$(json_file "$TMP/ctx")"
+      ;;
+    stop)
+      [ -f "$state" ] || exit 0
+      [ "$(json_get raw stop_hook_active "$TMP/in" 2>/dev/null)" != true ] || exit 0
+      addr="$(head -n 1 "$state")"
+      rm -f "$state"
+      json_get str last_assistant_message "$TMP/in" > "$TMP/text" 2>/dev/null || exit 0
+      [ -s "$TMP/text" ] || exit 0
+      body="$(json_file "$TMP/text")"
+      printf '{"event":"reply","address":%s,"text":%s,"author":%s,"ref":%s}' "$(json_arg "$addr")" "$body" "$(json_arg "${FOLDRENDER_THREAD_AGENT:-$agent}")" "$(json_arg "hook-$(printf '%s %s' "$addr" "$body" | cksum | tr ' ' '-')")" > "$TMP/req.json"
+      api_once POST "/api/desk/threads/hook" -H "$(desk_auth)" -H "Content-Type: application/json" --data-binary "@$TMP/req.json" --max-time 6 || exit 0
+      ;;
+    *) die 2 "thread hook $agent prompt|stop" ;;
+  esac
+  exit 0
+}
+
+# foldrender thread hook install claude|codex [--author NAME] [--channel C]
+# [--skip-file F]: the two hooks into the agent's settings (Claude Code
+# ~/.claude/settings.json, Codex ~/.codex/hooks.json), kept beside the hooks
+# already there; with Node to merge them in, else printed for you to add.
+# Nothing else in the file changes.
+thread_hook_install() {
+  local agent="${1:-}" file self env="" a
+  [ -n "$agent" ] && shift || die 2 "thread hook install claude|codex [--author NAME] [--channel C] [--skip-file FILE]"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --author) need $# "$1"; env="${env}FOLDRENDER_THREAD_AUTHOR='$(printf '%s' "$2" | sed "s/'/'\\\\''/g")' "; shift 2 ;;
+      --channel) need $# "$1"; env="${env}FOLDRENDER_THREAD_CHANNEL='$(printf '%s' "$2" | sed "s/'/'\\\\''/g")' "; shift 2 ;;
+      --session) need $# "$1"; env="${env}FOLDRENDER_THREAD_SESSION='$(printf '%s' "$2" | sed "s/'/'\\\\''/g")' "; shift 2 ;;
+      --skip-file) need $# "$1"; a="$(cd "$(dirname "$2")" 2>/dev/null && pwd)/$(basename "$2")"; env="${env}FOLDRENDER_THREAD_SKIP='$a' "; shift 2 ;;
+      *) die 2 "thread hook install $agent: unknown option $1" ;;
+    esac
+  done
+  case "$agent" in
+    claude) file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" ;;
+    codex) file="${CODEX_HOME:-$HOME/.codex}/hooks.json" ;;
+    *) die 2 "thread hook install claude|codex" ;;
+  esac
+  self="$(command -v foldrender 2>/dev/null || printf '%s' "$0")"
+  local p="${env}'$self' thread hook $agent prompt" s="${env}'$self' thread hook $agent stop"
+  if command -v node >/dev/null 2>&1; then
+    mkdir -p "$(dirname "$file")" || die 1 "cannot make $(dirname "$file")"
+    node -e '
+      const fs = require("fs");
+      const [file, p, s] = process.argv.slice(1);
+      let j = {};
+      if (fs.existsSync(file)) { j = JSON.parse(fs.readFileSync(file, "utf8") || "{}"); fs.copyFileSync(file, file + ".bak-foldrender"); }
+      j.hooks = j.hooks || {};
+      for (const [ev, cmd] of [["UserPromptSubmit", p], ["Stop", s]]) {
+        const list = (j.hooks[ev] = j.hooks[ev] || []);
+        const mine = / thread hook (claude|codex) (prompt|stop)"?$/;
+        for (const g of list) g.hooks = (g.hooks || []).filter((h) => !(h && typeof h.command === "string" && mine.test(h.command)));
+        list.push({ hooks: [{ type: "command", command: cmd, timeout: 10 }] });
+      }
+      for (const ev of ["UserPromptSubmit", "Stop"]) j.hooks[ev] = j.hooks[ev].filter((g) => (g.hooks || []).length);
+      fs.writeFileSync(file, JSON.stringify(j, null, 2) + "\n");
+    ' "$file" "$p" "$s" || die 1 "could not write the hooks into $file (it is kept as it was in $file.bak-foldrender)"
+    note "added the message hooks to $file (UserPromptSubmit and Stop; the file before is $file.bak-foldrender). Each new session of $agent now writes the user's messages and its replies to the desk."
+  else
+    note "Node is not here to merge them in: add these two hooks to $file (the user's words become threads, the reply goes under them):"
+    printf '{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":%s,"timeout":10}]}],"Stop":[{"hooks":[{"type":"command","command":%s,"timeout":10}]}]}}\n' "$(json_arg "$p")" "$(json_arg "$s")"
+  fi
 }
 
 cmd_bridge() {
@@ -4674,30 +4850,53 @@ foldrender thread COMMAND [--json]
   your agents with the desk's agent token (FOLDRENDER_DESK_TOKEN) or your
   sign-in; the page draws them.
   new TEXT|--text-file FILE|- [--key t-...] [--at WHEN] [--by NAME]
-      [--parent t-...] [--channel C] [--ref REF]
+      [--parent t-...] [--reply-to-ref REF] [--channel C] [--ref REF]
                        a thing you said: prints its key (t-MMDDHHMM-… unless
                        --key). The same --key or --ref again writes nothing.
                        From a hook, pass the words on stdin (--text-file -):
                        on a command line they are in the process table
                        --parent: the thread it follows on from (a reply in chat)
+                       --reply-to-ref: the chat id of the message it answers;
+                       when that is kept here this follows its thread, else
+                       this opens at the root
   reply KEY TEXT|--text-file F [--kind reply|progress|result|ask]
       [--via SESSION] [--by NAME] [--at WHEN] [--ref REF]
                        added under it, never rewritten. --via SESSION: the
                        session's report (drawn under that session); --ref
                        (a chat message id): the same ref again adds nothing
+  reply --reply-to-ref REF TEXT ...   the same, under the thread of the
+                       message it answers (the chat id of that message; no
+                       such id yet: exit 7, nothing written)
   link KEY SESSION [--machine M] [--agent A] [--parent SESSION] [--closed]
                        a session sent to work on it. --parent: the session it
                        was started for (else read from the names: hm275-rev2
                        goes under hm275-rev); --closed when it is closed
   status KEY received|doing|you|done
                        where it stands (else: from its last reply)
+  ref KEY[#seq] --add REF...         more chat ids a message came to have (the
+                       chat answers with a sent message's id only after):
+                       one already kept elsewhere is refused with its address
+  find --ref REF                     which message a chat id became (t-… or
+                       t-…#seq)
+  move KEY --into KEY                a thread opened by mistake goes into
+                       another: its key still answers, and new replies land
+                       on the other
   ls [--limit N]       the newest, with their sessions and last reply
+  show KEY [--json]    one thread: the words, its sessions, its replies
   import FILE|-        lines of JSON: the assistant's threads.jsonl ({type:
                        thread|reply|link, ...}) and its record of the sessions
                        it started ({machine, name, kind, at, closed}); 100 lines
                        a request, safe to run again (nothing is added twice)
+  hook install claude|codex [--author NAME] [--channel C] [--skip-file FILE]
+                       put the two hooks into the agent's settings: each
+                       message it gets becomes a thread, its last reply of
+                       the turn goes under it. Claude Code's hooks land in
+                       ~/.claude/settings.json, Codex's in ~/.codex/hooks.json
+  hook claude|codex prompt|stop      what those hooks run (never in the
+                       agent's way: a failure is silent and exits 0)
   What looks like a secret in what was said is kept as [hidden]; a name that
-  looks like one is refused. Limits a day: 20000 writes (import lines count).
+  looks like one is refused. Limits a day: 20000 writes (import lines count),
+  20000 hook calls.
 EOF
     ;;
     pack) cat <<'EOF'
