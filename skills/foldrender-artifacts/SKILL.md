@@ -306,7 +306,7 @@ foldrender read desk                       # the whole desk as text
 
 ### The desk's second version: cards, batches the user sends, the outbox
 
-For an account that has it (its page is at `https://foldrender.dev/desk` once it is switched on, `/desk?v2=1` before), every question is a card of one shape, and the user answers each the same way: agree to your suggestion, another option, "not now, ask me tomorrow" (the page adds it), or their own words. A tap is only a draft, kept until the user presses Send (发给你的 agent); nothing else sends it. What they send reaches their agents as one batch, and they can take a sent answer back until it is marked done.
+For an account that has it (its page is at `https://foldrender.dev/desk` once it is switched on, `/desk?v2=1` before), every question is a card of one shape, and the user answers each the same way: agree to your suggestion, another option, "not now, ask me tomorrow" (the page adds it), or their own words. A tap is only a draft, kept until the user presses Send (发给你的 agent); nothing else sends it. What they send reaches their agents as one batch, and they can take a sent answer back until it is marked done. A 429 with `site_quota` from any desk command means FoldRender's desks, every account together, are full for the day: stop and try again after 00:00 UTC (`Retry-After`), not sooner; it is not the user's own limit.
 
 ```bash
 foldrender desk card gw-caps --question "Raise the two monthly caps on the model gateway?" \
@@ -360,7 +360,7 @@ If a publish fails with "free plan limit reached", tell the user the limit. Run 
 
 Run these only when the user asks for them in this conversation.
 
-- `foldrender export [file.zip]` saves every page and a `manifest.json` as one zip — each page as `<slug>.html`, plus what was written on and kept of it when it has it: `<slug>.annotations.json`, `<slug>.panel.md`, `<slug>.answers.json` and `<slug>.versions/<id>.html` beside `<slug>.versions.json`. The default name is `foldrender-artifacts-<login>-<date>.zip`. It refuses to overwrite a file. Pages that add up to more than 64 MB are saved in parts, `file-1-of-K.zip` to `file-K-of-K.zip`, one path a line: give the user every path it printed.
+- `foldrender export [file.zip]` saves every page and a `manifest.json` as one zip — each page as `<slug>.html`, plus what was written on and kept of it when it has it: `<slug>.annotations.json`, `<slug>.panel.md`, `<slug>.answers.json` and `<slug>.versions/<id>.html` beside `<slug>.versions.json`; and, for an account with a desk, the desk under `desk/` (a `.jsonl` file a table: the cards and the user's answers, the messages, the memory, the machines; the cards' pictures; `desk/manifest.json` lists them), after the pages and, when it is large, cut across the last parts. The default name is `foldrender-artifacts-<login>-<date>.zip`. It refuses to overwrite a file. Pages that add up to more than 64 MB are saved in parts, `file-1-of-K.zip` to `file-K-of-K.zip`, one path a line: give the user every path it printed.
 - `foldrender account delete` removes the account, all its pages and all its API tokens. It cannot be undone. Before running it, suggest `foldrender export`.
 - Run `foldrender account delete --confirm <login>` only after the user has typed or confirmed their own login in this conversation. Use the login they gave, never one you looked up or guessed. Without a terminal the command refuses unless `--confirm` is given.
 - A 403 "cannot be deleted from here" means this account cannot be deleted with this tool. Tell the user and stop.
