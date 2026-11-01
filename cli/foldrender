@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.18.8
+FR_CLI_VERSION=0.18.9
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -39,7 +39,7 @@ FR_BRIDGE_SHA256=2c84e0e03270282d731935416436b439f9ebfeab85bf63637ac43ea97887092
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=183af7d850f992d0b2d7fcd12853d2ca7a7875765355173282cd75402ef20a4d
+FR_DESK_AGENT_SHA256=eceb0206492a031c063fdc8f91cda1aafcc5c1de131aa04030066c52b5589ac4
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -1045,6 +1045,11 @@ export_get() {
   local try=1 wait
   while :; do
     api_auth GET "$1" --max-time 3600
+    # A zip (not the plan) is asked as a download link on the account's own
+    # host (?direct=1): the server answers url=… and the zip is fetched from
+    # there, with no token (the link is the credential). A server without
+    # links answers the zip itself, as before.
+    case "$1" in *plan=1*) ;; *) export_direct ;; esac
     [ "$STATUS" = 429 ] || return 0
     wait="$(header_value retry-after)"
     case "$wait" in ''|*[!0-9]*) wait=60 ;; esac
@@ -1054,6 +1059,26 @@ export_get() {
     sleep "$wait"
     try=$((try + 1))
   done
+}
+
+# export_direct: the last answer is a download link (url=https://…--u.foldrender.dev/__fr/export?t=…):
+# the zip from it, as the last answer, fetched with no token (the link is the
+# credential). The link goes to curl on stdin (-K -), not on its command line,
+# where other users of the machine could read it. Anything but a link of that
+# shape (or, from a local server, http://localhost) is not followed: STATUS 000.
+export_direct() {
+  local url
+  case "$STATUS" in 2??) ;; *) return 0 ;; esac
+  [ "$(head -c 4 "$TMP/body")" = "url=" ] || return 0
+  url="$(field url)"
+  case "$url" in
+    *[\"\\\ ]*) STATUS=000; return 0 ;;
+    https://*/__fr/export\?t=*) ;;
+    http://localhost:*/__fr/export\?t=*|http://127.0.0.1:*/__fr/export\?t=*) case "$API" in http://*) ;; *) STATUS=000; return 0 ;; esac ;;
+    *) STATUS=000; return 0 ;;
+  esac
+  STATUS="$(printf 'url = "%s"\n' "$url" | curl -sS --connect-timeout 15 --max-time 3600 -H "Accept: application/zip" -D "$TMP/headers" -o "$TMP/body" -w '%{http_code}' -K - 2>"$TMP/err")" \
+    || die 6 "cannot reach your download link. Check your network connection and try again. ($(curl_error))"
 }
 
 # export_zip FILE: the zip in the last answer, written to FILE; 1 when the
@@ -1150,7 +1175,7 @@ cmd_export() {
   fi
   export_plan || die 1 "the server did not return an export plan"
   if [ "$PLAN_N" = 1 ]; then
-    export_get /api/me/export
+    export_get "/api/me/export?direct=1"
     export_zip "$target" || { [ -z "$EXPORT_ERR" ] || die "$EXPORT_CODE" "$EXPORT_ERR"; fail_http; }
     printf '%s\n' "$target"
     return 0
@@ -1175,7 +1200,7 @@ cmd_export() {
         q="part=$k&of=$PLAN_N"
         [ "${P_AFTER[$i]}" = - ] || q="$q&after=${P_AFTER[$i]}"
         [ "${P_TO[$i]}" = - ] || q="$q&to=${P_TO[$i]}"
-        export_get "/api/me/export?$q"
+        export_get "/api/me/export?$q&direct=1"
         export_zip "$name" || export_abort "$EXPORT_CODE" "$EXPORT_ERR"
         case " ${EXPORT_FILES[*]-} " in *" $name "*) ;; *) EXPORT_FILES+=("$name") ;; esac
         saved[$i]="$(header_value x-fr-export-part)"
@@ -5600,7 +5625,9 @@ foldrender export [FILE.zip]
   on stderr how many pages and how much each holds. If pages change while the
   parts are saved, each part that changed is saved again. A part that fails,
   or a daily export limit (exit 4, said at once), removes the parts saved
-  before it, so a set on disk is always whole.
+  before it, so a set on disk is always whole. Each zip is fetched from a
+  2-minute download link on the account's own host, with no token; an account
+  downloads at most 100 parts a day.
 EOF
     ;;
     login|logout|whoami) cat <<'EOF'
