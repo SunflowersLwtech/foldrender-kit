@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.18.6
+FR_CLI_VERSION=0.18.7
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -39,7 +39,7 @@ FR_BRIDGE_SHA256=2c84e0e03270282d731935416436b439f9ebfeab85bf63637ac43ea97887092
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=71cad8fe747328d57b48f8259415b9a2373844464f40edc4805dad3d1abe398d
+FR_DESK_AGENT_SHA256=70ec03b080560e7a7784d27f8825d532725527a2edd1b51e22745d3a334c05dd
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -1906,6 +1906,64 @@ say_access() {
   esac
 }
 
+# list_json_filter WORDS ACCESS FOLDER LIMIT: the answer of GET /api/artifacts
+# ({"artifacts":[{id,visibility,title,folder,name,page_url,…},…]}) on stdin,
+# filtered as the table's rows are: every word in id+title+page_url (any case),
+# access one kind, folder exact, the first LIMIT of what matches (0: all).
+# Item text is copied through as written, so fields the filter never reads
+# (size, updated, collab, page_url's token) reach stdout untouched.
+list_json_filter() {
+  awk -v words="$1" -v access="$2" -v folder="$3" -v limit="$4" '
+    function unstr(v,   c, n, i, j, out) {
+      n = split(v, c, "")
+      for (i = 2; i < n; i++) {
+        for (j = i; j < n && c[j] != "\\"; j++) ;
+        if (j > i) out = out substr(v, i, j - i)
+        if (j >= n) break
+        if (c[j + 1] == "u") { out = out "?"; i = j + 4 }
+        else { out = out c[j + 1]; i = j + 1 }
+      }
+      return out
+    }
+    # member WANT of object T: the value text as written (a string keeps its
+    # quotes and escapes; callers unstr it), "" when absent.
+    function member(t, want,   m, v) {
+      if (!match(t, "\"" want "\"[ \t]*:[ \t]*")) return ""
+      v = substr(t, RSTART + RLENGTH)
+      if (match(v, /^"([^"\\]|\\.)*"/)) return substr(v, 1, RLENGTH)
+      if (match(v, /^[^,}\]]*/)) return substr(v, 1, RLENGTH)
+      return ""
+    }
+    { s = s $0 }
+    END {
+      nw = split(tolower(words), w, " ")
+      sub(/^[\t\r\n ]*[{][\t\r\n ]*"artifacts"[\t ]*:[\t ]*\[/, "", s)
+      d = 1; vs = 0; n = 0; kept = 0; out = ""
+      for (i = 1; i <= length(s); i++) {
+        x = substr(s, i, 1)
+        if (x == "\"") { match(substr(s, i), /^"([^"\\]|\\.)*"/); i += RLENGTH - 1; continue }
+        if (x == "{" || x == "[") { if (d == 1 && x == "{") vs = i; d++ }
+        else if (x == "}" || x == "]") {
+          d--
+          if (d == 0) break
+          if (d == 1 && vs) {
+            it = substr(s, vs, i - vs + 1); vs = 0
+            id = unstr(member(it, "id"))
+            if (id != "") {
+              ok = 1
+              hay = tolower(id " " unstr(member(it, "title")) " " unstr(member(it, "page_url")))
+              for (k = 1; k <= nw; k++) if (index(hay, w[k]) == 0) { ok = 0; break }
+              if (ok && access != "" && unstr(member(it, "visibility")) != access) ok = 0
+              if (ok && folder != "" && unstr(member(it, "folder")) != folder) ok = 0
+              if (ok) { n++; if (limit == 0 || n <= limit) out = out (kept++ ? "," : "") it }
+            }
+          }
+        }
+      }
+      printf "{\"artifacts\":[%s]}\n", out
+    }'
+}
+
 # ls [WORDS...]: your pages, newest first, one line each: the newest 20 unless
 # --all or -n N. WORDS must all be in the id, title or address (any case);
 # --access keeps one kind, --folder one folder; --long adds each address.
@@ -1932,8 +1990,7 @@ cmd_list() {
     ACCEPT="application/json"
     api_auth GET /api/artifacts
     expect_2xx
-    cat "$TMP/body"
-    printf '\n'
+    list_json_filter "$words" "$access" "$folder" "$limit" < "$TMP/body"
     return 0
   fi
   api_auth GET /api/artifacts
