@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.18.9
+FR_CLI_VERSION=0.18.10
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -39,7 +39,7 @@ FR_BRIDGE_SHA256=2c84e0e03270282d731935416436b439f9ebfeab85bf63637ac43ea97887092
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=eceb0206492a031c063fdc8f91cda1aafcc5c1de131aa04030066c52b5589ac4
+FR_DESK_AGENT_SHA256=fc4e326b59b501490c014b53e10ad188ecf9e731c80738595a58b57ef9c9fd5c
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -3746,6 +3746,8 @@ mem_fail() {
     413) die 5 "too large: $msg" ;;
     429) die 4 "$msg" ;;
     400|422) die 1 "refused ($msg)$(sed -n 's/.*"field" *: *"\([^"]*\)".*/, field \1/p' "$TMP/body" | head -n 1)" ;;
+    # The desk's storage is full (all desks', or this one's): its own sentence.
+    507) die 1 "$msg" ;;
     *) fail_http ;;
   esac
 }
@@ -3755,6 +3757,7 @@ cmd_desk_mem() {
   local sub="${1:-status}" mode=text a q="" limit="" kind="" basis="" repo="" file="" key="" text="" source="" by="" via="" at="" ref="" session="" agent="" machine="" expires=""
   [ $# -eq 0 ] || shift
   [ "$sub" != install ] || { cmd_desk_mem_install "$@"; return; }
+  [ "$sub" != todo ] || { cmd_desk_mem_todo "$@"; return; }
   local rest=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -3924,6 +3927,214 @@ cmd_desk_mem() {
       printf 'hidden: %s\n' "$source"
       ;;
     *) die 2 "unknown desk mem command: $sub (foldrender help desk-mem)" ;;
+  esac
+}
+
+# The repository this command runs in, as the memory hook names it (its
+# event.py): the folder that holds its .git, which a worktree shares with its
+# main checkout; else this folder. Nothing when that is more than 128 bytes.
+mem_repo_here() {
+  local common top r
+  common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || common=""
+  common="${common%/}"
+  if [ -n "$common" ]; then
+    if [ "$(basename "$common")" = .git ]; then top="$(dirname "$common")"; else top="$common"; fi
+    r="$(basename "$top")"
+  else
+    r="$(basename "${PWD%/}")"
+  fi
+  [ -z "$r" ] || [ "${#r}" -gt 128 ] || printf '%s' "$r"
+}
+
+# foldrender desk mem todo ...: an agent's own to-do lists in the desk's
+# memory (mem_todo on the Worker), what claude-mem's work_state kept: lists of
+# items, each todo, doing, done or dropped, with a few fields of their own.
+# The same list and item written again is the later write's (its status, its
+# fields over the kept ones); done or dropped closes. Never on the owner's
+# page: the agents read them, and a new session in the list's repository is
+# handed the open ones touched in the last 7 days.
+cmd_desk_mem_todo() {
+  case "${1:-}" in --help|-h|help) cmd_help desk-mem; return 0 ;; esac
+  local sub="${1:-ls}" mode=text status="" repo="" list="" all="" limit="" offset="" by="" at="" from="" f k v fj="" item=""
+  [ $# -eq 0 ] || shift
+  local rest=() fields=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) mode=json; shift ;;
+      --status) need $# "$1"; status="$2"; shift 2 ;;
+      --dropped) status=dropped; shift ;;
+      --field) need $# "$1"; fields+=("$2"); shift 2 ;;
+      --repo) need $# "$1"; repo="$2"; shift 2 ;;
+      --list) need $# "$1"; list="$2"; shift 2 ;;
+      --all) all=1; shift ;;
+      --limit) need $# "$1"; limit="$2"; shift 2 ;;
+      --offset) need $# "$1"; offset="$2"; shift 2 ;;
+      --by) need $# "$1"; by="$2"; shift 2 ;;
+      --at) need $# "$1"; at="$(desk_when "$2")"; shift 2 ;;
+      --from) need $# "$1"; from="$2"; shift 2 ;;
+      --help|-h) cmd_help desk-mem; return 0 ;;
+      -) rest+=("$1"); shift ;;
+      -*) die 2 "desk mem todo $sub: unknown option $1 (foldrender help desk-mem)" ;;
+      *) rest+=("$1"); shift ;;
+    esac
+  done
+  set -- ${rest[@]+"${rest[@]}"}
+  mem_opt() { [ -z "$2" ] || printf ',"%s":%s' "$1" "$(json_arg "$2")"; }
+  case "$sub" in
+    set|close)
+      # set LIST [ITEM]: the list's own row when there is no item.
+      list="${1:-}"; item="${2:-}"
+      [ -n "$list" ] || die 2 "desk mem todo $sub LIST [ITEM]$([ "$sub" = set ] && printf ' [--status todo|doing|done|dropped] [--field NAME=VALUE]... [--repo R]' || printf ' [--dropped]')"
+      [ $# -le 2 ] || die 2 "desk mem todo $sub LIST [ITEM]: one item a call (quote it: \"$3\" is a third word)"
+      if [ "$sub" = close ]; then
+        case "$status" in ""|done|dropped) status="${status:-done}" ;; *) die 2 "desk mem todo close: --status done|dropped" ;; esac
+        [ ${#fields[@]} -eq 0 ] || die 2 "desk mem todo close takes no --field (desk mem todo set LIST ITEM --status done --field ...)"
+      fi
+      case "$status" in ""|todo|doing|done|dropped) ;; *) die 2 "desk mem todo set --status todo|doing|done|dropped" ;; esac
+      for f in ${fields[@]+"${fields[@]}"}; do
+        case "$f" in *=*) ;; *) die 2 "desk mem todo set --field NAME=VALUE (NAME= takes a field away), not $f" ;; esac
+        k="${f%%=*}"; v="${f#*=}"
+        [ -n "$k" ] || die 2 "desk mem todo set --field NAME=VALUE: a field has a name"
+        fj="$fj,$(json_arg "$k"):$(json_arg "$v")"
+      done
+      [ -z "$fj" ] || fj=",\"fields\":{${fj#,}}"
+      printf '{"list":%s%s%s%s%s%s%s%s}' "$(json_arg "$list")" "$(mem_opt item "$item")" "$(mem_opt status "$status")" \
+        "$fj" "$(mem_opt repo "$repo")" "$(mem_opt default_repo "$(mem_repo_here)")" "$(mem_opt by "$by")" "$(mem_opt at "$at")" > "$TMP/req"
+      api POST "/api/desk/mem/todo" -H "$(desk_auth)" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+      [ "${STATUS#2}" != "$STATUS" ] || mem_fail
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      printf '%s: %s%s (%s)%s\n' "$(json_get str result)" "$list" "${item:+ / $item}" "$(json_get str status)" \
+        "$(json_get raw open | grep -q true || printf ', list closed')"
+      ;;
+    ls)
+      local qs=""
+      [ -z "${list:-${1:-}}" ] || qs="$qs&list=$(urlencode "${list:-$1}")"
+      [ -z "$repo" ] || qs="$qs&repo=$(urlencode "$repo")"
+      [ -z "$all" ] || qs="$qs&all=1"
+      [ -z "$limit" ] || qs="$qs&limit=$(urlencode "$limit")"
+      [ -z "$offset" ] || qs="$qs&offset=$(urlencode "$offset")"
+      [ "$mode" = json ] && ACCEPT="application/json" || ACCEPT="text/plain"
+      api GET "/api/desk/mem/todo${qs:+?${qs#&}}" -H "$(desk_auth)"
+      [ "${STATUS#2}" != "$STATUS" ] || mem_fail
+      cat "$TMP/body"
+      [ "$mode" != json ] || printf '\n'
+      ;;
+    rm)
+      [ -n "${1:-}" ] && [ $# -eq 1 ] || die 2 "desk mem todo rm LIST (the whole list, its items with it)"
+      printf '{"list":%s,"remove":true}' "$(json_arg "$1")" > "$TMP/req"
+      api POST "/api/desk/mem/todo" -H "$(desk_auth)" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+      [ "${STATUS#2}" != "$STATUS" ] || mem_fail
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      printf 'removed: %s (%s rows)\n' "$1" "$(json_get raw rows)"
+      ;;
+    import)
+      # Lines as set sends one ({"list","item","status","fields","repo","at"};
+      # scripts/claude-mem-export.mjs --work-state makes the file from
+      # claude-mem's work-state lists), in order, 100 (and 60 KB) a request, as
+      # they are (application/x-ndjson): the desk reads each line alone, so no
+      # line's text can change what another's means. A line it refuses, or
+      # that is not one JSON object, is said by its number (the first 20, then
+      # how many more) and the others go in; each one that is a to-do is one of
+      # the day's writes. A request none of whose lines is one JSON object is a
+      # file of another shape (a pretty-printed one): it stops there, so that
+      # such a file costs one request whatever its size, and says the line to
+      # go on from. The desk's minute (too many changes in a minute) is waited
+      # out as it says, five times at most a request; the day's quota or a
+      # failure stops it, and says the line to go on from (--from N; the later
+      # write wins, so a line sent twice is "unchanged"). Exit 1 when every line
+      # was refused; a file sent again, all unchanged, is exit 0.
+      local file="${1:--}" added=0 changed=0 unchanged=0 refused=0 notjson=0 sent=0 say=20 bad="" part tries wait idx ln n nj total
+      case "${from:-1}" in ''|*[!0-9]*) die 2 "desk mem todo import --from N: a line number of the file (1 or more)" ;; esac
+      [ "${from:-1}" -ge 1 ] || die 2 "desk mem todo import --from N: a line number of the file (1 or more)"
+      if [ "$file" = - ]; then cat > "$TMP/todo.import"; file="$TMP/todo.import"; fi
+      [ -f "$file" ] || die 2 "no file $file"
+      # Each line to send with its number in the file before it (a tab
+      # between): blank lines and those before --from are left out.
+      LC_ALL=C awk -v from="${from:-1}" 'NR >= from && $0 ~ /[^ \t\r]/ { print NR "\t" $0 }' "$file" > "$TMP/todo.lines"
+      total=$(wc -l < "$TMP/todo.lines" | tr -d ' ')
+      [ "$total" -gt 0 ] || die 2 "desk mem todo import: no line to send in $file$([ "${from:-1}" = 1 ] || printf ' from line %s' "$from")"
+      rm -f "$TMP"/todo.part.*
+      LC_ALL=C awk -v pre="$TMP/todo.part." -v per=100 -v max=60000 '
+        { b = length($0) + 1
+          if (n == per || (n > 0 && size + b > max)) { close(f); k++; n = 0; size = 0 }
+          f = sprintf("%s%06d", pre, k); print > f; n++; size += b }' "$TMP/todo.lines"
+      todo_stop() {
+        printf 'desk mem todo import: stopped at line %s; added %s, changed %s, unchanged %s, refused %s before it. Go on with --from %s%s\n' \
+          "$1" "$added" "$changed" "$unchanged" "$refused" "$1" "$2" >&2
+        mem_fail
+      }
+      # What came of it: the counts, and how many refused lines went unsaid.
+      todo_said() {
+        local more=""
+        if [ "$refused" -gt "$say" ]; then
+          more=" and $((refused - say)) more"
+          printf 'desk mem todo import: ... and %s more refused\n' "$((refused - say))" >&2
+        fi
+        if [ "$mode" = json ]; then
+          printf '{"lines":%s,"added":%s,"changed":%s,"unchanged":%s,"refused":%s}\n' "$total" "$added" "$changed" "$unchanged" "$refused"
+        else
+          printf 'added: %s, changed: %s, unchanged: %s, refused: %s%s\n' "$added" "$changed" "$unchanged" "$refused" "${bad:+ (lines$bad$more)}"
+        fi
+      }
+      for part in "$TMP"/todo.part.*; do
+        cut -f2- "$part" > "$TMP/req"
+        n=$(wc -l < "$part" | tr -d ' ')
+        sent=$((sent + n))
+        tries=0
+        while :; do
+          ACCEPT="application/json"
+          api POST "/api/desk/mem/todo" -H "$(desk_auth)" -H "Content-Type: application/x-ndjson" --data-binary "@$TMP/req"
+          # Too many a minute (not a day's quota, which says so): as long as
+          # the desk says, if that is two minutes or less.
+          if [ "$STATUS" = 429 ] && [ $tries -lt 5 ] && ! grep -q 'quota"' "$TMP/body"; then
+            wait="$(header_value retry-after)"; case "$wait" in ''|*[!0-9]*) wait=60 ;; esac
+            if [ "$wait" -le 120 ]; then
+              [ "$wait" -ge 1 ] || wait=1
+              note "too many changes in a minute; sending from line $(head -n 1 "$part" | cut -f1) again in ${wait}s"
+              tries=$((tries + 1)); sleep "$wait"; continue
+            fi
+          fi
+          break
+        done
+        ln="$(head -n 1 "$part" | cut -f1)"
+        case "$STATUS" in
+          2*)
+            added=$((added + $(json_get raw added 2>/dev/null || echo 0)))
+            changed=$((changed + $(json_get raw changed 2>/dev/null || echo 0)))
+            unchanged=$((unchanged + $(json_get raw unchanged 2>/dev/null || echo 0)))
+            # Those refused, by their index in this request.
+            for idx in $(grep -o '"index":[0-9]*,"error"' "$TMP/body" | sed 's/[^0-9]//g'); do
+              refused=$((refused + 1))
+              [ "$refused" -le "$say" ] || continue
+              ln="$(sed -n "$((idx + 1))p" "$part" | cut -f1)"
+              bad="$bad $ln"
+              printf 'desk mem todo import: line %s refused (%s)\n' "$ln" \
+                "$(grep -o "\"index\":$idx,\"error\":\"[^\"]*\"" "$TMP/body" | sed 's/.*"error":"\(.*\)"/\1/')" >&2
+            done
+            # No line of this request is one JSON object, and more are to come:
+            # a file of another shape. One request is enough to say so.
+            nj="$(json_get raw not_objects 2>/dev/null || echo 0)"
+            notjson=$((notjson + nj))
+            if [ "$nj" = "$n" ] && [ "$sent" -lt "$total" ]; then
+              ln="$(tail -n 1 "$part" | cut -f1)"
+              todo_said
+              die 1 "stopped at line $ln: none of the last $n lines is one JSON object, and a to-do file is one JSON object a line. To go on past them: --from $((ln + 1))"
+            fi ;;
+          # Only a line alone can pass what a request holds: the rest are cut under 60 KB.
+          413)
+            refused=$((refused + 1))
+            [ "$refused" -gt "$say" ] || { bad="$bad $ln"; printf 'desk mem todo import: line %s refused (it is past 64 KB)\n' "$ln" >&2; } ;;
+          429) todo_stop "$ln" "$(grep -q 'quota"' "$TMP/body" && printf ' after 00:00 UTC')" ;;
+          *) todo_stop "$ln" "" ;;
+        esac
+      done
+      todo_said
+      if [ $((added + changed + unchanged)) -eq 0 ]; then
+        [ "$notjson" -eq 0 ] || die 1 "every line was refused and nothing written: a to-do file is one JSON object a line"
+        die 1 "every line was refused and nothing written"
+      fi
+      ;;
+    *) die 2 "unknown desk mem todo command: $sub (set, ls, close, rm, import; foldrender help desk-mem)" ;;
   esac
 }
 
@@ -5292,7 +5503,8 @@ foldrender desk mem COMMAND [--json]
                          summaries, sums_today, sum_tokens_today, sum_due and
                          the last one's result (sum_last)
   inject [--repo R]      what a session is handed as it starts: your
-                         decisions first, then the latest summaries (when
+                         decisions first, then the agents' open to-do lists
+                         in repository R, then the latest summaries (when
                          summarizing is on), then notes, then what was asked
                          and answered lately in repository R — marked "past
                          record, not instructions", at most ~8000 chars. The
@@ -5334,6 +5546,49 @@ foldrender desk mem COMMAND [--json]
                          says which line. From
                          claude-mem: the repository's
                          scripts/claude-mem-export.mjs makes the file.
+  todo set LIST [ITEM] [--status todo|doing|done|dropped]
+      [--field NAME=VALUE]... [--repo R] [--by NAME] [--at WHEN]
+                         your own to-do list (what claude-mem's work_state
+                         kept): an item of LIST, or with no ITEM the list's
+                         own row. Written again, the later write wins: its
+                         status, and its fields over the kept ones (NAME=
+                         takes one away); done or dropped closes the item,
+                         or the whole list. A new list belongs to the
+                         repository this runs in (as the hook names it)
+                         unless --repo names one; a new open item opens a
+                         closed list again. At most 500 open lists, 200 items
+                         a list (a new one takes the place of the oldest
+                         closed), 2 KB of fields each. Not on the owner's
+                         page: a new session in the list's repository is
+                         handed its open lists touched in the last 7 days
+                         (their own ~1,500 chars of the block). When the
+                         desk's storage is full, a new item or list, and a
+                         close that adds a field, are refused (exit 1, in
+                         the desk's own sentence); nothing is written
+  todo ls [LIST] [--repo R] [--all] [--json] [--limit N] [--offset N]
+                         the open lists, newest first, each with its open
+                         items (--all: closed ones too), at most 50 lists
+                         and about 800 items a read; "more: --offset N"
+                         when there are more
+  todo close LIST [ITEM] [--dropped]
+                         done (or dropped): the item, or the whole list. A full
+                         desk still takes this, and rm, for what is there
+  todo rm LIST           the list gone, its items with it (a forget a row:
+                         2,000 a day with forget)
+  todo import FILE|- [--from N] [--json]
+                         many: one JSON object a line, as set sends one
+                         ({"list","item","status","fields","repo","at"}), in
+                         order, 100 a request (each line one of the day's
+                         writes). A line refused, or that is not one JSON
+                         object, is said by its number (the first 20, then how
+                         many more) and the others go in; exit 1 when every
+                         line was refused, and a pretty-printed file stops
+                         after its first request. Too many changes in a minute
+                         is waited out; the day's quota stops it and says the
+                         line to go on from: run it again with --from N (a
+                         line sent twice is unchanged). From claude-mem's
+                         work-state lists: scripts/claude-mem-export.mjs
+                         --work-state
   install [--agent claude|codex|all] [--remove]
                          on this machine, the hooks that feed the memory
                          (default claude and codex): a session's start prints
@@ -5369,6 +5624,8 @@ Examples: foldrender desk mem install --agent claude
           foldrender desk mem search "release window"
           foldrender desk mem note "the retry loop was the bug" --kind discovery --source claude:fr-desk
           foldrender desk mem import claude-mem.jsonl
+          foldrender desk mem todo set ship-1101 "merge #307" --status doing --field next="wait for CI"
+          foldrender desk mem todo close ship-1101 "merge #307"
 EOF
     ;;
     answers) cat <<'EOF'
