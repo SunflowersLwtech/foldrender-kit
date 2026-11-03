@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.18.10
+FR_CLI_VERSION=0.18.12
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -39,7 +39,7 @@ FR_BRIDGE_SHA256=2c84e0e03270282d731935416436b439f9ebfeab85bf63637ac43ea97887092
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=fc4e326b59b501490c014b53e10ad188ecf9e731c80738595a58b57ef9c9fd5c
+FR_DESK_AGENT_SHA256=9a35b12fd3e6b6d042758274068d46dce17f814c66617fb689aaf3c8ce62235d
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -1784,14 +1784,17 @@ cmd_restore() {
 }
 
 restore_version() {
+  # A kept version's id is sixteen hex characters, all digits in about one of
+  # 1,845; a revision is at most fifteen digits (REV_NUM_RE in the Worker).
+  local what="rev"
+  case "$2" in *[!0-9]*|????????????????*) what="version" ;; esac
   api_auth POST "/api/artifacts/$PAGE_ID/versions/$2/restore"
   [ "$STATUS" != 404 ] || die 7 "no version $2 of $1 (see: foldrender log $1)"
   [ "$STATUS" != 409 ] || die 1 "rev $2 is already the page"
-  [ "$STATUS" != 410 ] || die 1 "the body of rev $2 is gone; its log entry stays (foldrender log $1)"
+  [ "$STATUS" != 410 ] || die 1 "the body of $what $2 is gone; its log entry stays (foldrender log $1)"
   expect_2xx
   read_page_url
   printf '%s\n' "$PAGE_URL"
-  case "$2" in *[!0-9]*) what="version" ;; *) what="rev" ;; esac
   note "restored $what $2${PAGE_ID:+ of $PAGE_ID}$( [ -n "$(field rev)" ] && printf ' as rev %s' "$(field rev)")"
 }
 
@@ -3902,10 +3905,10 @@ cmd_desk_mem() {
           # A day's quota: the same command after 00:00 UTC goes on (what is
           # kept costs nothing then); sent again today it is refused again.
           again="Run it again to go on."
-          [ "$STATUS" != 429 ] || ! grep -q -E '"code" *: *"quota"|^code: *quota' "$TMP/body" || again="Run it again after 00:00 UTC to go on; until then it is refused again."
+          [ "$STATUS" != 429 ] || ! day_limit || again="Run it again after 00:00 UTC to go on (what is already in costs nothing); until then it is refused again."
           at=$((sent + $(sed -n -e 's/^index: *\([0-9][0-9]*\).*/\1/p' -e 's/.*"index":\([0-9][0-9]*\).*/\1/p' "$TMP/body" | head -n 1 | grep . || echo 0) + 1))
-          printf 'desk mem import: stopped at line %s of %s; added %s, unchanged %s before it. %s\n' \
-            "$(sed -n "${at}p" "$TMP/import.nums")" "$(awk 'END { print NR }' "$file")" "$added" "$unchanged" "$again" >&2
+          printf 'desk mem import: stopped at line %s of %s; added %s, unchanged %s before it; %s of %s items are still to go. %s\n' \
+            "$(sed -n "${at}p" "$TMP/import.nums")" "$(awk 'END { print NR }' "$file")" "$added" "$unchanged" "$((total - at + 1))" "$total" "$again" >&2
           mem_fail
         fi
         added=$((added + $(grep -o '"result":"added"' "$TMP/body" | wc -l)))
@@ -4504,6 +4507,12 @@ desk_agent_token_ok() {
 # the assistant's replies, the sessions sent to work on it and what those
 # reported. Written with the desk's agent token (FOLDRENDER_DESK_TOKEN) or the
 # signed-in account, as the desk's cards are.
+# Whether the answer in $TMP/body is a day's limit: this desk's, this account's
+# share of every account's writes, or every account's. Asking again before 00:00
+# UTC gets the same answer.
+day_limit() {
+  grep -qE '"code" *: *"(quota|site_quota|account_quota)"|^code: *(quota|site_quota|account_quota)' "$TMP/body"
+}
 thread_fail() {
   local msg
   msg="$(error_text)"
@@ -4646,29 +4655,58 @@ cmd_thread() {
       rm -f "$TMP"/imp.*
       split -l 100 "$TMP/import" "$TMP/imp."
       local f tries total_t=0 total_r=0 total_l=0 total_s=0 total_u=0 total_k=0 total_h=0 total_n=0 n wait
+      local lines_all sent_lines=0 part_lines part_stopped
+      lines_all=$(awk 'END { print NR }' "$TMP/import")
+      thread_n() { local v; v="$(sed -n "s/.*\"$1\" *: *\\([0-9]*\\).*/\\1/p" "$TMP/body" | head -n 1)"; printf '%s' "${v:-0}"; }
+      thread_added() {
+        total_t=$((total_t + $(thread_n threads))); total_r=$((total_r + $(thread_n replies))); total_l=$((total_l + $(thread_n links)))
+        total_s=$((total_s + $(thread_n sessions))); total_u=$((total_u + $(thread_n unchanged))); total_k=$((total_k + $(thread_n skipped)))
+        total_h=$((total_h + $(thread_n hidden))); total_n=$((total_n + $(thread_n no_thread)))
+      }
+      thread_said() {
+        printf 'imported %s threads, %s replies, %s links, %s sessions; %s unchanged, %s skipped, %s with no thread\n' "$total_t" "$total_r" "$total_l" "$total_s" "$total_u" "$total_k" "$total_n"
+      }
       for f in "$TMP"/imp.*; do
         [ -s "$f" ] || continue
         tries=0
         while :; do
           ACCEPT="application/json"
           api POST "/api/desk/threads/import" -H "$(desk_auth)" -H "Content-Type: application/x-ndjson" --data-binary "@$f"
-          # Too many a minute: as long as the desk says, three times at most.
-          if [ "$STATUS" = 429 ] && [ $tries -lt 3 ] && ! grep -q '"quota"' "$TMP/body"; then
+          # Too many a minute: as long as the desk says, three times at most. A
+          # day's limit, or a wait in hours, is not waited for.
+          if [ "$STATUS" = 429 ] && [ $tries -lt 3 ] && ! day_limit; then
             wait="$(header_value retry-after)"; case "$wait" in ''|*[!0-9]*) wait=20 ;; esac
+            [ "$wait" -le 120 ] || break
             tries=$((tries + 1)); sleep "$wait"; continue
           fi
           break
         done
+        part_lines=$(awk 'END { print NR }' "$f")
+        # A day's limit: what went is kept, and the same command tomorrow goes on
+        # (a line already there is not written twice). The
+        # desk says how many of this part's lines did not go; none said, none went.
+        if [ "$STATUS" = 429 ] && day_limit; then
+          thread_added
+          part_stopped="$(thread_n stopped)"
+          [ "$part_stopped" -gt 0 ] || part_stopped="$part_lines"
+          n=$((lines_all - sent_lines - part_lines + part_stopped))
+          if [ "$mode" = json ]; then
+            cat "$TMP/body"; printf '\n'
+            printf '{"stopped":true,"lines":%s,"to_go":%s}\n' "$lines_all" "$n"
+          else
+            thread_said
+          fi
+          printf 'thread import: up to %s of %s lines are still to go. Run the same command after 00:00 UTC to go on: what is already in is not written again.\n' "$n" "$lines_all" >&2
+          thread_fail
+        fi
         [ "${STATUS#2}" != "$STATUS" ] || thread_fail
+        sent_lines=$((sent_lines + part_lines))
         [ "$mode" != json ] || { cat "$TMP/body"; printf '\n'; continue; }
-        thread_n() { local v; v="$(sed -n "s/.*\"$1\" *: *\\([0-9]*\\).*/\\1/p" "$TMP/body" | head -n 1)"; printf '%s' "${v:-0}"; }
-        total_t=$((total_t + $(thread_n threads))); total_r=$((total_r + $(thread_n replies))); total_l=$((total_l + $(thread_n links)))
-        total_s=$((total_s + $(thread_n sessions))); total_u=$((total_u + $(thread_n unchanged))); total_k=$((total_k + $(thread_n skipped)))
-        total_h=$((total_h + $(thread_n hidden))); total_n=$((total_n + $(thread_n no_thread)))
+        thread_added
         grep -o '"line":[0-9]*,"why":"[^"]*"' "$TMP/body" | sed 's/"line":\([0-9]*\),"why":"\(.*\)"/skipped a line (\1 of its part): \2/' >&2
       done
       [ "$mode" != json ] || return 0
-      printf 'imported %s threads, %s replies, %s links, %s sessions; %s unchanged, %s skipped, %s with no thread\n' "$total_t" "$total_r" "$total_l" "$total_s" "$total_u" "$total_k" "$total_n"
+      thread_said
       [ "$total_h" = 0 ] || note "$total_h piece(s) that looked like a secret were kept as [hidden]"
       ;;
     ref)
@@ -5305,7 +5343,12 @@ foldrender thread COMMAND [--json]
   import FILE|-        lines of JSON: the assistant's threads.jsonl ({type:
                        thread|reply|link, ...}) and its record of the sessions
                        it started ({machine, name, kind, at, closed}); 100 lines
-                       a request, safe to run again (nothing is added twice)
+                       a request, safe to run again (nothing is added twice, and
+                       20 lines already there cost what one new line does). An
+                       import writes about 2,500 thread lines a day at most
+                       (half of an account's share): past that it stops, exit
+                       4, says how many lines are still to go, and the same
+                       command after 00:00 UTC goes on
   hook install claude|codex [--author NAME] [--channel C] [--skip-file FILE]
                        put the two hooks into the agent's settings: each
                        message it gets becomes a thread, its last reply of
@@ -5537,7 +5580,9 @@ foldrender desk mem COMMAND [--json]
                          up to 100 (and 60 KB) a request. With
                          "basis":"imported" and a source of each item's own,
                          each is kept once, so the same file sent again
-                         (after a quota or a failure) adds only what is not
+                         (after a quota or a failure; one account writes about
+                         3,000 notes a day at most, exit 4 and it says how many
+                         are still to go) adds only what is not
                          there yet; what is already there costs none of the
                          day's writes, and an item forgotten (forget
                          --source) stays forgotten. Stopped by the day's
