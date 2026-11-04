@@ -29,6 +29,8 @@ foldrender whoami
 
 ## 3. Publish
 
+Run the command yourself, in a shell — it is the same command on every machine and in every agent. Never go through the host app's own artifact, canvas or preview feature: a page made there stays inside that vendor, with no `foldrender.dev` address, and `foldrender read` cannot reach it.
+
 ```
 foldrender publish /path/to/page.html
 ```
