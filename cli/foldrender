@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.18.12
+FR_CLI_VERSION=0.18.13
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -39,7 +39,7 @@ FR_BRIDGE_SHA256=2c84e0e03270282d731935416436b439f9ebfeab85bf63637ac43ea97887092
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=9a35b12fd3e6b6d042758274068d46dce17f814c66617fb689aaf3c8ce62235d
+FR_DESK_AGENT_SHA256=59ce5ab722918ac445410f59b7bc92afe21133b94bba2f3bf790e0f489014c60
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -5474,8 +5474,12 @@ on for your account; until then at /desk?v2=1). Every question is a card of
 one shape, answered the same way: agree to your suggestion, another option,
 "not now, ask me tomorrow" (the page adds it), or the owner's own words. An
 answer is a draft until the owner presses Send (发给你的 agent); nothing else
-sends it. What they send reaches their agents as one batch, from the outbox,
-and can be taken back until it is marked done.
+sends it. One press sends every answer they ticked, as batches of at most 20;
+each reaches their agents from the outbox, and can be taken back until it is
+marked done. Answers they copy for Feishu (复制去飞书) and paste into the
+assistant's chat themselves are handed over too, as batches sent_by copy: the
+outbox never hands one on (the assistant has it from the chat), and in answers
+its words begin by saying not to act on it again.
   card KEY --question "one line" --suggest "what you would do"
       [--context TEXT (300)] [--option LABEL]... (at most 2) [--heavy]
       [--deadline 2026-10-23[T10:00]] [--product P] [--by SESSION]
@@ -5499,7 +5503,8 @@ and can be taken back until it is marked done.
   cards                the open cards: KEY, revision, how far its answer is
   outbox               what the owner sent and you have not been handed: each
                        #ID with the words to hand on (a batch of answers, an
-                       answer taken back, or a warning that too much waits)
+                       answer taken back, or a warning that too much waits);
+                       never a batch they copied for Feishu
   outbox ack ID...     you have them (until then they are handed again)
   answers [--since NEXT] [--limit N]
                        what the owner sent, for you alone: each batch (and
@@ -5510,7 +5515,10 @@ and can be taken back until it is marked done.
                        next (--since NEXT reads from there again). Your place
                        moves when the desk answers: keep the next of the last
                        read you handled, and after a read that failed, read
-                       again with --since that next
+                       again with --since that next. A batch sent_by copy the
+                       owner pasted into the assistant's chat: do not act on
+                       it again because you read it here (its words say so);
+                       the one doing it marks it as usual
   mark BATCH read|doing|done [--result "one sentence"] [--key KEY]... [--all]
                        how far you are with a batch's answers: KEY's (a
                        --key each), or --all of them alike. A batch of one
