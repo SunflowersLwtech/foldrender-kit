@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.18.13
+FR_CLI_VERSION=0.19.0
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -39,7 +39,7 @@ FR_BRIDGE_SHA256=2c84e0e03270282d731935416436b439f9ebfeab85bf63637ac43ea97887092
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=59ce5ab722918ac445410f59b7bc92afe21133b94bba2f3bf790e0f489014c60
+FR_DESK_AGENT_SHA256=0e4c969f648a0ae95898bf799de29be2417933e9fe879b9c31610345e1f27feb
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -3271,7 +3271,7 @@ cmd_desk() {
       key="${1:-}"
       [ $# -eq 0 ] || shift
       case "$key" in ''|-*) die 2 "desk $sub KEY ...: KEY names the thing (letters, digits, . _ : -), the same key again changes it" ;; esac
-      local title="" product="" state="" context="" suggest="" deadline="" need="" heavy="" input="" device="" minutes="" session="" next="" at="" star="" match="" until="" reply="" base=""
+      local title="" product="" state="" context="" suggest="" deadline="" need="" heavy="" input="" device="" minutes="" session="" next="" at="" star="" match="" until="" reply="" base="" heartbeat=""
       local opts=() links=()
       while [ $# -gt 0 ]; do
         case "$1" in
@@ -3288,6 +3288,11 @@ cmd_desk() {
           --device) need $# "$1"; device="$2"; shift 2 ;;
           --minutes) need $# "$1"; minutes="$2"; shift 2 ;;
           --session) need $# "$1"; session="$2"; shift 2 ;;
+          --heartbeat)
+            # --heartbeat alone: the desk's own window (90 min by default).
+            heartbeat=watch
+            case "${2:-}" in ''|-*) ;; *[!0-9]*) die 2 "--heartbeat is minutes (a number), or nothing for the desk's default" ;; *) heartbeat="$2"; shift ;; esac
+            shift ;;
           --next) need $# "$1"; next="$2"; shift 2 ;;
           --at) need $# "$1"; at="$(desk_when "$2")" || exit 2; shift 2 ;;
           --star) star=1; shift ;;
@@ -3301,7 +3306,9 @@ cmd_desk() {
         esac
       done
       [ -n "$title" ] || die 2 "desk $sub needs --title (desk known: --note)"
+      [ "$sub" = task ] || [ -z "$heartbeat" ] || die 2 "--heartbeat is for desk task"
       case "$minutes" in ''|[0-9]|[0-9][0-9]|[0-9][0-9][0-9]) ;; *) die 2 "--minutes is a number" ;; esac
+      case "$heartbeat" in ''|watch) ;; 0*) die 2 "--heartbeat is at least 1 minute" ;; [0-9]|[0-9][0-9]|[0-9][0-9][0-9]|[0-9][0-9][0-9][0-9]) ;; *) die 2 "--heartbeat is minutes (a number), or nothing for the desk's default" ;; esac
       [ ${#opts[@]} -le 3 ] || die 2 "at most 3 --option"
       local body="" i=1 o ol=""
       for o in ${opts[@]+"${opts[@]}"}; do ol="$ol${ol:+,}{\"id\":\"o$i\",\"label\":$(json_arg "$o")}"; i=$((i + 1)); done
@@ -3315,6 +3322,8 @@ cmd_desk() {
       [ -z "$device" ] || body="$body,\"device\":$(json_arg "$device")"
       [ -z "$minutes" ] || body="$body,\"minutes\":$minutes"
       [ -z "$session" ] || body="$body,\"session\":$(json_arg "$session")"
+      if [ "$heartbeat" = watch ]; then body="$body,\"watch\":true"
+      elif [ -n "$heartbeat" ]; then body="$body,\"heartbeat_min\":$heartbeat"; fi
       [ -z "$next" ] || body="$body,\"next_check\":$(json_arg "$next")"
       [ -z "$at" ] || body="$body,\"at\":$(json_arg "$at")"
       [ -z "$star" ] || body="$body,\"star\":true"
@@ -3349,6 +3358,66 @@ cmd_desk() {
       if [ "$mode" = json ]; then cat "$TMP/body"; printf '\n'
       elif [ "$sub" = done ]; then printf 'done: %s\n' "${keys[*]}"
       else printf 'removed: %s\n' "$(sed -n 's/.*"removed":\[\([^]]*\)\].*/\1/p' "$TMP/body" | tr -d '"' | sed 's/,/ /g')"; fi
+      ;;
+    fail)
+      key="${1:-}"
+      [ $# -eq 0 ] || shift
+      case "$key" in ''|-*) die 2 "desk fail KEY --why TEXT: KEY names the task that failed" ;; esac
+      local why="" title="" product="" session=""
+      local links=()
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --why) need $# "$1"; why="$2"; shift 2 ;;
+          --title) need $# "$1"; title="$2"; shift 2 ;;
+          --product) need $# "$1"; product="$2"; shift 2 ;;
+          --session) need $# "$1"; session="$2"; shift 2 ;;
+          --link) need $# "$1"; links+=("$2"); shift 2 ;;
+          *) die 2 "desk fail: unknown option $1 (foldrender help desk)" ;;
+        esac
+      done
+      [ -n "$why" ] || die 2 "desk fail needs --why \"one sentence\""
+      local f="{\"key\":$(json_arg "$key"),\"why\":$(json_arg "$why")"
+      [ -z "$title" ] || f="$f,\"title\":$(json_arg "$title")"
+      [ -z "$product" ] || f="$f,\"product\":$(json_arg "$product")"
+      [ -z "$session" ] || f="$f,\"session\":$(json_arg "$session")"
+      [ ${#links[@]} -eq 0 ] || f="$f,\"links\":$(desk_links "${links[@]}")"
+      printf '{"fail":[%s]}' "$f}" > "$TMP/req"
+      desk_api POST /items -H "Content-Type: application/json" --data-binary "@$TMP/req"
+      [ "${STATUS#2}" != "$STATUS" ] || desk_fail
+      desk_written "$mode"
+      ;;
+    alerts)
+      local aop="${1:-ls}" astatus="all"
+      [ $# -eq 0 ] || shift
+      case "$aop" in
+        ls|"")
+          while [ $# -gt 0 ]; do
+            case "$1" in
+              --status) need $# "$1"; astatus="$2"; shift 2 ;;
+              *) die 2 "desk alerts [--status open|acked|resolved|all]" ;;
+            esac
+          done
+          case "$astatus" in open|acked|resolved|all) ;; *) die 2 "--status is open, acked, resolved or all" ;; esac
+          ACCEPT="text/plain"
+          [ "$mode" != json ] || ACCEPT="application/json"
+          desk_api GET "/alerts?status=$astatus"
+          [ "${STATUS#2}" != "$STATUS" ] || desk_fail
+          grep -q . "$TMP/body" || printf 'no alerts\n'
+          cat "$TMP/body"
+          ;;
+        ack)
+          local akey="${1:-}"
+          [ $# -eq 0 ] || shift
+          case "$akey" in ''|*[!A-Za-z0-9_.:-]*) die 2 "desk alerts ack KEY (the task's key, from desk alerts)" ;; esac
+          [ $# -eq 0 ] || die 2 "desk alerts ack KEY takes no options"
+          printf '{"key":%s}' "$(json_arg "$akey")" > "$TMP/req"
+          desk_api POST /alerts/ack -H "Content-Type: application/json" --data-binary "@$TMP/req"
+          [ "${STATUS#2}" != "$STATUS" ] || desk_fail
+          [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+          printf 'acknowledged: %s\n' "$akey"
+          ;;
+        *) die 2 "desk alerts [--status ...] | desk alerts ack KEY" ;;
+      esac
       ;;
     feed)
       local source="${1:-}" file="${2:-}"
@@ -3410,13 +3479,16 @@ cmd_desk() {
       # key goes into the path of --close, where ? or / would change the request.
       local key_re='^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$'
       [[ "$key" =~ $key_re ]] || die 2 "desk card KEY --question Q --suggest S ...: KEY names the card (1 to 80 letters, digits, . _ : -, starting with a letter or digit), the same key again rewrites it"
-      local question="" suggest="" context="" product="" by="" machine="" deadline="" heavy="" close="" why=""
+      local question="" suggest="" context="" product="" by="" machine="" deadline="" heavy="" close="" why="" force="" from="" changed="" reason=""
       local opts=() links=() imgs=()
       while [ $# -gt 0 ]; do
         case "$1" in
           --question) need $# "$1"; question="$2"; shift 2 ;;
           --suggest) need $# "$1"; suggest="$2"; shift 2 ;;
           --context) need $# "$1"; context="$2"; shift 2 ;;
+          --from) need $# "$1"; from="$2"; shift 2 ;;
+          --changed) need $# "$1"; changed="$2"; shift 2 ;;
+          --reason) need $# "$1"; reason="$2"; shift 2 ;;
           --option) need $# "$1"; opts+=("$2"); shift 2 ;;
           --product) need $# "$1"; product="$2"; shift 2 ;;
           --by) need $# "$1"; by="$2"; shift 2 ;;
@@ -3427,14 +3499,29 @@ cmd_desk() {
           --image) need $# "$1"; imgs+=("$2"); shift 2 ;;
           --close) close=1; shift ;;
           --done) [ -n "$close" ] || die 2 "--done goes with --close"; why=done; shift ;;
+          --force) [ -n "$close" ] || die 2 "--force goes with --close"; force=1; shift ;;
           --title|--hands|--input|--device|--minutes) die 2 "desk card has no $1: every card is answered the same way (agree, another option, not now, or the owner's own words); the question is --question, and what you would do is --suggest" ;;
           *) die 2 "desk card: unknown option $1 (foldrender help desk)" ;;
         esac
       done
       if [ -n "$close" ]; then
-        [ -z "$question$suggest$context$product$by$machine$deadline$heavy" ] && [ ${#opts[@]} -eq 0 ] && [ ${#links[@]} -eq 0 ] && [ ${#imgs[@]} -eq 0 ] \
-          || die 2 "--close takes only --done (a card is written, or taken off, not both)"
-        desk2_api DELETE "/cards/$key${why:+?why=done}"
+        [ -z "$question$suggest$context$product$by$machine$deadline$heavy$from$changed" ] && [ ${#opts[@]} -eq 0 ] && [ ${#links[@]} -eq 0 ] && [ ${#imgs[@]} -eq 0 ] \
+          || die 2 "--close takes only --done and --reason (a card is written, or taken off, not both)"
+        [ -z "$reason" ] || [ "${#reason}" -le 120 ] || die 2 "--reason is one line of at most 120 characters"
+        # A card holding the owner's draft is refused (409 owner_draft) unless
+        # --force: the draft is never lost, but the owner may still answer it.
+        local cq="${why:+why=done}"
+        [ -z "$force" ] || cq="$cq${cq:+&}force=1"
+        # Taken off with no answer on it: why (required by the desk then), in
+        # the archive the owner reads.
+        [ -z "$reason" ] || cq="$cq${cq:+&}reason=$(urlencode "$reason")"
+        desk2_api DELETE "/cards/$key${cq:+?$cq}"
+        if [ "$STATUS" = 409 ] && [ "$(json_field code)" = owner_draft ] && [ "$mode" != json ]; then
+          die 1 "$(json_field error)"
+        fi
+        if [ "$STATUS" = 422 ] && [ "$(json_field code)" = reason_required ] && [ "$mode" != json ]; then
+          die 1 "$(json_field error)"
+        fi
         [ "${STATUS#2}" != "$STATUS" ] || desk2_fail
         [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
         # An answer the owner picked on it and had not sent stays theirs (the
@@ -3443,7 +3530,7 @@ cmd_desk() {
         local kept
         kept="$(json_get raw unsent_draft 2>/dev/null)" || kept=""
         if [ "$kept" = true ]; then
-          printf "took %s off the desk; the owner's draft on it was kept, not sent (theirs to send or drop)\n" "$key"
+          printf "took %s off the desk; the owner's draft on it is not lost: the card stays on their page, marked taken off, theirs to send or delete (nothing was sent)\n" "$key"
         else
           printf 'took %s off the desk\n' "$key"
         fi
@@ -3475,6 +3562,8 @@ cmd_desk() {
       for o in ${opts[@]+"${opts[@]}"}; do ol="$ol${ol:+,}$(json_arg "$o")"; done
       body="\"key\":$(json_arg "$key"),\"question\":$(json_arg "$question"),\"suggest\":$(json_arg "$suggest")"
       [ -z "$context" ] || body="$body,\"context\":$(json_arg "$context")"
+      [ -z "$from" ] || body="$body,\"from\":$(json_arg "$from")"
+      [ -z "$changed" ] || body="$body,\"changed\":$(json_arg "$changed")"
       [ -z "$ol" ] || body="$body,\"options\":[$ol]"
       [ -z "$product" ] || body="$body,\"product\":$(json_arg "$product")"
       [ -z "$by" ] || body="$body,\"by\":$(json_arg "$by")"
@@ -3483,8 +3572,22 @@ cmd_desk() {
       [ -z "$heavy" ] || body="$body,\"heavy\":true"
       [ ${#links[@]} -eq 0 ] || body="$body,\"links\":$(desk_links "${links[@]}")"
       [ -z "$il" ] || body="$body,\"images\":[$il]"
-      printf '{"cards":[{%s}]}' "$body" > "$TMP/req"
+      # strict: the desk reads the card for what the owner needs to answer it
+      # (where it came from, a background of a few sentences, no session name,
+      # no bare number) and refuses a rewrite that says nothing about what it
+      # changed (2026-11-05).
+      printf '{"cards":[{%s}],"strict":true}' "$body" > "$TMP/req"
+      # Asked for JSON: a refusal's reasons (the room's problems, a line a
+      # card) are in it, and a text answer would say only that it refused.
+      local acc=$ACCEPT
+      ACCEPT="application/json"
       desk2_api POST /cards -H "Content-Type: application/json" --data-binary "@$TMP/req"
+      ACCEPT="$acc"
+      if [ "$STATUS" = 422 ] && grep -q '"code":"strict"' "$TMP/body" && [ "$mode" != json ]; then
+        # The desk's own words for each card, a line each.
+        sed -n 's/.*"problems":\[\(.*\)\].*/\1/p' "$TMP/body" | tr '{' '\n' | sed -n 's/.*"error":"\([^"]*\)".*/\1/p' | sed 's/^/  - /' >&2
+        die 1 "the card was not written: what the owner needs to answer it is missing (above); --from, --context, --changed"
+      fi
       [ "${STATUS#2}" != "$STATUS" ] || desk2_fail
       [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
       grep -q '"code":"full"' "$TMP/body" && die 1 "the desk holds as many open questions as it can: take one off first (desk card KEY --close)"
@@ -3551,11 +3654,13 @@ cmd_desk() {
       [ $# -lt 2 ] || shift 2
       case "$batch" in ''|*[!0-9]*) die 2 "desk mark BATCH read|doing|done [--result TEXT] [--key KEY]... [--all] [--correct]" ;; esac
       case "$st" in read|doing|done) ;; *) die 2 "desk mark BATCH read|doing|done [--result TEXT] [--key KEY]... [--all] [--correct]" ;; esac
-      local keys=() kl="" k marked unchanged
+      local keys=() kl="" k marked unchanged machine="" link=""
       while [ $# -gt 0 ]; do
         case "$1" in
           --result) need $# "$1"; result="$2"; shift 2 ;;
           --key) need $# "$1"; keys+=("$2"); shift 2 ;;
+          --machine) need $# "$1"; machine="$2"; shift 2 ;;
+          --link) need $# "$1"; link="$2"; shift 2 ;;
           --all) all=1; shift ;;
           --correct) correct=1; shift ;;
           *) die 2 "desk mark: unknown option $1 (foldrender help desk)" ;;
@@ -3564,7 +3669,7 @@ cmd_desk() {
       [ -z "$result" ] || [ "$st" != read ] || die 2 "--result goes with doing or done"
       for k in ${keys[@]+"${keys[@]}"}; do kl="$kl${kl:+,}$(json_arg "$k")"; done
       [ -z "$all" ] || [ -z "$kl" ] || die 2 "--key or --all, not both"
-      printf '{"state":"%s"%s%s%s%s}' "$st" "${result:+,\"result\":$(json_arg "$result")}" "${kl:+,\"keys\":[$kl]}" "${all:+,\"all\":true}" "${correct:+,\"correct\":true}" > "$TMP/req"
+      printf '{"state":"%s"%s%s%s%s%s%s}' "$st" "${result:+,\"result\":$(json_arg "$result")}" "${kl:+,\"keys\":[$kl]}" "${all:+,\"all\":true}" "${correct:+,\"correct\":true}" "${machine:+,\"machine\":$(json_arg "$machine")}" "${link:+,\"link\":$(json_arg "$link")}" > "$TMP/req"
       desk2_api POST "/batches/$batch/mark" -H "Content-Type: application/json" --data-binary "@$TMP/req"
       if [ "${STATUS#2}" = "$STATUS" ]; then
         # Which answers, and whose: the desk's own words (they name the keys).
@@ -5416,12 +5521,37 @@ foldrender desk COMMAND [--desk ID] [--json]
       [--input]  answered by writing (no "agree"; --suggest says how to fill it)
   task KEY --title T [--product P] [--state doing|you|external] [--session NAME]
       [--next "10-23 10:00 check"] [--link URL[=LABEL]]...
+      [--heartbeat [MIN]]  watch this task: the desk marks it failed and
+                       pushes you when it hears nothing for MIN minutes
+                       (default 90), or when its --session ends or disappears
+  fail KEY --why "one sentence" [--title T] [--product P] [--session NAME]
+      [--link URL[=LABEL]]...
+                       mark a task failed; it floats to the top of Running in
+                       red with the reason, and the desk pushes you once (the
+                       same failure twice is one push; the owner's ack stops
+                       it). Writing the task again recovers it (one push)
   timer KEY --title T --at 2026-10-23T10:00 [--star]
   known KEY --match "text of an alert" --note "why it is known" [--until WHEN]
   done KEY... [--note "what was done"]   rm KEY...
+  alerts [--status open|acked|resolved|all]
+                       the desk's pushes, newest first, with what each said
+  alerts ack KEY      the owner has seen this failure: no more pushes for it
+                       (the page's 知道了 button does the same)
   feed SOURCE FILE.json|-   a snapshot: {"every_s": 60, "items": [{key, kind:
-                       session|host|seat|alert|timer, title, product?, state?,
-                       body?}]}; what it no longer names is removed
+                       session|host|seat|alert|timer|peer|message, title,
+                       product?, state?, body?}]}; what it no longer names is
+                       removed. peer and message are an agent messaging
+                       system's (the mesh), drawn on the desk's Mesh page
+                       (https://foldrender.dev/desk/mesh): a peer is one session
+                       on it, state busy|idle|away|unknown, body {machine,
+                       account?, ref?, harness?, model?, mode?, where?}; a
+                       message is one message, key its id, state
+                       sent|delivered|read|failed, body {msg_id, from {name,
+                       machine?, account?, ref?}, to {...}, sent_at, at?,
+                       latency_ms?, via?, bytes?}. Keep a body to what changes
+                       with its state: a field that changes every snapshot
+                       (an age, a last-seen time) rewrites the row each time
+                       and spends the desk's writes for the day
   ls                   the desk as text (also: foldrender read desk, your
                        own desk wherever it is; FOLDRENDER_DESK names another)
   inbox [--all] [--after ID]
@@ -5481,25 +5611,43 @@ assistant's chat themselves are handed over too, as batches sent_by copy: the
 outbox never hands one on (the assistant has it from the chat), and in answers
 its words begin by saying not to act on it again.
   card KEY --question "one line" --suggest "what you would do"
-      [--context TEXT (300)] [--option LABEL]... (at most 2) [--heavy]
+      --from "where it came from" [--context TEXT (600)]
+      [--option LABEL]... (at most 2) [--heavy]
       [--deadline 2026-10-23[T10:00]] [--product P] [--by SESSION]
       [--machine M] [--link URL[=LABEL]]... (at most 3)
       [--image FILE[=LABEL]]... (at most 3)
+      [--changed "what this rewrite changed"]   (a rewrite of an existing KEY)
                        write the card (the same KEY again rewrites it: a new
                        revision when its words change). No --title, --hands,
                        --input: the question is --question, and what you would
                        do (or the default, when you need the owner to tell you
-                       something) is --suggest. Refused: no suggestion, a
+                       something) is --suggest.
+                       --from: where it came from, in the owner's words (a
+                       product and what happened, not a session's name): the
+                       page shows it above the question.
+                       --context: the background the owner answers from —
+                       where it came from, where it stands, why it is theirs to
+                       decide, what each answer does — at least 60 characters.
+                       Refused (422, each reason named): no suggestion, no
+                       --from, a background under 60 characters, a worker
+                       session's name in it (the owner does not know who
+                       hm-ship or pr-captain is), a bare #113 with no words
+                       saying what it is, a rewrite with no --changed, a
                        question past 80 characters or on two lines, more than
                        2 options, anything that looks like a secret.
                        --image: a picture the question shows (a PNG, JPEG or
                        WebP, at most 200 KB; LABEL one line of at most 40
                        characters), sent first as desk image does
-  card KEY --close [--done]
+  card KEY --close [--done] [--reason "why"] [--force]
                        take it off the desk (it is not needed any more).
-                       Nothing is sent: an answer the owner picked on it and
-                       has not sent stays theirs, the card with it on their
-                       page, and the command says so
+                       Nothing is sent. A card the owner has picked an answer
+                       on and not sent is refused (exit 1, owner_draft): they
+                       may still answer it. --force takes it off all the same,
+                       and what they picked and has not sent stays theirs: the
+                       card stays on their page, marked taken off, to send or
+                       delete, and the command says so. Taken off with no
+                       answer of theirs on it, --reason is required: it is what
+                       the owner's archive says about why it is not needed
   cards                the open cards: KEY, revision, how far its answer is
   outbox               what the owner sent and you have not been handed: each
                        #ID with the words to hand on (a batch of answers, an
@@ -5520,6 +5668,7 @@ its words begin by saying not to act on it again.
                        it again because you read it here (its words say so);
                        the one doing it marks it as usual
   mark BATCH read|doing|done [--result "one sentence"] [--key KEY]... [--all]
+      [--machine M] [--link URL]
                        how far you are with a batch's answers: KEY's (a
                        --key each), or --all of them alike. A batch of one
                        answer needs neither; one of several is refused
@@ -5611,8 +5760,14 @@ foldrender desk mem COMMAND [--json]
                          unless --repo names one; a new open item opens a
                          closed list again. At most 500 open lists, 200 items
                          a list (a new one takes the place of the oldest
-                         closed), 2 KB of fields each. Not on the owner's
-                         page: a new session in the list's repository is
+                         closed), 2 KB of fields each. The owner sees the
+                         open lists on their desk page (待办 / To-do), and
+                         may add an item there, set one's status or close a
+                         list: what they set is by "owner", and an item they
+                         add says "from the owner" in todo ls (--json:
+                         from_owner) and in a new session's block, theirs to
+                         have done (--by owner is refused, the name is
+                         theirs). A new session in the list's repository is
                          handed its open lists touched in the last 7 days
                          (their own ~1,500 chars of the block). When the
                          desk's storage is full, a new item or list, and a
