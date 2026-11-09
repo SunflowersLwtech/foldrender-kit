@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.19.1
+FR_CLI_VERSION=0.19.2
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -39,7 +39,7 @@ FR_BRIDGE_SHA256=2c84e0e03270282d731935416436b439f9ebfeab85bf63637ac43ea97887092
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=d925a95dfb9864ee03ddf4388138afd8376e7a42799c23e01c09162834865797
+FR_DESK_AGENT_SHA256=55eea935b61d447ef2dfe0d79713d37776e8b93e5e8c13fa2a40dbe1fcfc1028
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -5343,7 +5343,7 @@ foldrender publish FILE...|- [options]
   (a dropped connection is retried twice by itself).
   --private            only you (the default for a new page)
   --link               anyone with the link; the link carries a key (?k=)
-  --public             anyone, and listed on your page .../artifacts/LOGIN/
+  --public             anyone with its address (no key); listed nowhere
   --share a,b          only these GitHub logins
   --name NAME          the address's last part (default: from the title)
   --folder FOLDER      .../artifacts/LOGIN/FOLDER/NAME
@@ -6034,7 +6034,7 @@ foldrender share PAGE... [+LOGIN ...] [-LOGIN ...] [--private|--shared|--link|--
                        last one removed makes a shared page private again
   --shared             Only people added: the logins on its list, signed in
   --link               Anyone with the link (it carries a key; listed nowhere)
-  --public             Public: anyone, and listed on .../artifacts/LOGIN/
+  --public             Public: anyone with its address (no key); listed nowhere
   --reset-link         a new key for a --link page: the old link stops working
   --collab             readers who sign in can write on it (ink, notes, and
                        answering its choices); --no-collab turns it off
