@@ -1,0 +1,18 @@
+{
+  "name": "foldrender",
+  "owner": {
+    "name": "DuoCode Technology",
+    "url": "https://foldrender.dev"
+  },
+  "metadata": {
+    "description": "FoldRender: publish HTML pages as links and read them back."
+  },
+  "plugins": [
+    {
+      "name": "foldrender",
+      "source": "./",
+      "description": "Publish an HTML page as a link that opens on any device, and read FoldRender pages back as text.",
+      "version": "0.21.0"
+    }
+  ]
+}

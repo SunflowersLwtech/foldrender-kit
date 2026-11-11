@@ -1,0 +1,34 @@
+{
+  "name": "foldrender",
+  "version": "0.21.0",
+  "description": "Publish an HTML page as a link that opens on any device, put several pages on one canvas, and read FoldRender pages, comments and answers back as text.",
+  "author": {
+    "name": "DuoCode Technology",
+    "url": "https://foldrender.dev"
+  },
+  "homepage": "https://foldrender.dev/share",
+  "repository": "https://github.com/SunflowersLwtech/foldrender-kit",
+  "license": "Apache-2.0",
+  "keywords": ["html", "publish", "share", "link", "canvas", "report"],
+  "skills": "./skills/",
+  "requires_local_executor": true,
+  "interface": {
+    "displayName": "FoldRender",
+    "shortDescription": "Share HTML pages as links",
+    "longDescription": "Turn an HTML page you made with Codex (a report, a diagram, an explainer, a dashboard) into a link that opens on a phone, a tablet or a computer, and choose who can see it. Put several pages on one canvas with notes and connectors, ask the reader to answer a question with a tap, and read pages, comments and answers back as clean text.\n\nThe plugin runs the foldrender command on your computer, so it needs a local Codex session with a shell; it installs the command from foldrender.dev when it is missing. Pages are stored by FoldRender under your account, which you sign in to with GitHub. Pages are private unless you share them.",
+    "developerName": "DuoCode Technology",
+    "category": "Productivity",
+    "capabilities": ["Publish an HTML page as a link", "Put pages on a canvas", "Read a page back as text", "Read comments and answers"],
+    "websiteURL": "https://foldrender.dev",
+    "supportURL": "https://github.com/SunflowersLwtech/foldrender-kit/issues",
+    "privacyPolicyURL": "https://foldrender.dev/privacy",
+    "termsOfServiceURL": "https://foldrender.dev/terms",
+    "defaultPrompt": [
+      "Publish report.html as a private link I can open on my phone.",
+      "Put these three pages on one canvas and give me the link.",
+      "Read the comments people left on my FoldRender page."
+    ],
+    "composerIcon": "./assets/icon.png",
+    "logo": "./assets/icon.png"
+  }
+}

@@ -367,13 +367,19 @@ foldrender pack show pr321-review                            # paste this into t
 - `--name NAME` gives it a handle: the same name and items again write nothing (safe to rerun); other items under the name make a new pack that takes the name, and the old one stays by its id. A pack never changes once made. `foldrender pack ls`, `foldrender pack rm ID|NAME`. The user's sign-in or the desk's agent token (`FOLDRENDER_DESK_TOKEN`) makes and reads them; one account's packs never reach another. To give one to someone outside the account, publish what `pack show` prints as a page and share that page.
 - Limits: 100 packs an account; 100 makes (dry runs too) and 1,000 reads a day. `foldrender help pack`.
 
-## 9. Free plan limits
+## 9. Plans and limits
 
-- 10 pages.
-- Each page expires 30 days after it was published.
-- 5 MB per page.
+- Free: 10 pages, each expiring 30 days after it was published, 5 MB per page.
+- Pro: 1,000 pages, 2 GB in all, no expiry; $10 a month or $96 a year (USD; tax may apply).
+- Every kind of page (a page, a canvas, a sheet) counts as one page. Team and Enterprise are sold by email (sales@duocodetech.com), not from the command.
+- The plans and their limits, as the site has them: https://foldrender.dev/pricing, or `GET https://foldrender.dev/artifacts/api/billing/plans` (JSON, no sign-in).
 
-If a publish fails with "free plan limit reached", tell the user the limit. Run `foldrender ls --all` and offer to delete a page they no longer need. Do not delete anything without asking.
+If a publish fails with "plan limit reached" (exit 4), tell the user the limit. Offer either to delete a page they no longer need (`foldrender ls --all`; never delete without asking) or to upgrade.
+
+- `foldrender upgrade` (or `--year`) prints the address of a Stripe Checkout page and opens it in the browser. The user pays there, never through you: give them the address, and do not run it unless they ask to upgrade. An account that already pays gets its billing portal instead.
+- `foldrender billing` prints and opens the Stripe Customer Portal: change the card, see invoices, cancel. Before a first subscription it says `no subscription yet: foldrender upgrade` (exit 1).
+- `foldrender whoami` says when Pro renews (`pro plan, renews 2026-12-11`) or, after a cancel, when it ends. A cancelled plan lasts to the end of the paid period, then the account is Free again: its pages stay up, and a new publish waits until it is under the free 10.
+- "paid plans are not open yet" (exit 1): nothing can be bought yet; point the user at the pricing page.
 
 ## 10. Export or delete the account
 
@@ -414,7 +420,7 @@ One machine can be signed in to several GitHub accounts. `foldrender auth list` 
 | 1 | Failed (the message says why) | Tell the user |
 | 2 | Bad arguments | Fix the command |
 | 3 | Not signed in, or the token was rejected | Sign in (above) |
-| 4 | A limit reached: the free plan's pages, or (the message says) canvas saves or exports | Tell the user; for the plan, offer `foldrender ls --all`; for a limit, the time it names |
+| 4 | A limit reached: the plan's pages, or (the message says) canvas saves, exports or billing requests | Tell the user; for the plan, offer `foldrender ls --all` or `foldrender upgrade` (section 9); for a limit, the time it names |
 | 5 | Page larger than 5 MB | Make the page smaller |
 | 6 | Cannot reach the server | Retry once, then tell the user |
 | 7 | `read`: no such page, or not shared with this account | Tell the user (section 6) |

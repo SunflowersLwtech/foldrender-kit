@@ -23,15 +23,15 @@
 #   FOLDRENDER_NO_UPDATE_NOTE  Set to 1 to never say that a newer CLI is out.
 #
 # Exit codes: 0 ok, 1 failed, 2 bad usage, 3 not signed in or token rejected,
-# 4 a limit reached (the free plan's pages, canvas saves, exports a day),
-# 5 page too large, 6 network failure, 7 no such page, or not visible to this
-# account (read), 8 page expired (read), 9 too large to read as text, 10 an
-# edit did not apply, 11 no new answer before --timeout (answers --wait), 12
-# the id or address asked for is another page's (publish).
+# 4 a limit reached (the free plan's pages, canvas saves, exports or billing
+# requests a day), 5 page too large, 6 network failure, 7 no such page, or not
+# visible to this account (read), 8 page expired (read), 9 too large to read as
+# text, 10 an edit did not apply, 11 no new answer before --timeout (answers
+# --wait), 12 the id or address asked for is another page's (publish).
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.20.2
+FR_CLI_VERSION=0.21.0
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -39,7 +39,7 @@ FR_BRIDGE_SHA256=b3ce72ca9fea7317b053eeaf15482a522cc514a656f3712db10ee348ede4091
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=7b9556ee84f90a089d30c38e418f56070aac11785f7d1b544c57b6ba181ec974
+FR_DESK_AGENT_SHA256=f48165f13e560b5f6dab8d9905e0ed27492efceb563e17b4c759f3bfb6e0ee4d
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -275,7 +275,7 @@ fail_http() {
       die 3 "not signed in, or the token was rejected${msg:+ ($msg)}. Run: foldrender login" ;;
     403)
       if grep -q quota_exceeded "$TMP/body"; then
-        die 4 "free plan limit reached: 10 pages, each kept for 30 days. See your pages with: foldrender list"
+        die 4 "free plan limit reached: 10 pages, each kept for 30 days. See your pages with: foldrender list; more room: foldrender upgrade (https://foldrender.dev/pricing)"
       fi
       die 1 "not allowed ($msg)" ;;
     404) die 1 "not found ($msg)" ;;
@@ -939,7 +939,9 @@ device_login() {
   done
 }
 
-# show_account: the account TOKEN is, its plan and pages, on stdout.
+# show_account: the account TOKEN is, its plan and pages, on stdout. A paid
+# plan's next renewal, or the day it ends after a cancel, goes with its name
+# (the day alone, not the time).
 show_account() {
   api_auth GET /api/me
   expect_2xx
@@ -949,7 +951,14 @@ show_account() {
       $1 == "plan" { p = $2 }
       $1 == "used" { u = $2 }
       $1 == "limit" { m = $2 }
-      END { printf "signed in as %s (%s plan), %s of %s pages used\n", l, p, u, m }' "$TMP/body"
+      $1 == "renews_at" { r = substr($2, 1, 10) }
+      $1 == "ends_at" { e = substr($2, 1, 10) }
+      END {
+        plan = p
+        if (r != "") plan = p " plan, renews " r
+        else if (e != "") plan = p " plan, ends " e
+        else plan = p " plan"
+        printf "signed in as %s (%s), %s of %s pages used\n", l, plan, u, m }' "$TMP/body"
   else
     cat "$TMP/body"
   fi
@@ -2256,6 +2265,68 @@ cmd_open() {
   fi
   printf '%s\n' "$url"
   open_url "$url"
+}
+
+#   ------------------------------------------------------------------ billing
+
+# billing_open: the URL in a checkout's or portal's answer ({"url": "https://…"},
+# JSON whatever Accept says), printed on stdout and opened in the browser (not
+# with FOLDRENDER_NO_BROWSER=1). Not run in a subshell, because a die inside
+# $(...) would only end the subshell.
+billing_open() {
+  local url
+  url="$(json_field url)"
+  case "$url" in
+    https://*) ;;
+    *) die 1 "the server did not return a URL ($(error_text))" ;;
+  esac
+  printf '%s\n' "$url"
+  open_url "$url"
+}
+
+# billing_fail: a checkout's or portal's answer that is not a URL. 404 is a
+# deploy whose paid plans are off (no payment provider configured), or, from
+# the portal, an account that has never subscribed; 429 the minute's or the
+# day's billing requests (exit 4, the server's sentence).
+billing_fail() {
+  case "$STATUS" in
+    404)
+      if grep -q 'no billing account' "$TMP/body"; then
+        die 1 "no subscription yet: foldrender upgrade"
+      fi
+      die 1 "paid plans are not open yet; the plans: https://foldrender.dev/pricing" ;;
+    429) die 4 "$(error_text)" ;;
+  esac
+  fail_http
+}
+
+# upgrade [--year]: a Stripe Checkout page for Pro, monthly or yearly. An
+# account that already pays (409) gets its billing portal instead: a second
+# checkout would start a second subscription.
+cmd_upgrade() {
+  local interval=month
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --year) interval=year; shift ;;
+      --month) interval=month; shift ;;
+      *) die 2 "usage: foldrender upgrade [--year]" ;;
+    esac
+  done
+  api_auth POST /api/billing/checkout -H "Content-Type: application/json" --data "{\"interval\":\"$interval\"}"
+  if [ "$STATUS" = 409 ]; then
+    note "this account already pays for a plan: here is its billing portal (change the plan, the card, or cancel)"
+    api_auth POST /api/billing/portal
+  fi
+  case "$STATUS" in 2??) ;; *) billing_fail ;; esac
+  billing_open
+}
+
+# billing: the Stripe Customer Portal (the card, invoices, cancel).
+cmd_billing() {
+  [ $# -eq 0 ] || die 2 "usage: foldrender billing"
+  api_auth POST /api/billing/portal
+  case "$STATUS" in 2??) ;; *) billing_fail ;; esac
+  billing_open
 }
 
 #   ------------------------------------------------------------------ read
@@ -5412,8 +5483,8 @@ foldrender publishes HTML pages as links and reads pages back as text.
   desk / thread / pack  your desk, your messages, context packs (help pack)
   bridge --page PAGE   connect an agent (or --session NAME) to the page's sidebar
   rm PAGE... / open PAGE   delete pages / print a page's address and open it
+  upgrade [--year] / billing  Pro checkout / the billing portal (card, cancel)
   login / logout / whoami / auth / export [FILE] / account delete / version
-
 PAGE is a page's address, its id, or an old a.foldrender.dev link.
 --json prints the API's answer. More: foldrender help COMMAND (or COMMAND
 --help), foldrender help choices (questions on a page), foldrender help exit.
@@ -6201,6 +6272,29 @@ foldrender open PAGE
   opens it in the browser (not with FOLDRENDER_NO_BROWSER=1).
 EOF
     ;;
+    upgrade) cat <<'EOF'
+foldrender upgrade [--year]
+  Prints the address of a Stripe Checkout page for Pro, monthly (or yearly
+  with --year), and opens it in the browser (not with FOLDRENDER_NO_BROWSER=1):
+  the user pays there, not here. Pro: 1,000 pages (a canvas counts as one),
+  2 GB, no expiry; $10 a month or $96 a year (USD; tax may apply). The plans
+  and their limits: https://foldrender.dev/pricing, or GET
+  https://foldrender.dev/artifacts/api/billing/plans (no sign-in).
+  An account that already pays gets its billing portal instead. Paid plans
+  not open yet: exit 1, with the pricing page. Too many tries (20 a day):
+  exit 4.
+EOF
+    ;;
+    billing) cat <<'EOF'
+foldrender billing
+  Prints the address of the Stripe Customer Portal for the account (change the
+  card, see invoices, cancel) and opens it in the browser (not with
+  FOLDRENDER_NO_BROWSER=1). A cancelled Pro plan lasts to the end of the paid
+  period, then the account is Free again: its pages stay up, and a new publish
+  waits until it is under the free plan's 10. No subscription yet: exit 1,
+  "no subscription yet: foldrender upgrade".
+EOF
+    ;;
     export) cat <<'EOF'
 foldrender export [FILE.zip]
   Saves every page of the account and a manifest.json as one zip (default:
@@ -6263,9 +6357,10 @@ EOF
     ;;
     exit) cat <<'EOF'
 Exit codes: 0 ok, 1 failed, 2 bad usage, 3 not signed in or token rejected,
-4 plan limit reached (or a canvas save or export limit), 5 page too large, 6 network
-failure, 7 no such page or not visible to this account, 8 page expired, 9 too
-large to read as text (use --html), 10 an edit did not apply (old text missing
+4 plan limit reached (foldrender upgrade for more; or a canvas save, export
+or billing limit), 5 page too large, 6 network failure, 7 no such page or not
+visible to this account, 8 page expired, 9 too large to read as text (use
+--html), 10 an edit did not apply (old text missing
 or not unique, the page moved on from --base, or a canvas edit was refused),
 11 no new answer before --timeout (answers --wait), 12 the id or address
 publish was asked for is another page's (the error names the page and the
@@ -6306,7 +6401,7 @@ main() {
   local cmd="${1:-help}"
   [ $# -eq 0 ] || shift
   case "$cmd" in
-    login|logout|auth|account|export|whoami|publish|edit|share|list|ls|read|cat|versions|restore|undo|canvas|answers|desk|pack|bridge|rm|delete|open|version)
+    login|logout|auth|account|export|whoami|publish|edit|share|list|ls|read|cat|versions|restore|undo|canvas|answers|desk|pack|bridge|rm|delete|open|upgrade|billing|version)
       if help_asked "$cmd" "$@"; then
         case "$cmd" in
           list) cmd_help ls ;;
@@ -6344,6 +6439,8 @@ main() {
     reply) cmd_reply "$@" ;;
     rm|delete) cmd_rm "$@" ;;
     open) cmd_open "$@" ;;
+    upgrade) cmd_upgrade "$@" ;;
+    billing) cmd_billing "$@" ;;
     version|--version) printf 'foldrender %s\n' "$FR_CLI_VERSION" ;;
     help|-h|--help) cmd_help "$@" ;;
     *) die 2 "unknown command: $cmd (try: foldrender help)" ;;
