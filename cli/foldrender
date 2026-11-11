@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.19.2
+FR_CLI_VERSION=0.20.0
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -39,7 +39,7 @@ FR_BRIDGE_SHA256=2c84e0e03270282d731935416436b439f9ebfeab85bf63637ac43ea97887092
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=55eea935b61d447ef2dfe0d79713d37776e8b93e5e8c13fa2a40dbe1fcfc1028
+FR_DESK_AGENT_SHA256=af50db4180a7b73cb13cfd4f6d07896b900c4356b5fc1b4d335dc8498736b4ac
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -481,10 +481,65 @@ map_set() {
 # never makes a second page.
 UPLOAD_TRIES=3
 UPLOAD_TYPE=text/html
+# made_by_header: FR_MADE_BY, the agent session this command runs in, for the
+# page's owner (the Worker's src/made-by.js): base64url of {agent, session, cwd,
+# machine, turn, name}, or empty. Claude Code gives the commands it runs
+# CLAUDE_CODE_SESSION_ID; the folder its session is kept for and the turn now
+# running this command (written before the command runs) are in its
+# transcript, ~/.claude/projects/<folder>/<session>.jsonl, read here at its
+# first and last MB only. The page's owner can then take that session up
+# beside the page (foldrender help bridge). Nothing with --no-session
+# (NO_SESSION) or FOLDRENDER_NO_SESSION=1, or when no agent says.
+FR_MADE_BY=""
+made_by_header() {
+  local sid="${CLAUDE_CODE_SESSION_ID:-}" root f="" cwd="" turn="" name="" machine
+  FR_MADE_BY=""
+  [ -z "${FOLDRENDER_NO_SESSION:-}" ] && [ -z "${NO_SESSION:-}" ] || return 0
+  case "$sid" in ''|*[!A-Za-z0-9._:-]*) return 0 ;; esac
+  root="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  for f in "$root"/projects/*/"$sid".jsonl; do [ -f "$f" ] && break; f=""; done
+  [ -n "$f" ] || return 0
+  head -c 1048576 "$f" 2>/dev/null | grep -m 1 '"cwd":"' > "$TMP/made-by-line" 2>/dev/null
+  cwd="$(json_get str cwd "$TMP/made-by-line" 2>/dev/null)" || cwd=""
+  [ -n "$cwd" ] || return 0
+  # This turn: the newest assistant line's message id, read as JSON (the
+  # message's own "id", never one inside its content, such as a tool call's),
+  # not a subagent's line kept in the session's file (isSidechain).
+  tail -c 1048576 "$f" 2>/dev/null | grep '"type":"assistant"' | grep -v '"isSidechain":true' > "$TMP/made-by-turns"
+  tail -n 1 "$TMP/made-by-turns" > "$TMP/made-by-line"
+  json_get raw message "$TMP/made-by-line" > "$TMP/made-by-msg" 2>/dev/null || : > "$TMP/made-by-msg"
+  turn="$(json_get str id "$TMP/made-by-msg" 2>/dev/null)" || turn=""
+  case "$turn" in *[!A-Za-z0-9_:-]*) turn="" ;; esac
+  # ...only when that turn is the one running this command: one of its lines
+  # has a Bash call that names foldrender. Run by a subagent (which has the
+  # session's id, its own turns kept apart), the session's newest turn is
+  # another, still moving: no turn is named, and a fork is from the newest.
+  if [ -n "$turn" ] && ! grep -F "\"$turn\"" "$TMP/made-by-turns" | grep '"name":"Bash"' | grep -q 'foldrender'; then turn=""; fi
+  # The session's name (herdr's, or one given with claude -n), from Claude
+  # Code's list of its open sessions, when that entry is this session's.
+  # Not a name Claude Code made up from the conversation (nameSource auto):
+  # given (user), from the folder (derived), a peer's or a hook's, or one
+  # from before names had a source.
+  if [ -n "${CLAUDE_PID:-}" ] && [ -f "$root/sessions/${CLAUDE_PID}.json" ] && [ "$(json_get str sessionId "$root/sessions/${CLAUDE_PID}.json" 2>/dev/null)" = "$sid" ]; then
+    case "$(json_get str nameSource "$root/sessions/${CLAUDE_PID}.json" 2>/dev/null)" in
+      ''|user|derived|collision|peer|hook) name="$(json_get str name "$root/sessions/${CLAUDE_PID}.json" 2>/dev/null)" || name="" ;;
+    esac
+  fi
+  machine="${FOLDRENDER_MACHINE:-$(default_machine_name)}"
+  {
+    printf '{"agent":"claude","session":%s,"cwd":%s,"machine":%s' "$(json_arg "$sid")" "$(json_arg "$cwd")" "$(json_arg "$machine")"
+    [ -z "$turn" ] || printf ',"turn":%s' "$(json_arg "$turn")"
+    [ -z "$name" ] || printf ',"name":%s' "$(json_arg "$name")"
+    printf '}'
+  } > "$TMP/made-by.json"
+  FR_MADE_BY="$(base64 < "$TMP/made-by.json" | tr -d '\n=' | tr '+/' '-_')"
+}
+
 upload() {
   local try=1 rc wait extra=()
   require_token
   [ -z "${PUB_KEY:-}" ] || extra=(-H "Idempotency-Key: $PUB_KEY")
+  [ -z "$FR_MADE_BY" ] || extra+=(-H "FoldRender-Made-By: $FR_MADE_BY")
   while :; do
     api_once "$1" "$2${4:+?$4}" -H "$(auth_header)" -H "Content-Type: $UPLOAD_TYPE" ${extra[@]+"${extra[@]}"} --data-binary "@$3"
     rc=$?
@@ -1320,12 +1375,13 @@ cmd_publish() {
       --link) vis=link; shift ;;
       --public) vis=public; shift ;;
       --json) as_json=1; shift ;;
+      --no-session) NO_SESSION=1; shift ;;
       -) files+=("-"); shift ;;
       -*) die 2 "unknown option: $1" ;;
       *) files+=("$1"); shift ;;
     esac
   done
-  [ ${#files[@]} -gt 0 ] || die 2 "usage: foldrender publish FILE...|- [--title T] [--name N] [--folder F] [--slug ID] [--private|--link|--public|--share a,b] [--idempotency-key K] [--allow-duplicate] [--json]"
+  [ ${#files[@]} -gt 0 ] || die 2 "usage: foldrender publish FILE...|- [--title T] [--name N] [--folder F] [--slug ID] [--private|--link|--public|--share a,b] [--idempotency-key K] [--allow-duplicate] [--no-session] [--json]"
   case "$key" in
     '') ;;
     *[!A-Za-z0-9._:-]*) die 2 "--idempotency-key takes 8 to 128 letters, digits and . _ : -" ;;
@@ -1345,6 +1401,7 @@ cmd_publish() {
     vis=shared
   fi
   require_token
+  made_by_header
   for f in "${files[@]}"; do
     n=$((n + 1))
     # One key a page: --idempotency-key K names the publish, and each file of
@@ -1600,6 +1657,7 @@ cmd_edit() {
       --title) need $# "$1"; title="$2"; shift 2 ;;
       -m|--message) need $# "$1"; message="$2"; shift 2 ;;
       --json) as_json=1; shift ;;
+      --no-session) NO_SESSION=1; shift ;;
       -*) die 2 "unknown option: $1" ;;
       *) [ -z "$target" ] || die 2 "edit takes one page"; target="$1"; shift ;;
     esac
@@ -1641,7 +1699,10 @@ cmd_edit() {
     printf '}' >> "$TMP/edit.json"
   fi
   [ -z "$as_json" ] || ACCEPT="application/json"
-  api_auth POST "/api/artifacts/$PAGE_ID/edit" -H "Content-Type: application/json" --data-binary "@$TMP/edit.json"
+  made_by_header
+  local oh=()
+  [ -z "$FR_MADE_BY" ] || oh=(-H "FoldRender-Made-By: $FR_MADE_BY")
+  api_auth POST "/api/artifacts/$PAGE_ID/edit" -H "Content-Type: application/json" ${oh[@]+"${oh[@]}"} --data-binary "@$TMP/edit.json"
   case "$STATUS" in
     404) die 7 "no page named $PAGE_ID among yours" ;;
     409)
@@ -3068,6 +3129,11 @@ desk_send() {
   shift 2
   api "$method" "/api/desk/$DESK_ID$path" "$@"
   [ "$STATUS" = 404 ] && [ -n "$DESK_KEPT" ] || return 0
+  # Only a desk that is not there sends the request to the account's own desk.
+  # A not_found is something on this desk that is not (an alert key with no
+  # open failure, an answer, a token id): sent again, it would write to
+  # another desk.
+  [ "$(error_text)" = not_found ] && return 0
   kept="$DESK_ID"; DESK_ID=desk; DESK_KEPT=""
   api "$method" "/api/desk/$DESK_ID$path" "$@"
   if [ "${STATUS#2}" != "$STATUS" ]; then
@@ -3090,7 +3156,12 @@ desk_fail() {
   why="$(sed -n -e 's/^message: *//p' -e 's/.*"message" *: *"\([^"]*\)".*/\1/p' "$TMP/body" | head -n 1)"
   case "$STATUS" in
     401) die 3 "not signed in, or the token was rejected ($msg)" ;;
-    404) die 7 "no desk $DESK_ID that this token or sign-in may use (foldrender desk init makes one; --desk names another)" ;;
+    404) case "$msg" in
+           # The desk is there, the thing named is not: an alert key with no open
+           # failure (its own message), an answer or a token id. Not "no desk".
+           not_found) die 7 "${why:-not found on desk $DESK_ID}" ;;
+           *) die 7 "no desk $DESK_ID that this token or sign-in may use (foldrender desk init makes one; --desk names another)" ;;
+         esac ;;
     409) die 1 "$msg${why:+: $why}" ;;
     422) die 1 "refused ($msg)${why:+: $why}" ;;
     429) die 1 "${why:-$msg}" ;;
@@ -5356,23 +5427,33 @@ foldrender publish FILE...|- [options]
   --allow-duplicate    make a new page even if you have one with this content
   --idempotency-key K  name this publish (8-120 of A-Z a-z 0-9 . _ : -): the
                        same key within a day answers with the page it made
+  --no-session         do not say which agent session published it (below)
   --json               the API's answer, one JSON object a page: action
                        (created, updated, unchanged, exists), id, url, access,
                        content_hash, duplicates and same_title (other pages of
                        yours, {id, url}), requested_id and not_applied (exists)
+  Run by Claude Code, a publish (and an edit) also tells FoldRender which
+  session made the page: its id, the folder it runs in, this computer's name
+  (FOLDRENDER_MACHINE, else the host name), the turn that published it and the
+  session's name, read from what Claude Code gives the commands it runs and
+  from its transcript; never what was said. Only you see it: foldrender log
+  PAGE --json, each revision's made_by. --no-session or FOLDRENDER_NO_SESSION=1
+  leaves it out.
 Examples: foldrender publish report.html --link
           foldrender publish notes.md
           foldrender publish a.html b.html c.html --folder q3
 EOF
     ;;
     edit) cat <<'EOF'
-foldrender edit PAGE --old TEXT --new TEXT [--old TEXT --new TEXT ...] [--base REV] [--title T]
+foldrender edit PAGE --old TEXT --new TEXT [--old TEXT --new TEXT ...] [--base REV] [--title T] [--no-session]
 foldrender edit PAGE --edits FILE|-    (JSON: [{"old": "...", "new": "..."}, ...])
   Replaces each --old with its --new in the page's HTML, in order, on the
   server: only the changes are sent. Each --old must be in the page exactly
   once (as the edits before it left it), or nothing changes (exit 10).
   --base REV refuses if the page is no longer at that revision (exit 10).
   Prints the address; stderr says the new revision and the lines changed.
+  Like publish, it says which agent session made the revision (foldrender
+  help publish); --no-session leaves it out.
 EOF
     ;;
     read) cat <<'EOF'

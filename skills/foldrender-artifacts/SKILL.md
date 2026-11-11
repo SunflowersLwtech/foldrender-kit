@@ -98,6 +98,8 @@ foldrender undo <page>               put back the revision before the current (u
 foldrender rm <page> --rev REV       delete one version's body (its ?v= link then says it was deleted)
 ```
 
+Run from a Claude Code session, a publish or edit also records which session made the revision (its id, the folder it runs in, this computer, the turn); never what was said, and only the owner sees it (`foldrender log <page> --json`, `made_by`). Add `--no-session` when the user does not want that kept.
+
 ## 5. Change access or manage pages
 
 ```
