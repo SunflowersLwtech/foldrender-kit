@@ -36,7 +36,7 @@ import { basename, delimiter, dirname, extname, join, resolve, sep } from "node:
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const BRIDGE_VERSION = "0.20.1";
+export const BRIDGE_VERSION = "0.21.1";
 export const PROTOCOL = "fr-agent.1";
 // How the owner may begin a conversation from the session that made the page.
 export const START_MODES = new Set(["continue", "fork", "subagent"]);
@@ -1445,6 +1445,46 @@ export function handoffLines(made, page, ex) {
   return text.split("\n");
 }
 
+// What was said in that session so far, for its owner's sidebar when a
+// conversation there continues it: read now from its transcript here, sent to
+// the room for the owner's sockets and kept nowhere (not on this computer
+// either, but where Claude Code keeps it). Words only, as the handoff reads
+// them; one item a message (a reply Claude Code wrote in parts, one), the
+// newest SAID_MAX, each cut to SAID_CHARS, within SAID_BYTES as JSON (the
+// room takes a message of 64 KiB at most).
+export const SAID_MAX = 40, SAID_CHARS = 2000, SAID_BYTES = 48000;
+export async function claudeSaid(file) {
+  const all = [];
+  if (!file) return { list: [], more: false };
+  const lines = createInterface({ input: createReadStream(file, { encoding: "utf8" }), crlfDelay: Infinity });
+  for await (const line of lines) {
+    const user = line.includes('"type":"user"');
+    if (!user && !line.includes('"type":"assistant"')) continue;
+    let d = null;
+    try { d = JSON.parse(line); } catch { continue; }
+    const w = d.type === "user" ? userWords(d) : d.type === "assistant" ? agentWords(d) : "";
+    if (!w) continue;
+    const at = Date.parse(d.timestamp);
+    const id = d.type === "assistant" ? d.message?.id || null : null;
+    const prev = all[all.length - 1];
+    if (id && prev && prev.r === "a" && prev.id === id) { prev.text += "\n\n" + w; continue; }
+    all.push({ r: d.type === "user" ? "u" : "a", text: w, ...(Number.isFinite(at) ? { at } : {}), ...(id ? { id } : {}) });
+    if (all.length > SAID_MAX + 1) all.shift();
+  }
+  lines.close();
+  const list = [];
+  let bytes = 0;
+  for (let i = all.length - 1; i >= 0 && list.length < SAID_MAX; i--) {
+    const { id, ...x } = all[i];
+    const text = x.text.length > SAID_CHARS ? x.text.slice(0, SAID_CHARS) : x.text;
+    const n = bytesOf(JSON.stringify(text)) + 40;
+    if (bytes + n > SAID_BYTES) break;
+    bytes += n;
+    list.unshift({ ...x, text, ...(text.length < x.text.length ? { cut: true } : {}) });
+  }
+  return { list, more: all.length > list.length };
+}
+
 // pi's own reason for a turn that ended without a word: its ACP adapter
 // keeps a failed model call to itself (the turn ends as end_turn, nothing
 // said), but pi writes it in the session's file, which the adapter's own map
@@ -2493,6 +2533,16 @@ export class Bridge {
       this.filesAt = Date.now();
       const f = folderFiles(this.dir);
       this.send({ t: "files", list: f.list, cut: f.cut });
+      return;
+    }
+    // The owner's sidebar, a conversation that continues the session that made
+    // the page: what was said in it before, now (at most every 2 s).
+    if (m.t === "made-ask") {
+      if (Date.now() - (this.saidAt || 0) < 2000) return;
+      this.saidAt = Date.now();
+      const made = this.madeBy;
+      const file = made && made.agent === "claude" ? claudeTranscript(made.session, this.env) : null;
+      claudeSaid(file).then((said) => this.send({ t: "made-said", here: Boolean(file), ...said }), (err) => warn("what that session said was not read:", err.message));
       return;
     }
     if (m.t === "panel-choose" && (m.choice === "panel" || m.choice === "agent")) return this.panel.choose(m.choice, typeof m.by === "string" ? m.by : null);
