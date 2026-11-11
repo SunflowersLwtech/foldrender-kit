@@ -31,15 +31,15 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.20.0
+FR_CLI_VERSION=0.20.1
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=2c84e0e03270282d731935416436b439f9ebfeab85bf63637ac43ea97887092c
+FR_BRIDGE_SHA256=b3ce72ca9fea7317b053eeaf15482a522cc514a656f3712db10ee348ede40912
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=af50db4180a7b73cb13cfd4f6d07896b900c4356b5fc1b4d335dc8498736b4ac
+FR_DESK_AGENT_SHA256=6963e1c9c9284e3b050bdf6d60e192d15072a660b01f55594e3ecc2fe089480e
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -5264,7 +5264,7 @@ thread_hook_install() {
 }
 
 cmd_bridge() {
-  local target="" agent="claude" dir="$PWD" session="" channel="" mesh_cli="" mcp="" node_major file cache url got
+  local target="" agent="claude" dir="$PWD" dir_given="" session="" channel="" mesh_cli="" mcp="" node_major file cache url got
   while [ $# -gt 0 ]; do
     case "$1" in
       --page) need $# "$1"; target="$2"; shift 2 ;;
@@ -5273,7 +5273,7 @@ cmd_bridge() {
       --mesh-cli) need $# "$1"; mesh_cli="$2"; shift 2 ;;
       --mcp) need $# "$1"; mcp="$2"; shift 2 ;;
       --channel) channel=1; shift ;;
-      --dir) need $# "$1"; dir="$2"; shift 2 ;;
+      --dir) need $# "$1"; dir="$2"; dir_given=1; shift 2 ;;
       -*) die 2 "unknown option: $1" ;;
       *) [ -z "$target" ] || die 2 "bridge takes one page"; target="$1"; shift ;;
     esac
@@ -5317,10 +5317,15 @@ cmd_bridge() {
     fi
     exec node "$file" --api "$API" --page "$PAGE_ID" --session "$session" --dir "$dir"
   fi
+  # An agent's folder: the one named, else (none named) the bridge works in
+  # the folder of the session that made the page when that session is on
+  # this computer, and in this one otherwise.
+  local dir_args=()
+  [ -z "$dir_given" ] || dir_args=(--dir "$dir")
   if [ -n "$mcp" ]; then
-    exec node "$file" --api "$API" --page "$PAGE_ID" --agent "$agent" --mcp "$mcp" --dir "$dir"
+    exec node "$file" --api "$API" --page "$PAGE_ID" --agent "$agent" --mcp "$mcp" ${dir_args[@]+"${dir_args[@]}"}
   fi
-  exec node "$file" --api "$API" --page "$PAGE_ID" --agent "$agent" --dir "$dir"
+  exec node "$file" --api "$API" --page "$PAGE_ID" --agent "$agent" ${dir_args[@]+"${dir_args[@]}"}
 }
 
 # foldrender reply --page PAGE [--to N] TEXT|-|--file FILE: a terminal session's answer to
@@ -6009,7 +6014,23 @@ foldrender bridge --page PAGE --channel
   Only the page's owner runs a bridge on a page; a second one (another
   computer) takes over from the first. FoldRender runs no model: the agent
   runs here, signed in as you.
-  --dir DIR            the folder the agent works in (default: this one)
+  The session that made the page: a page published from a Claude Code
+  session (foldrender 0.20.0 or later) names it to its owner, and the
+  owner's sidebar offers three ways to begin a conversation from it: Continue
+  it (that session itself, taken up with session/resume or load, which
+  remembers everything it did; refused while it is still open in a terminal
+  here), Fork from here (session/fork from the turn that published the page;
+  that session is not changed), Hand to a subagent (a new session in its
+  folder, told a handoff: the page, what that session was asked first and
+  last and what it said last before publishing, from its transcript; its last
+  words go to that session with its next message in the conversation that
+  continues it). The session's files are on the computer it ran on, so run
+  the bridge there; without --dir it then works in that session's folder
+  (the sidebar says which computer; elsewhere a start is refused, saying so).
+  Only the owner writes in those conversations. Claude Code only for now.
+  --dir DIR            the folder the agent works in (default: the folder of
+                       the session that made the page, when it is on this
+                       computer; else this one)
   --mcp FILE           MCP servers for the agent, as .mcp.json writes them
                        ({"mcpServers": {name: {command, args, env} or
                        {type: "http" or "sse", url, headers}}}): each session
