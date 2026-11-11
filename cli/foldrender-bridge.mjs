@@ -36,7 +36,7 @@ import { basename, delimiter, dirname, extname, join, resolve, sep } from "node:
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const BRIDGE_VERSION = "0.21.1";
+export const BRIDGE_VERSION = "0.21.2";
 export const PROTOCOL = "fr-agent.1";
 // How the owner may begin a conversation from the session that made the page.
 export const START_MODES = new Set(["continue", "fork", "subagent"]);
@@ -1453,7 +1453,32 @@ export function handoffLines(made, page, ex) {
 // newest SAID_MAX, each cut to SAID_CHARS, within SAID_BYTES as JSON (the
 // room takes a message of 64 KiB at most).
 export const SAID_MAX = 40, SAID_CHARS = 2000, SAID_BYTES = 48000;
-export async function claudeSaid(file) {
+// A message this bridge gave the agent (promptText: with each message from
+// the page, and a steer into a turn) wraps what someone wrote there in the
+// bridge's own words: where the page is, the record, subagents' reports,
+// what was attached. What was said is what they wrote: the last "@login
+// wrote:" block's quoted lines (a writer who is not the owner named), not
+// the wrapping, which reads as if the owner had written it. Null for a
+// message the bridge did not write (one typed into Claude Code), kept as it is:
+// the bridge's begin with one of its own heads, in full, or an "@login wrote:"
+// line, and always end their writer's block with at least one "| " line (an
+// empty message is "| "), which a reply typed under a pasted "@x wrote:" has not.
+const WROTE = /^@(\S+?)(?: \(on a [^)]*\))? wrote:$/;
+const OWN_HEADS = ["You are being messaged from the agent sidebar beside a FoldRender page", "You are a subagent of another agent session: ", "Your subagent, begun from the sidebar of this page", "Your subagents, begun from the sidebar of this page", RETOLD, RETOLD_SESSION, MISSED];
+export function sidebarWords(text, owner = null) {
+  const lines = String(text ?? "").split(LINES);
+  const head = lines[0] || "";
+  if (!WROTE.test(head) && !OWN_HEADS.some((h) => head.startsWith(h))) return null;
+  let at = lines.length - 1;
+  while (at >= 0 && !(WROTE.test(lines[at]) && (lines[at + 1] || "").startsWith("| "))) at--;
+  if (at < 0) return null;
+  const words = [];
+  for (let i = at + 1; i < lines.length && lines[i].startsWith("| "); i++) words.push(lines[i].slice(2));
+  const by = lines[at].match(WROTE)[1];
+  const t = words.join("\n").trim();
+  return t && owner && by !== owner ? `@${by}: ${t}` : t;
+}
+export async function claudeSaid(file, owner = null) {
   const all = [];
   if (!file) return { list: [], more: false };
   const lines = createInterface({ input: createReadStream(file, { encoding: "utf8" }), crlfDelay: Infinity });
@@ -1462,7 +1487,8 @@ export async function claudeSaid(file) {
     if (!user && !line.includes('"type":"assistant"')) continue;
     let d = null;
     try { d = JSON.parse(line); } catch { continue; }
-    const w = d.type === "user" ? userWords(d) : d.type === "assistant" ? agentWords(d) : "";
+    let w = d.type === "user" ? userWords(d) : d.type === "assistant" ? agentWords(d) : "";
+    if (d.type === "user") w = sidebarWords(w, owner) ?? w;
     if (!w) continue;
     const at = Date.parse(d.timestamp);
     const id = d.type === "assistant" ? d.message?.id || null : null;
@@ -2542,7 +2568,7 @@ export class Bridge {
       this.saidAt = Date.now();
       const made = this.madeBy;
       const file = made && made.agent === "claude" ? claudeTranscript(made.session, this.env) : null;
-      claudeSaid(file).then((said) => this.send({ t: "made-said", here: Boolean(file), ...said }), (err) => warn("what that session said was not read:", err.message));
+      claudeSaid(file, this.info?.login || null).then((said) => this.send({ t: "made-said", here: Boolean(file), ...said }), (err) => warn("what that session said was not read:", err.message));
       return;
     }
     if (m.t === "panel-choose" && (m.choice === "panel" || m.choice === "agent")) return this.panel.choose(m.choice, typeof m.by === "string" ? m.by : null);
