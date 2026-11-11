@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.20.1
+FR_CLI_VERSION=0.20.2
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -39,7 +39,7 @@ FR_BRIDGE_SHA256=b3ce72ca9fea7317b053eeaf15482a522cc514a656f3712db10ee348ede4091
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=6963e1c9c9284e3b050bdf6d60e192d15072a660b01f55594e3ecc2fe089480e
+FR_DESK_AGENT_SHA256=7b9556ee84f90a089d30c38e418f56070aac11785f7d1b544c57b6ba181ec974
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -485,14 +485,15 @@ UPLOAD_TYPE=text/html
 # page's owner (the Worker's src/made-by.js): base64url of {agent, session, cwd,
 # machine, turn, name}, or empty. Claude Code gives the commands it runs
 # CLAUDE_CODE_SESSION_ID; the folder its session is kept for and the turn now
-# running this command (written before the command runs) are in its
-# transcript, ~/.claude/projects/<folder>/<session>.jsonl, read here at its
-# first and last MB only. The page's owner can then take that session up
+# running this command are in its transcript,
+# ~/.claude/projects/<folder>/<session>.jsonl, read here at its first and last
+# MB only. NEEDLE (the file published, or the page) is what the command that
+# runs this one names, besides foldrender. The page's owner can then take that session up
 # beside the page (foldrender help bridge). Nothing with --no-session
 # (NO_SESSION) or FOLDRENDER_NO_SESSION=1, or when no agent says.
 FR_MADE_BY=""
 made_by_header() {
-  local sid="${CLAUDE_CODE_SESSION_ID:-}" root f="" cwd="" turn="" name="" machine
+  local needle="${1:-}" sid="${CLAUDE_CODE_SESSION_ID:-}" root f="" cwd="" turn="" name="" machine tries=0
   FR_MADE_BY=""
   [ -z "${FOLDRENDER_NO_SESSION:-}" ] && [ -z "${NO_SESSION:-}" ] || return 0
   case "$sid" in ''|*[!A-Za-z0-9._:-]*) return 0 ;; esac
@@ -504,17 +505,31 @@ made_by_header() {
   [ -n "$cwd" ] || return 0
   # This turn: the newest assistant line's message id, read as JSON (the
   # message's own "id", never one inside its content, such as a tool call's),
-  # not a subagent's line kept in the session's file (isSidechain).
-  tail -c 1048576 "$f" 2>/dev/null | grep '"type":"assistant"' | grep -v '"isSidechain":true' > "$TMP/made-by-turns"
-  tail -n 1 "$TMP/made-by-turns" > "$TMP/made-by-line"
-  json_get raw message "$TMP/made-by-line" > "$TMP/made-by-msg" 2>/dev/null || : > "$TMP/made-by-msg"
-  turn="$(json_get str id "$TMP/made-by-msg" 2>/dev/null)" || turn=""
-  case "$turn" in *[!A-Za-z0-9_:-]*) turn="" ;; esac
-  # ...only when that turn is the one running this command: one of its lines
-  # has a Bash call that names foldrender. Run by a subagent (which has the
-  # session's id, its own turns kept apart), the session's newest turn is
-  # another, still moving: no turn is named, and a fork is from the newest.
-  if [ -n "$turn" ] && ! grep -F "\"$turn\"" "$TMP/made-by-turns" | grep '"name":"Bash"' | grep -q 'foldrender'; then turn=""; fi
+  # not a subagent's line kept in the session's file (isSidechain); only when
+  # that turn is the one running this command: one of its lines has a Bash
+  # call whose command runs foldrender publish or edit and names NEEDLE. The
+  # command only, not the rest of its line: every line carries the session's
+  # folder (cwd), which can name foldrender. Claude Code writes the message
+  # whose call runs this command a moment after the command starts (up to
+  # half a second, measured on Linux, 2026-11-11), so until then the newest is
+  # the one before: read again every quarter second, for up to 2.5 seconds
+  # (FR_MADE_BY_TRIES reads). Run by a subagent (which has the session's id,
+  # its own turns kept apart), the session's newest turn is another: none
+  # comes, no turn is named, and a fork is from the newest. With no NEEDLE (a
+  # page from stdin with neither --slug nor --name) no turn can be told from
+  # another publish, so none is named.
+  while [ -n "$needle" ]; do
+    tail -c 1048576 "$f" 2>/dev/null | grep '"type":"assistant"' | grep -v '"isSidechain":true' > "$TMP/made-by-turns"
+    tail -n 1 "$TMP/made-by-turns" > "$TMP/made-by-line"
+    json_get raw message "$TMP/made-by-line" > "$TMP/made-by-msg" 2>/dev/null || : > "$TMP/made-by-msg"
+    turn="$(json_get str id "$TMP/made-by-msg" 2>/dev/null)" || turn=""
+    case "$turn" in *[!A-Za-z0-9_:-]*) turn="" ;; esac
+    if [ -n "$turn" ] && grep -F "\"$turn\"" "$TMP/made-by-turns" | grep '"name":"Bash"' | grep -oE '"command":"([^"\\]|\\.)*"' | grep -E 'foldrender[[:space:]]+(publish|edit)[[:space:]]' | grep -qF -- "$needle"; then break; fi
+    turn=""
+    tries=$((tries + 1))
+    [ "$tries" -lt "${FR_MADE_BY_TRIES:-10}" ] || break
+    sleep 0.25
+  done
   # The session's name (herdr's, or one given with claude -n), from Claude
   # Code's list of its open sessions, when that entry is this session's.
   # Not a name Claude Code made up from the conversation (nameSource auto):
@@ -1401,7 +1416,8 @@ cmd_publish() {
     vis=shared
   fi
   require_token
-  made_by_header
+  # (What the command that runs this one names: the file, else the page.)
+  case "${files[0]}" in -) made_by_header "${slug:-$name}" ;; *) made_by_header "${files[0]##*/}" ;; esac
   for f in "${files[@]}"; do
     n=$((n + 1))
     # One key a page: --idempotency-key K names the publish, and each file of
@@ -1699,7 +1715,7 @@ cmd_edit() {
     printf '}' >> "$TMP/edit.json"
   fi
   [ -z "$as_json" ] || ACCEPT="application/json"
-  made_by_header
+  made_by_header "$target"
   local oh=()
   [ -z "$FR_MADE_BY" ] || oh=(-H "FoldRender-Made-By: $FR_MADE_BY")
   api_auth POST "/api/artifacts/$PAGE_ID/edit" -H "Content-Type: application/json" ${oh[@]+"${oh[@]}"} --data-binary "@$TMP/edit.json"
