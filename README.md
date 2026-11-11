@@ -12,20 +12,21 @@ This repository holds the released versions of:
 | `cli/foldrender` | The `foldrender` command. It needs only bash and curl, and runs on macOS and Linux |
 | `cli/foldrender-bridge.mjs` | What `foldrender bridge` runs: a Node 22+ program the command fetches from the site and checks against the SHA-256 it pins |
 | `install.sh` | The installer served at `https://foldrender.dev/install.sh` |
-| `.claude-plugin/`, `.codex-plugin/`, `assets/icon.png` | The plugin manifests and icon, so the repository installs as a plugin |
+| `plugins/foldrender/` | The plugin: the same skill with its manifests (`.claude-plugin/`, `.codex-plugin/`), icon, README and license |
+| `.claude-plugin/marketplace.json` | The marketplace that lists the plugin, so the repository installs as a plugin |
 
 Later additions for FoldRender (MCP servers, examples) will live here too.
 
 ## Install
 
-**As a plugin in Claude Code.** The plugin holds the skill.
+**As a plugin in Claude Code.** The plugin (`plugins/foldrender`) holds the skill; its README says what it runs and sends.
 
 ```
 /plugin marketplace add SunflowersLwtech/foldrender-kit
 /plugin install foldrender@foldrender
 ```
 
-**As a plugin in Codex.** The `.codex-plugin/plugin.json` manifest describes the same skill.
+**As a plugin in Codex.** `plugins/foldrender/.codex-plugin/plugin.json` describes the same skill.
 It needs a local session with a shell, because the skill runs the `foldrender` command.
 
 **Everything: the command and the skill.**
@@ -78,7 +79,12 @@ the privacy policy: https://foldrender.dev/privacy.
   GitHub. When you publish from a Claude Code session, the revision also records
   which session made it (its id, its folder, the computer and the turn, never
   what was said); only the page's owner sees it, and `--no-session` leaves it
-  out. The command sends no analytics.
+  out. The command sends no analytics. Two desk features keep working once you set them
+  up, until you remove them: with the desk's memory, hooks in your coding tool send each
+  prompt and last reply of your sessions to your desk; with its background helper (a small
+  Node program that stays running), the names, states and last lines of your terminal
+  sessions and the machine's load go there too, with secrets taken out first. Your desk is
+  private to you.
 - Pages are private unless you share them.
 
 ## How this repository is updated
@@ -108,7 +114,7 @@ FoldRender Kit 收录 [FoldRender Artifacts](https://foldrender.dev/zh/artifacts
 作为插件安装：
 
 - Claude Code：`/plugin marketplace add SunflowersLwtech/foldrender-kit`，再 `/plugin install foldrender@foldrender`。
-- Codex：仓库里的 `.codex-plugin/plugin.json` 描述同一个技能；技能要在本机运行 `foldrender` 命令，所以需要能执行命令的本地会话。
+- Codex：`plugins/foldrender/.codex-plugin/plugin.json` 描述同一个技能；技能要在本机运行 `foldrender` 命令，所以需要能执行命令的本地会话。
 
 其他三种安装方式：
 
@@ -116,7 +122,7 @@ FoldRender Kit 收录 [FoldRender Artifacts](https://foldrender.dev/zh/artifacts
 2. 只装技能：`npx skills add SunflowersLwtech/foldrender-kit`（技能需要调用 `foldrender` 命令，请同时安装命令）
 3. 只装命令：`curl -fsSL https://foldrender.dev/install.sh | sh -s -- --no-skill`，或把 `cli/foldrender` 放进 `PATH` 并加上可执行权限。
 
-插件在本机运行什么、发送什么：技能调用 `foldrender` 命令，命令不存在时运行上面的安装脚本；发布或修改的页面、读取页面和评论的请求发往 foldrender.dev，登录用 GitHub；在 Claude Code 会话里发布时，修订记录会写明是哪个会话（会话 id、所在文件夹、电脑和轮次，不含对话内容），只有页面主人能看到，加 `--no-session` 可不记录；命令不发送统计数据。页面默认私有。
+插件在本机运行什么、发送什么：技能调用 `foldrender` 命令，命令不存在时运行上面的安装脚本；发布或修改的页面、读取页面和评论的请求发往 foldrender.dev，登录用 GitHub；在 Claude Code 会话里发布时，修订记录会写明是哪个会话（会话 id、所在文件夹、电脑和轮次，不含对话内容），只有页面主人能看到，加 `--no-session` 可不记录；命令不发送统计数据。工作台的两个功能一旦设置就会持续运行，直到你移除：开了工作台记忆，编程工具里的钩子会把每个会话的提问和最后一条回复发到你的工作台；开了后台助手（一个常驻的小 Node 程序），终端会话的名称、状态、最后几行和机器负载也会发过去，发送前会先去掉密钥。工作台只有你自己能看。页面默认私有。
 
 本仓库里的文件是 foldrender.dev 已发布版本的副本，每次发布后从 FoldRender 源码仓库同步过来；直接改这里的文件会在下次同步时被覆盖，问题和建议请提 issue。
 

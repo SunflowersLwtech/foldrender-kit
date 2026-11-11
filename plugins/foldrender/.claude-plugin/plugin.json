@@ -10,6 +10,16 @@
   "homepage": "https://foldrender.dev/share",
   "repository": "https://github.com/SunflowersLwtech/foldrender-kit",
   "license": "Apache-2.0",
-  "keywords": ["html", "publish", "share", "link", "canvas", "report"],
-  "icon": "./assets/icon.png"
+  "keywords": [
+    "html",
+    "publish",
+    "share",
+    "link",
+    "canvas",
+    "report"
+  ],
+  "privacyPolicyUrl": "https://foldrender.dev/privacy",
+  "termsOfServiceUrl": "https://foldrender.dev/terms",
+  "supportUrl": "https://github.com/SunflowersLwtech/foldrender-kit/issues",
+  "documentationUrl": "https://foldrender.dev/share"
 }
