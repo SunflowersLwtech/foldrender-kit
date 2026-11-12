@@ -29,14 +29,14 @@
 //                        adapter (the tests' stand-in agent)
 
 import { spawn, spawnSync } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, closeSync, constants as fsConstants, createReadStream, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, renameSync, statSync, unwatchFile, watchFile, writeFileSync } from "node:fs";
-import { hostname, homedir } from "node:os";
-import { basename, delimiter, dirname, extname, join, resolve, sep } from "node:path";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { chmodSync, closeSync, constants as fsConstants, createReadStream, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, renameSync, rmSync, statSync, unwatchFile, watchFile, writeFileSync } from "node:fs";
+import { hostname, homedir, tmpdir } from "node:os";
+import { basename, delimiter, dirname, extname, isAbsolute, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const BRIDGE_VERSION = "0.21.3";
+export const BRIDGE_VERSION = "0.22.0";
 export const PROTOCOL = "fr-agent.1";
 // How the owner may begin a conversation from the session that made the page.
 export const START_MODES = new Set(["continue", "fork", "subagent"]);
@@ -134,6 +134,12 @@ export function agentCommand(known, env = process.env) {
   return null;
 }
 
+// How an agent's own CLI starts here: found, or null (not installed).
+export function cliHow(def, env = process.env) {
+  const bin = def.find(env);
+  return bin ? { command: [bin], version: "installed" } : null;
+}
+
 // ---------- small things ----------
 
 const enc = new TextEncoder();
@@ -173,6 +179,15 @@ export function parseArgs(argv) {
     else if (a === "--channel") out.channel = true;
     else if (a === "--mesh-cli") out.meshCli = v();
     else if (a === "--mcp") out.mcp = v();
+    // The agent's ACP adapter, not its own CLI (CLI_AGENTS).
+    else if (a === "--acp") out.acp = true;
+    // Ended after this many seconds with nothing to do (a bridge the desk
+    // agent starts when a message waits for it).
+    else if (a === "--exit-idle") {
+      const n = Number(v());
+      if (!Number.isInteger(n) || n < 60 || n > 86400) throw new Error("--exit-idle is a number of seconds, 60 to 86400");
+      out.exitIdle = n;
+    }
     else throw new Error(`unknown option: ${a}`);
   }
   return out;
@@ -238,13 +253,15 @@ export function findClaude(env = process.env) {
 // mode that does (bypassPermissions; acceptEdits for edits), or a blanket
 // allow rule for commands or for edits that no ask rule takes back. The
 // settings stay theirs; the sidebar says so while it is true. As Claude Code
-// reads them: the folder's local settings over its shared ones over the
-// user's for the mode, and the rules of all three together.
+// reads them: the settings files the session was started with (--settings:
+// `given`, as the bridge starts its CLI, madeLaunch) over the folder's local
+// settings over its shared ones over the user's for the mode, and the rules
+// of all of them together.
 const BLANKET = /^(Bash|Edit|Write|MultiEdit)(\((\*|\*\*|:\*|\/\*\*)\))?$/;
-export function claudeAutoRuns(dir, env = process.env, sessionMode = null) {
+export function claudeAutoRuns(dir, env = process.env, sessionMode = null, given = []) {
   const home = env.HOME || env.USERPROFILE || homedir();
   const config = env.CLAUDE_CONFIG_DIR || join(home, ".claude");
-  const files = [join(dir, ".claude", "settings.local.json"), join(dir, ".claude", "settings.json"), join(config, "settings.json")];
+  const files = [...given, join(dir, ".claude", "settings.local.json"), join(dir, ".claude", "settings.json"), join(config, "settings.json")];
   let mode = null;
   const allowed = new Set();
   const asked = new Set();
@@ -579,11 +596,14 @@ export function managedSources({ platform = process.platform, env = process.env,
   }
   return out;
 }
-export function claudeAsks(dir, env = process.env, sessionMode = null, managed = managedSources({ env })) {
+// (`given`: the settings files the session was started with, --settings,
+// which Claude Code ranks below managed settings and above the folder's and
+// the user's.)
+export function claudeAsks(dir, env = process.env, sessionMode = null, managed = managedSources({ env }), given = []) {
   const home = env.HOME || env.USERPROFILE || homedir();
   const config = env.CLAUDE_CONFIG_DIR || join(home, ".claude");
   const asSource = (m) => (typeof m === "string" ? { from: m } : m);
-  const files = [...[].concat(managed).map(asSource), ...[join(dir, ".claude", "settings.local.json"), join(dir, ".claude", "settings.json"), join(config, "settings.json")].map(asSource)];
+  const files = [...[].concat(managed).map(asSource), ...[...given, join(dir, ".claude", "settings.local.json"), join(dir, ".claude", "settings.json"), join(config, "settings.json")].map(asSource)];
   let mode = null;
   for (const f of files) {
     if (f.unreadable) return false;
@@ -772,6 +792,442 @@ export class AgentProcess {
   }
 }
 
+// ---------- an agent's own CLI, driven here ----------
+//
+// How the bridge runs an agent that has a CLI it can drive: that CLI, the one
+// the owner runs in a terminal, started without a terminal for each turn on
+// the session's own id, its output read here. No adapter, nothing fetched the
+// first time, no sign-in of the bridge's own: the CLI's configuration is the
+// owner's. Where the session that made the page was started with settings of
+// its own (Claude Code's --settings, a gateway's say), `foldrender publish`
+// noted them on this computer and they are used again (madeLaunch). It
+// answers the bridge as an ACP agent does (request, notify, stop, exited,
+// closed: AgentProcess's interface), so all the rest is the same for it: the
+// owner's answers to its permission questions, the turn's record, what it
+// changed. An agent is a definition here (CLI_AGENTS), not code of its own,
+// as open-design's daemon runs agents (github.com/nexu-io/open-design,
+// apps/daemon/src/runtimes). The ACP adapters stay for --acp.
+//
+// Claude Code, measured on 2.1.322 (2026-11-12): `-p --input-format
+// stream-json --output-format stream-json --verbose`, with `--session-id ID`
+// for a new session, `--resume ID` to go on in one (the same id, the same
+// transcript), `--resume ID --fork-session --session-id NEW
+// --resume-session-at LINE` for a fork that ends at a message (LINE is the
+// uuid of that message's line in the transcript, not its API id), and
+// `--permission-prompt-tool=stdio`, which asks the question here as a
+// control_request (can_use_tool) answered on its stdin, as the Agent SDK
+// does. A session it cannot find fails before any model call: an error
+// result with no turns and no API time, "No conversation found with session
+// ID" on stderr.
+const CLAUDE_INSIDE = ["CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "CLAUDE_PLUGIN_DATA", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SESSION_ATTENDED"];
+export const CLI_AGENTS = {
+  claude: {
+    name: "Claude Code",
+    bin: "claude",
+    find: (env) => findClaude(env),
+    // (What marks a process as one run inside a Claude Code session: the
+    // bridge may be one, and the CLI it starts is not.)
+    inside: CLAUDE_INSIDE,
+    // A turn: the session's own settings first, then how it goes on.
+    args: ({ launch, start, mcp }) => [
+      ...launch.settings.flatMap((f) => ["--settings", f]),
+      ...(launch.model ? ["--model", launch.model] : []),
+      "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+      "--permission-prompt-tool=stdio",
+      ...start,
+      ...(mcp ? ["--mcp-config", mcp] : []),
+    ],
+    begin: {
+      new: (id) => ["--session-id", id],
+      resume: (id) => ["--resume", id],
+      fork: (from, id, at) => ["--resume", from, "--fork-session", "--session-id", id, ...(at ? ["--resume-session-at", at] : [])],
+    },
+    // The session's transcript here, and the line a fork ends at: the last
+    // line of the message the turn names (its API id, made_by.turn).
+    transcript: (id, env) => claudeTranscript(id, env),
+    forkPoint: (file, messageId) => claudeLineOf(file, messageId),
+    gone: (stderr) => /no conversation found with session id/i.test(stderr),
+    // A message the turn sends: what the bridge would give an ACP agent.
+    message: (blocks) => ({ type: "user", message: { role: "user", content: claudeContent(blocks) } }),
+    stream: () => new ClaudeStream(),
+  },
+};
+
+// The uuid of the last transcript line of the assistant message with this
+// API id (not a subagent's), or null.
+export function claudeLineOf(file, messageId) {
+  if (!file || !messageId) return null;
+  let text = "";
+  try { text = readFileSync(file, "utf8"); } catch { return null; }
+  let found = null;
+  for (const line of text.split("\n")) {
+    if (!line.includes(messageId) || !line.includes('"type":"assistant"')) continue;
+    let d = null;
+    try { d = JSON.parse(line); } catch { continue; }
+    if (d.type === "assistant" && !d.isSidechain && d.message?.id === messageId && typeof d.uuid === "string") found = d.uuid;
+  }
+  return found;
+}
+
+// An ACP prompt's blocks as Claude Code's message content.
+export function claudeContent(blocks) {
+  const out = [];
+  for (const b of Array.isArray(blocks) ? blocks : []) {
+    if (b?.type === "text" && typeof b.text === "string") out.push({ type: "text", text: b.text });
+    else if (b?.type === "image" && typeof b.data === "string" && typeof b.mimeType === "string") out.push({ type: "image", source: { type: "base64", media_type: b.mimeType, data: b.data } });
+    else if (b?.type === "resource" && typeof b.resource?.text === "string") out.push({ type: "text", text: `<context ref="${String(b.resource.uri || "").replace(/[<>"]/g, "")}">\n${b.resource.text}\n</context>` });
+    else if (b?.type === "resource_link" && typeof b.uri === "string") out.push({ type: "text", text: `[@${String(b.name || b.uri)}](${b.uri})` });
+  }
+  return out;
+}
+
+// What a Claude Code tool call is, as ACP says one: its kind, a title, the
+// files it names and, for an edit, its diff (the turn's record of what it
+// changed reads those), with its input.
+const CLAUDE_KINDS = { Bash: "execute", BashOutput: "execute", KillShell: "execute", KillBash: "execute", Read: "read", NotebookRead: "read", Edit: "edit", MultiEdit: "edit", Write: "edit", NotebookEdit: "edit", Grep: "search", Glob: "search", LS: "search", WebFetch: "fetch", WebSearch: "fetch", Agent: "think", Task: "think", TodoWrite: "think", ExitPlanMode: "switch_mode" };
+export function claudeToolCall(id, name, input) {
+  const i = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+  const str = (v) => (typeof v === "string" ? v : "");
+  const path = str(i.file_path) || str(i.notebook_path) || str(i.path) || null;
+  const line = (v) => str(v).split("\n")[0].slice(0, 200);
+  const title = name === "Bash" ? (line(i.command) || "Run a command")
+    : path && /^(Read|Edit|MultiEdit|Write|NotebookEdit|NotebookRead)$/.test(name) ? `${name} ${path}`
+    : name === "Grep" ? `Search for ${line(i.pattern)}`
+    : name === "Glob" ? `Find ${line(i.pattern)}`
+    : name === "WebFetch" ? `Fetch ${line(i.url)}`
+    : name === "WebSearch" ? `Search the web for ${line(i.query)}`
+    : (name === "Agent" || name === "Task") ? (line(i.description) || name)
+    : name;
+  const diffs = name === "Write" && path ? [{ type: "diff", path, oldText: null, newText: str(i.content) }]
+    : name === "Edit" && path ? [{ type: "diff", path, oldText: str(i.old_string), newText: str(i.new_string) }]
+    : name === "MultiEdit" && path && Array.isArray(i.edits) ? i.edits.slice(0, 20).map((e) => ({ type: "diff", path, oldText: str(e?.old_string), newText: str(e?.new_string) }))
+    : [];
+  return {
+    toolCallId: String(id || ""),
+    title,
+    kind: CLAUDE_KINDS[name] || "other",
+    status: "pending",
+    rawInput: i,
+    ...(path ? { locations: [{ path }] } : {}),
+    ...(diffs.length ? { content: diffs } : {}),
+    // (Whose it is, for a subagent's steps: as Claude Code's ACP adapter says it.)
+    _meta: { claudeCode: { toolName: name } },
+  };
+}
+
+// Claude Code's stream-json, as ACP's session/update: words and thinking as
+// they come (--include-partial-messages; the whole message that follows is not
+// said again), its tool calls and their results, its plan (TodoWrite), its
+// slash commands, and what the turn used. A subagent's are marked with the
+// call that launched it (lineage). `line(event)` answers the updates it makes.
+export class ClaudeStream {
+  constructor() {
+    this.streamed = new Set(); // "<message id>:text|thinking" said as it came
+    this.current = new Map(); // parent call (or "") -> the message id being streamed
+  }
+  line(m) {
+    if (!m || typeof m !== "object") return [];
+    const parent = typeof m.parent_tool_use_id === "string" && m.parent_tool_use_id ? m.parent_tool_use_id : null;
+    const mine = (u, toolName) => (parent || toolName ? { ...u, _meta: { claudeCode: { ...(toolName ? { toolName } : {}), ...(parent ? { parentToolUseId: parent } : {}) } } } : u);
+    if (m.type === "system" && m.subtype === "init") {
+      const cmds = Array.isArray(m.slash_commands) ? m.slash_commands.filter((c) => typeof c === "string").slice(0, 200) : [];
+      return cmds.length ? [{ sessionUpdate: "available_commands_update", availableCommands: cmds.map((name) => ({ name, description: "" })) }] : [];
+    }
+    if (m.type === "stream_event") {
+      const e = m.event || {};
+      const key = parent || "";
+      if (e.type === "message_start" && typeof e.message?.id === "string") this.current.set(key, e.message.id);
+      if (e.type !== "content_block_delta") return [];
+      const id = this.current.get(key) || "";
+      if (e.delta?.type === "text_delta" && typeof e.delta.text === "string" && e.delta.text) {
+        this.streamed.add(`${id}:text`);
+        return [mine({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: e.delta.text } })];
+      }
+      if (e.delta?.type === "thinking_delta" && typeof e.delta.thinking === "string" && e.delta.thinking) {
+        this.streamed.add(`${id}:thinking`);
+        return [mine({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: e.delta.thinking } })];
+      }
+      return [];
+    }
+    if (m.type === "assistant" && Array.isArray(m.message?.content)) {
+      const id = String(m.message.id || "");
+      const out = [];
+      for (const b of m.message.content) {
+        if (b?.type === "text" && typeof b.text === "string" && b.text && !this.streamed.has(`${id}:text`)) out.push(mine({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: b.text } }));
+        else if (b?.type === "thinking" && typeof b.thinking === "string" && b.thinking && !this.streamed.has(`${id}:thinking`)) out.push(mine({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: b.thinking } }));
+        else if (b?.type === "tool_use") {
+          const call = claudeToolCall(b.id, String(b.name || ""), b.input);
+          out.push({ sessionUpdate: "tool_call", ...call, _meta: { claudeCode: { toolName: String(b.name || ""), ...(parent ? { parentToolUseId: parent } : {}) } } });
+          if (b.name === "TodoWrite" && Array.isArray(b.input?.todos)) {
+            out.push({ sessionUpdate: "plan", entries: b.input.todos.slice(0, 50).map((t) => ({ content: String(t?.content || t?.activeForm || ""), status: ["pending", "in_progress", "completed"].includes(t?.status) ? t.status : "pending", priority: "medium" })) });
+          }
+        }
+      }
+      return out;
+    }
+    if (m.type === "user" && Array.isArray(m.message?.content)) {
+      const out = [];
+      for (const b of m.message.content) {
+        if (b?.type !== "tool_result") continue;
+        const parts = typeof b.content === "string" ? [b.content] : Array.isArray(b.content) ? b.content.filter((c) => c?.type === "text" && typeof c.text === "string").map((c) => c.text) : [];
+        const text = parts.join("\n");
+        out.push(mine({ sessionUpdate: "tool_call_update", toolCallId: String(b.tool_use_id || ""), status: b.is_error ? "failed" : "completed", ...(text ? { content: [{ type: "content", content: { type: "text", text: cut(text, 20000) } }] } : {}) }));
+      }
+      return out;
+    }
+    if (m.type === "result") {
+      const u = m.usage && typeof m.usage === "object" ? m.usage : null;
+      const window = Object.values(m.modelUsage || {}).map((x) => Number(x?.contextWindow)).find((n) => Number.isFinite(n) && n > 0);
+      if (!u) return [];
+      const used = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"].reduce((s, k) => s + (Number(u[k]) || 0), 0);
+      return [{ sessionUpdate: "usage_update", used, ...(window ? { size: window } : {}), ...(Number.isFinite(m.total_cost_usd) ? { cost: { amount: m.total_cost_usd, currency: "USD" } } : {}) }];
+    }
+    return [];
+  }
+}
+
+const rpcError = (code, message) => Object.assign(new Error(message), { code });
+
+// What the session that made the page was started with on this computer, as
+// `foldrender publish` noted it there (FR_MADE_DIR, by its session id): the
+// settings files it was given and its model. Only files that are there, and
+// a model that is a name. Nothing when none was noted (a publish of an older
+// CLI, another computer's session): the CLI as it is set up here.
+export function madeDir(env = process.env) {
+  return join(env.XDG_STATE_HOME || join(env.HOME || homedir(), ".local", "state"), "foldrender", "made");
+}
+export function madeLaunch(made, env = process.env) {
+  const none = { settings: [], model: null };
+  if (!made || typeof made.session !== "string" || !MADE_ID.test(made.session)) return none;
+  let o = null;
+  try { o = JSON.parse(readFileSync(join(madeDir(env), `${made.session}.json`), "utf8")); } catch { return none; }
+  if (!o || o.session !== made.session || o.agent !== made.agent) return none;
+  const settings = (Array.isArray(o.settings) ? o.settings : []).filter((f) => {
+    if (typeof f !== "string" || !isAbsolute(f) || f.length > 1024 || /[\u0000-\u001f]/.test(f)) return false;
+    try { return statSync(f).isFile(); } catch { return false; }
+  }).slice(0, 8);
+  const model = typeof o.model === "string" && /^[A-Za-z0-9][A-Za-z0-9._:/[\]-]{0,99}$/.test(o.model) ? o.model : null;
+  return { settings, model };
+}
+
+// The owner's MCP servers for a CLI's turn (ACP's list, as --mcp gave them):
+// Claude Code's --mcp-config JSON, or null.
+export function cliMcpConfig(servers) {
+  const list = (Array.isArray(servers) ? servers : []).filter((s) => s && typeof s.name === "string" && typeof s.command === "string");
+  if (!list.length) return null;
+  return JSON.stringify({ mcpServers: Object.fromEntries(list.map((s) => [s.name, { command: s.command, args: Array.isArray(s.args) ? s.args : [], env: Object.fromEntries((Array.isArray(s.env) ? s.env : []).filter((e) => e && typeof e.name === "string").map((e) => [e.name, String(e.value ?? "")])) }])) });
+}
+
+export class CliAgent {
+  // def: a CLI_AGENTS entry; handlers: as AgentProcess's (update, permission);
+  // launch: madeLaunch's; spawnImpl: the tests' own.
+  constructor(def, { env = process.env, cwd = process.cwd(), handlers, launch = null, spawnImpl = spawn, interruptMs = 5000 }) {
+    Object.assign(this, { def, cwd, handlers, spawnImpl, interruptMs });
+    this.env = { ...env };
+    for (const k of def.inside || []) delete this.env[k];
+    this.launch = launch || { settings: [], model: null };
+    this.bin = def.find(this.env);
+    this.closed = false;
+    this.stderr = "";
+    this.sessions = new Map(); // session id -> {cwd, mcp, start}
+    this.turns = new Map(); // session id -> the turn running in it
+    this.next = 1;
+    this.exited = new Promise((done) => { this.ended = done; });
+  }
+
+  version() {
+    if (!this.bin) return "";
+    try {
+      const r = spawnSync(this.bin, ["--version"], { env: this.env, encoding: "utf8", timeout: 15000, windowsHide: true });
+      return (String(r.stdout || "").match(/\d+\.\d+\.\d+[^\s]*/) || [""])[0];
+    } catch {
+      return "";
+    }
+  }
+
+  request(method, params = {}) {
+    if (this.closed) return Promise.reject(new Error("the agent is not running"));
+    try {
+      return Promise.resolve(this.handle(method, params || {}));
+    } catch (err) {
+      return Promise.reject(err);
+    }
+  }
+
+  notify(method, params) {
+    if (method === "session/cancel") this.cancel(String(params?.sessionId || ""));
+  }
+
+  handle(method, p) {
+    const d = this.def;
+    const cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : this.cwd;
+    if (method === "initialize") {
+      return { protocolVersion: 1, agentInfo: { name: d.name, version: this.version() }, agentCapabilities: { loadSession: false, promptCapabilities: { image: true, embeddedContext: true }, sessionCapabilities: { resume: {}, fork: {} } } };
+    }
+    if (method === "session/new") {
+      const id = randomUUID();
+      this.sessions.set(id, { cwd, mcp: p.mcpServers, start: d.begin.new(id) });
+      return { sessionId: id };
+    }
+    if (method === "session/resume") {
+      const id = String(p.sessionId || "");
+      if (!d.transcript(id, this.env)) throw rpcError(-32002, `No conversation found with session ID: ${id} on this computer`);
+      this.sessions.set(id, { cwd, mcp: p.mcpServers, start: d.begin.resume(id) });
+      return {};
+    }
+    if (method === "session/fork") {
+      const from = String(p.sessionId || "");
+      const file = d.transcript(from, this.env);
+      if (!file) throw rpcError(-32002, `No conversation found with session ID: ${from} on this computer`);
+      const point = p._meta?.jetbrains?.air?.fork?.messageId;
+      let at = null;
+      if (typeof point === "string" && point) {
+        at = d.forkPoint(file, point);
+        if (!at) throw rpcError(-32602, `Fork point message ${point} was not found in session ${from}`);
+      }
+      const id = randomUUID();
+      this.sessions.set(id, { cwd, mcp: p.mcpServers, start: d.begin.fork(from, id, at) });
+      return { sessionId: id };
+    }
+    if (method === "session/prompt") return this.prompt(String(p.sessionId || ""), p.prompt);
+    throw rpcError(-32601, `${d.name} here does not offer ${method}`);
+  }
+
+  // One turn: the CLI started on the session, the message given, its stream
+  // passed on, its questions asked, until its result.
+  prompt(id, blocks) {
+    const d = this.def;
+    const s = this.sessions.get(id);
+    if (!s) return Promise.reject(rpcError(-32002, `No session ${id} is open here`));
+    if (this.turns.has(id)) return Promise.reject(rpcError(-32603, "a turn is already running in this session"));
+    if (!this.bin) return Promise.reject(new Error(`${d.name} is not installed here (${d.bin} is not on the PATH)`));
+    // (The owner's MCP servers, their env with them, in a file only the owner
+    // reads, for this turn: never on the command line, which every user of
+    // the computer can read.)
+    const mcpJson = cliMcpConfig(s.mcp);
+    let mcpDir = null;
+    let mcp = null;
+    if (mcpJson) {
+      mcpDir = mkdtempSync(join(tmpdir(), "fr-mcp-"));
+      chmodSync(mcpDir, 0o700);
+      mcp = join(mcpDir, "mcp.json");
+      writeFileSync(mcp, mcpJson, { mode: 0o600 });
+    }
+    const gone = () => { if (mcpDir) { try { rmSync(mcpDir, { recursive: true, force: true }); } catch { /* gone */ } } };
+    const args = d.args({ launch: this.launch, start: s.start, mcp });
+    return new Promise((resolveTurn, rejectTurn) => {
+      let child;
+      try {
+        child = this.spawnImpl(this.bin, args, { cwd: s.cwd, env: this.env, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", windowsHide: true });
+      } catch (err) {
+        gone();
+        rejectTurn(err);
+        return;
+      }
+      const turn = { child, cancelled: false, result: null, stderr: "", timer: null, done: false };
+      this.turns.set(id, turn);
+      const stream = d.stream();
+      const write = (o) => { try { child.stdin.write(JSON.stringify(o) + "\n"); } catch { /* gone */ } };
+      const finish = (err, value) => {
+        if (turn.done) return;
+        turn.done = true;
+        clearTimeout(turn.timer);
+        this.turns.delete(id);
+        gone();
+        try { child.stdin.end(); } catch { /* closed */ }
+        // From now on the session is one to go on in (once there is one).
+        if (d.transcript(id, this.env)) s.start = d.begin.resume(id);
+        if (err) rejectTurn(err); else resolveTurn(value);
+      };
+      child.stderr.on("data", (b) => { turn.stderr = (turn.stderr + b.toString()).slice(-4000); this.stderr = turn.stderr; if (DEBUG) process.stderr.write(`[agent] ${b}`); });
+      child.on("error", (err) => finish(err));
+      // (On close, not exit: its last lines are read by then.)
+      child.on("close", (code, signal) => {
+        if (turn.done) return;
+        if (d.gone(turn.stderr)) return finish(rpcError(-32002, `No conversation found with session ID: ${id}`));
+        if (turn.cancelled) return finish(null, { stopReason: "cancelled" });
+        finish(new Error(`${d.name} stopped (${signal || code})${turn.stderr ? `: ${cut(turn.stderr.trim().split("\n").slice(-3).join(" "), 400)}` : ""}`));
+      });
+      createInterface({ input: child.stdout }).on("line", (line) => {
+        debug("<", line);
+        let m;
+        try { m = JSON.parse(line); } catch { return; }
+        if (!m || typeof m !== "object") return;
+        if (m.type === "control_request") return this.control(id, m, write);
+        for (const u of stream.line(m)) {
+          try { this.handlers.update({ sessionId: id, update: u }); } catch (err) { warn("an update was not passed on:", err.message); }
+        }
+        if (m.type === "result") {
+          turn.result = m;
+          if (turn.cancelled) return finish(null, { stopReason: "cancelled" });
+          if (!m.is_error) return finish(null, { stopReason: m.subtype === "error_max_turns" ? "max_turn_requests" : "end_turn" });
+          if (d.gone(turn.stderr) || (Number(m.num_turns) === 0 && Number(m.duration_api_ms) === 0 && /no conversation found/i.test(`${m.result || ""} ${(m.errors || []).join(" ")}`))) return finish(rpcError(-32002, `No conversation found with session ID: ${id}`));
+          const why = [typeof m.result === "string" ? m.result : "", ...(Array.isArray(m.errors) ? m.errors.map(String) : [])].filter(Boolean).join("; ");
+          return finish(new Error(cut(why || `${d.name} could not answer (${m.subtype || "error"})`, 1500)));
+        }
+      });
+      write(d.message(blocks));
+    });
+  }
+
+  // A question it asks: a permission one goes to the owner as ACP's
+  // session/request_permission (allow once, or not); anything else it asks
+  // of a host is not offered here.
+  async control(id, m, write) {
+    const r = m.request || {};
+    const reply = (response) => write({ type: "control_response", response: { subtype: "success", request_id: m.request_id, response } });
+    // A form it asks the person to fill (an MCP server's elicitation): declined,
+    // as the Agent SDK answers one with no handler (what it asks, the agent can
+    // ask in its reply).
+    if (r.subtype === "elicitation") { reply({ action: "decline" }); return; }
+    if (r.subtype !== "can_use_tool") {
+      write({ type: "control_response", response: { subtype: "error", request_id: m.request_id, error: `${r.subtype || "this"} is not offered here` } });
+      return;
+    }
+    const toolUseID = r.tool_use_id;
+    // Its question to the person (AskUserQuestion): asked in its words instead,
+    // where they answer it in the sidebar.
+    if (r.tool_name === "AskUserQuestion") {
+      reply({ behavior: "deny", message: "Ask this in your reply instead: the person answers there, in the sidebar beside the page.", toolUseID });
+      return;
+    }
+    const call = claudeToolCall(toolUseID, String(r.tool_name || ""), r.input);
+    let out = null;
+    try {
+      out = await this.handlers.permission({ sessionId: id, toolCall: { ...call, ...(typeof r.description === "string" && r.description ? { title: cut(r.description, 200) } : {}) }, options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }] });
+    } catch {
+      out = null;
+    }
+    const chosen = out?.outcome?.outcome === "selected" ? out.outcome.optionId : null;
+    reply(chosen === "allow" ? { behavior: "allow", updatedInput: r.input && typeof r.input === "object" ? r.input : {}, toolUseID } : { behavior: "deny", message: chosen === "reject" ? "The person declined this." : "Not answered.", toolUseID });
+  }
+
+  // Stopped from the page: asked to stop (an interrupt, as the SDK asks),
+  // and ended if it has not within interruptMs.
+  cancel(id) {
+    const t = this.turns.get(id);
+    if (!t || t.cancelled) return;
+    t.cancelled = true;
+    try { t.child.stdin.write(JSON.stringify({ type: "control_request", request_id: `fr-interrupt-${this.next++}`, request: { subtype: "interrupt" } }) + "\n"); } catch { /* gone */ }
+    t.timer = setTimeout(() => killGroup(t.child, "SIGTERM"), this.interruptMs);
+  }
+
+  stop() {
+    this.closed = true;
+    for (const t of this.turns.values()) { t.cancelled = true; killGroup(t.child, "SIGTERM"); }
+    this.ended({ code: 0, signal: null });
+    return Promise.resolve();
+  }
+}
+
+// A turn's CLI and what it started (its own process group, but on Windows).
+function killGroup(child, sig) {
+  try {
+    if (process.platform !== "win32" && child.pid) process.kill(-child.pid, sig);
+    else if (!treeKill(child.pid)) child.kill(sig);
+  } catch { /* gone */ }
+}
+
 // ---------- what a turn was, kept by the room ----------
 
 // Whose a step is, when the agent runs subagents: the call that launched one
@@ -872,10 +1328,10 @@ export class TurnRecord {
         }
         return p;
       });
-      const record = { parts };
+      const record = { parts, ...(this.by ? { by: this.by } : {}) };
       if (bytesOf(JSON.stringify(record)) <= max) return record;
     }
-    return { parts: [...this.parts.filter((p) => p.k === "text").map((p) => ({ k: "text", text: cut(p.text, 1000) })), ...this.parts.filter((p) => p.k === "changes").map((p) => ({ ...p, files: p.files.map(({ lines, ...f }) => ({ ...f, ...(lines?.length ? { cut: true } : {}) })) }))], cut: true };
+    return { ...(this.by ? { by: this.by } : {}), parts: [...this.parts.filter((p) => p.k === "text").map((p) => ({ k: "text", text: cut(p.text, 1000) })), ...this.parts.filter((p) => p.k === "changes").map((p) => ({ ...p, files: p.files.map(({ lines, ...f }) => ({ ...f, ...(lines?.length ? { cut: true } : {}) })) }))], cut: true };
   }
 }
 
@@ -2297,8 +2753,11 @@ export class Bridge {
   // `dirGiven`: the folder was named (--dir); when it was not, the bridge
   // works in the folder of the session that made the page, when that session
   // is on this computer (useDir).
-  constructor({ api, page, agent, dir, token, command, fetchImpl = fetch, WebSocketImpl = globalThis.WebSocket, env = process.env, authHeaders = null, agentFactory = null, known = null, session = null, claudeManaged = null, managedTtlMs = 60_000, managedRead = (e) => managedSources({ env: e }), mcp = null, dirGiven = true }) {
-    Object.assign(this, { api, page, agentId: session ? "session" : agent, dir, token, command, fetchImpl, WebSocketImpl, env, authHeaders, agentFactory, session, claudeManaged, managedTtlMs, managedRead, managedAt: 0, managedCache: null, mcp, dirGiven });
+  constructor({ api, page, agent, dir, token, command, fetchImpl = fetch, WebSocketImpl = globalThis.WebSocket, env = process.env, authHeaders = null, agentFactory = null, known = null, session = null, claudeManaged = null, managedTtlMs = 60_000, managedRead = (e) => managedSources({ env: e }), mcp = null, dirGiven = true, acp = false, exitIdle = 0, cliSpawn = spawn }) {
+    Object.assign(this, { api, page, agentId: session ? "session" : agent, dir, token, command, fetchImpl, WebSocketImpl, env, authHeaders, agentFactory, session, claudeManaged, managedTtlMs, managedRead, managedAt: 0, managedCache: null, mcp, dirGiven, exitIdle, cliSpawn });
+    // The agent's own CLI, driven here (CLI_AGENTS), unless it is another
+    // client (a test's command, the app's) or its ACP adapter was asked for.
+    this.cli = !session && !command && !agentFactory && !known && !acp ? CLI_AGENTS[agent] || null : null;
     // The agent session that made the page, as the grant names it (cleanMade).
     this.madeBy = null;
     // The agent's commands run through this client (fs and terminal, within the folder).
@@ -2306,7 +2765,7 @@ export class Bridge {
     this.mcpSaid = null;
     this.known = session ? { name: `Terminal session ${session.name}`, adapter: "session" } : known || AGENTS[agent];
     // How the agent starts (a test's command, the app's client, its CLI, or its package).
-    this.how = session ? { command: null, version: "text" } : command ? { command, version: "custom" } : agentFactory ? { command: null, version: "app" } : agentCommand(this.known, env);
+    this.how = session ? { command: null, version: "text" } : command ? { command, version: "custom" } : agentFactory ? { command: null, version: "app" } : this.cli ? cliHow(this.cli, env) : agentCommand(this.known, env);
     this.sessions = new Map(); // room session id -> ACP session id (a terminal session's: the session it went to)
     this.store = new SessionStore(sessionStoreFile(env, page, dir || "."));
     this.failed = new FailedModels(failedModelsFile(env));
@@ -2353,7 +2812,7 @@ export class Bridge {
   asksFor(options) {
     if (this.loosened) return false;
     const mode = (options || []).find((x) => x.id === "mode" || x.category === "mode")?.current || null;
-    if (this.agentId === "claude") return claudeAsks(this.dir, this.env, mode || (this.agentFactory ? "default" : null), this.managedPolicy());
+    if (this.agentId === "claude") return claudeAsks(this.dir, this.env, mode || (this.agentFactory ? "default" : null), this.managedPolicy(), this.launchFiles());
     if (this.agentId === "pi") return false;
     if (this.agentId === "codex" && mode) return mode === "read-only";
     return null;
@@ -2450,16 +2909,19 @@ export class Bridge {
       const claude = findClaude(env);
       if (claude) env.CLAUDE_CODE_EXECUTABLE = claude;
     }
-    if (!this.how) throw new Error(`${this.known.name} is not installed here (its CLI, ${this.known.local?.[0] || "?"}, is not on the PATH)`);
+    if (!this.how) throw new Error(`${this.known.name} is not installed here (its CLI, ${this.cli?.bin || this.known.local?.[0] || "?"}, is not on the PATH)`);
     const command = this.how.command;
-    if (!this.command && !this.agentFactory) log(this.how.version === "installed" ? `starting ${this.known.name} (${command.join(" ")})` : `starting ${this.known.name} (the first start fetches ${this.known.adapter}, which can take a minute)`);
+    if (this.cli) log(`starting ${this.known.name} (its own CLI, ${command[0]})`);
+    else if (!this.command && !this.agentFactory) log(this.how.version === "installed" ? `starting ${this.known.name} (${command.join(" ")})` : `starting ${this.known.name} (the first start fetches ${this.known.adapter}, which can take a minute)`);
     const handlers = {
       update: (params) => this.onUpdate(params),
       permission: (params) => this.onPermission(params),
       elicit: (params) => this.onElicit(params),
       client: (method, params) => this.onClient(method, params),
     };
-    const agent = this.agentFactory ? this.agentFactory({ env, cwd: this.dir, handlers }) : new AgentProcess(command, { env, cwd: this.dir, handlers });
+    const agent = this.agentFactory ? this.agentFactory({ env, cwd: this.dir, handlers })
+      : this.cli ? new CliAgent(this.cli, { env, cwd: this.dir, handlers, launch: madeLaunch(this.madeBy, this.env), spawnImpl: this.cliSpawn })
+      : new AgentProcess(command, { env, cwd: this.dir, handlers });
     this.agent = agent;
     this.sessions.clear();
     this.opts.clear();
@@ -2488,6 +2950,7 @@ export class Bridge {
   // Connect, and keep connected: a dropped socket opens again, with a new grant.
   async run() {
     let wait = 1000;
+    this.idle();
     while (!this.stopped) {
       let closed;
       if (this.session && !(await this.sessionOpen())) {
@@ -2532,7 +2995,7 @@ export class Bridge {
         opened = true;
         lastHeard = Date.now();
         // (The desktop app starts every session in the mode that asks.)
-        const auto = this.agentId === "claude" ? claudeAutoRuns(this.dir, this.env, this.agentFactory ? "default" : null) : null;
+        const auto = this.agentId === "claude" ? claudeAutoRuns(this.dir, this.env, this.agentFactory ? "default" : null, this.launchFiles()) : null;
         // A terminal session's: text only.
         const text = this.session ? true : undefined;
         // A turn still running here (the socket dropped, the agent did not) is
@@ -2752,7 +3215,7 @@ export class Bridge {
   autoFor(options) {
     if (this.agentId !== "claude") return null;
     const mode = options.find((x) => x.id === "mode" || x.category === "mode")?.current || null;
-    return claudeAutoRuns(this.dir, this.env, mode);
+    return claudeAutoRuns(this.dir, this.env, mode, this.launchFiles());
   }
 
   // The owner's message that is one of the agent's slash commands ("/name
@@ -3224,6 +3687,23 @@ export class Bridge {
     turn.record.parts.push({ k: "note", code: "report-kept", text: "Its answer goes back to the session that made the page, with that session's next message in the conversation that continues it." });
   }
 
+  // The settings files the agent's CLI is started with here (--settings, as
+  // the session that made the page was: madeLaunch), which decide with the
+  // folder's and the user's whether it asks first. None through an adapter.
+  launchFiles() {
+    return this.cli ? madeLaunch(this.madeBy, this.env).settings : [];
+  }
+
+  // Who answered a turn, for the sidebar to say beside it: the agent, its own
+  // CLI or its adapter, and which session: the one that made the page itself
+  // (continue), a fork of it, a subagent of it, or one of the conversation's
+  // own (none). Never which session, computer or folder: a page's
+  // collaborators see its conversations.
+  answeredBy(p) {
+    const start = this.store.get(this.agentId, p.sid)?.start || p.start || null;
+    return { agent: this.agentId, via: this.cli ? "cli" : this.agentFactory ? "app" : "acp", ...(START_MODES.has(start) ? { start } : {}) };
+  }
+
   sessionNote(turn, code, text) {
     turn.record.parts = turn.record.parts.filter((x) => !(x.k === "note" && x.session));
     const note = { k: "note", session: true, code, text };
@@ -3234,6 +3714,7 @@ export class Bridge {
 
   // One message, start to end.
   async runTurn(p) {
+    this.idle();
     // Its settings read again (another session in the folder may have kept
     // an "always allow" there): the room told if it is no longer sure.
     this.sayAsks();
@@ -3328,7 +3809,9 @@ export class Bridge {
       else if (!turn.cancelled && turn.record.parts.some((x) => x.k === "text")) this.modelSaid(p.sid, turn.model, null);
       // A subagent's answer, for the session it is a subagent of.
       if (!turn.cancelled && !failedWhy) this.keepReport(p, turn);
+      turn.record.by = this.answeredBy(p);
       this.send({ t: "done", seq: p.seq, stop, record: turn.record.fit(this.limits.turn_bytes - 1024) });
+      this.idle();
       this.sendUsage(p.sid);
       log(`done (${stop})`);
     } catch (err) {
@@ -3728,8 +4211,22 @@ export class Bridge {
   }
 
   // Resolves once the agent (and what it started) is gone.
+  // With --exit-idle: stopped once nothing has happened for that long (no
+  // turn running); each message starts the wait again.
+  idle() {
+    if (!this.exitIdle) return;
+    clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => {
+      if (this.turn) return this.idle();
+      log(`nothing to do for ${this.exitIdle} s: stopping (a message on the page starts it again)`);
+      this.stop();
+    }, this.exitIdle * 1000);
+    this.idleTimer.unref?.();
+  }
+
   stop() {
     this.stopped = true;
+    clearTimeout(this.idleTimer);
     try { this.ws?.close(1000, "bridge stopped"); } catch { /* closed */ }
     const gone = Promise.all([Promise.resolve(this.agent?.stop()), this.terms.stopAll()]);
     this.panel.stop();
@@ -3952,7 +4449,7 @@ async function main() {
     try { mcpServersFor(mcp, { mcpCapabilities: { http: true, sse: true } }, args.agent); } catch (err) { warn(`--mcp ${args.mcp}: ${cut(err.message, 200)}`); return 2; }
     if (session) { warn("--mcp is for an agent the bridge starts, not a terminal session"); return 2; }
   }
-  const bridge = new Bridge({ api: args.api, page: args.page, agent: args.agent, dir, token, command, env, session, mcp, dirGiven: Boolean(args.dirGiven) });
+  const bridge = new Bridge({ api: args.api, page: args.page, agent: args.agent, dir, token, command, env, session, mcp, dirGiven: Boolean(args.dirGiven), acp: Boolean(args.acp), exitIdle: args.exitIdle || 0 });
   // A channel ends with its session: Claude Code closes its stdin.
   if (channel) channel.closed.then(() => { bridge.stop(); setTimeout(() => process.exit(0), 1500).unref(); });
   // Stopped (Ctrl-C, a signal): the room is told by the socket's close, which

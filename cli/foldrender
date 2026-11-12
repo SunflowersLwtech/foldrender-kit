@@ -31,15 +31,15 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.21.3
+FR_CLI_VERSION=0.22.0
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=6a4ded47a7035f2fad003c6446cdb00ef1766faa2f08967973749b587c0d9fe1
+FR_BRIDGE_SHA256=4504c2d162a21c0f2558727500adbc6e8039571a2c0dcdf065f6985ce70117be
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=0df793094d7aac8db9e6ff594e4737def9e114d05115e9492fabeed82d3c191a
+FR_DESK_AGENT_SHA256=1ea9c977ae2addffd348c267824e9bf8516615b940fad76793121c4d9ed96544
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -538,11 +538,14 @@ made_by_header() {
   # Not a name Claude Code made up from the conversation (nameSource auto):
   # given (user), from the folder (derived), a peer's or a hook's, or one
   # from before names had a source.
+  local own=""
   if [ -n "${CLAUDE_PID:-}" ] && [ -f "$root/sessions/${CLAUDE_PID}.json" ] && [ "$(json_get str sessionId "$root/sessions/${CLAUDE_PID}.json" 2>/dev/null)" = "$sid" ]; then
+    own=1
     case "$(json_get str nameSource "$root/sessions/${CLAUDE_PID}.json" 2>/dev/null)" in
       ''|user|derived|collision|peer|hook) name="$(json_get str name "$root/sessions/${CLAUDE_PID}.json" 2>/dev/null)" || name="" ;;
     esac
   fi
+  made_launch "$sid" "$cwd" "$own"
   machine="${FOLDRENDER_MACHINE:-$(default_machine_name)}"
   {
     printf '{"agent":"claude","session":%s,"cwd":%s,"machine":%s' "$(json_arg "$sid")" "$(json_arg "$cwd")" "$(json_arg "$machine")"
@@ -551,6 +554,56 @@ made_by_header() {
     printf '}'
   } > "$TMP/made-by.json"
   FR_MADE_BY="$(base64 < "$TMP/made-by.json" | tr -d '\n=' | tr '+/' '-_')"
+}
+
+# made_launch SESSION CWD OWN: that this session published from this computer,
+# and how its Claude Code was started, noted here only (never sent):
+# ${XDG_STATE_HOME:-~/.local/state}/foldrender/made/SESSION.json, mode 600.
+# The page's sidebar takes the session up with this computer's `foldrender
+# bridge`, which starts Claude Code with the same settings files (--settings
+# FILE: a gateway's, say, where the CLI has no sign-in of its own) and model:
+# the Claude Code that works in the owner's terminal, not a bare one. Its
+# arguments are read only when Claude Code's own list of open sessions says
+# that process (CLAUDE_PID) has this session (OWN); only a value that is a file
+# here is kept (a settings value given as JSON may hold a key: it is not one).
+# FR_MADE_ARGS_FILE: the arguments, NUL-separated, in place of the process's
+# (the tests').
+made_launch() {
+  local sid="$1" cwd="$2" own="${3:-}" dir f a i model="" args=() settings=() list=""
+  dir="${XDG_STATE_HOME:-$HOME/.local/state}/foldrender/made"
+  if [ -n "${FR_MADE_ARGS_FILE:-}" ]; then
+    while IFS= read -r -d '' a; do args+=("$a"); done < "$FR_MADE_ARGS_FILE"
+  elif [ -n "$own" ]; then
+    if [ -r "/proc/${CLAUDE_PID}/cmdline" ]; then
+      while IFS= read -r -d '' a; do args+=("$a"); done < "/proc/${CLAUDE_PID}/cmdline"
+    else
+      # (A Mac: as ps prints them, split at spaces.)
+      read -r -a args <<< "$(ps -ww -o args= -p "$CLAUDE_PID" 2>/dev/null)"
+    fi
+  fi
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    a=""
+    case "${args[$i]}" in
+      --settings) a="${args[$((i + 1))]:-}"; i=$((i + 1)) ;;
+      --settings=*) a="${args[$i]#--settings=}" ;;
+      --model) model="${args[$((i + 1))]:-}"; i=$((i + 1)) ;;
+      --model=*) model="${args[$i]#--model=}" ;;
+    esac
+    case "$a" in
+      /*) f="$a" ;;
+      '') continue ;;
+      *) f="$cwd/$a" ;;
+    esac
+    [ -f "$f" ] && settings+=("$f")
+  done
+  case "$model" in *[!A-Za-z0-9._:/\[\]-]*) model="" ;; esac
+  for f in ${settings[@]+"${settings[@]}"}; do list="${list:+$list,}$(json_arg "$f")"; done
+  ( umask 077
+    mkdir -p "$dir" 2>/dev/null && chmod 700 "$dir" 2>/dev/null
+    { printf '{"agent":"claude","session":%s,"cwd":%s,"settings":[%s]' "$(json_arg "$sid")" "$(json_arg "$cwd")" "$list"
+      [ -z "$model" ] || printf ',"model":%s' "$(json_arg "$model")"
+      printf ',"at":%s}\n' "$(date +%s)"
+    } > "$dir/$sid.json.tmp.$$" && mv -f "$dir/$sid.json.tmp.$$" "$dir/$sid.json" ) 2>/dev/null || true
 }
 
 upload() {
@@ -5354,7 +5407,7 @@ thread_hook_install() {
 }
 
 cmd_bridge() {
-  local target="" agent="claude" dir="$PWD" dir_given="" session="" channel="" mesh_cli="" mcp="" node_major file cache url got
+  local target="" agent="claude" dir="$PWD" dir_given="" session="" channel="" mesh_cli="" mcp="" acp="" idle="" extra=() node_major file cache url got
   while [ $# -gt 0 ]; do
     case "$1" in
       --page) need $# "$1"; target="$2"; shift 2 ;;
@@ -5363,6 +5416,8 @@ cmd_bridge() {
       --mesh-cli) need $# "$1"; mesh_cli="$2"; shift 2 ;;
       --mcp) need $# "$1"; mcp="$2"; shift 2 ;;
       --channel) channel=1; shift ;;
+      --acp) acp=1; shift ;;
+      --exit-idle) need $# "$1"; idle="$2"; shift 2 ;;
       --dir) need $# "$1"; dir="$2"; dir_given=1; shift 2 ;;
       -*) die 2 "unknown option: $1" ;;
       *) [ -z "$target" ] || die 2 "bridge takes one page"; target="$1"; shift ;;
@@ -5374,6 +5429,11 @@ cmd_bridge() {
   [ -d "$dir" ] || die 2 "--dir $dir is not a folder"
   [ -z "$mcp" ] || [ -z "$session$channel" ] || die 2 "--mcp is for an agent the bridge starts (--agent), not a terminal session"
   [ -z "$mcp" ] || [ -f "$mcp" ] || die 2 "--mcp $mcp is not a file"
+  case "$idle" in ''|[0-9]|[0-9][0-9]|[0-9][0-9][0-9]|[0-9][0-9][0-9][0-9]|[0-9][0-9][0-9][0-9][0-9]) ;; *) die 2 "--exit-idle is a number of seconds, 60 to 86400" ;; esac
+  [ -z "$idle" ] || { [ "$idle" -ge 60 ] && [ "$idle" -le 86400 ]; } || die 2 "--exit-idle is a number of seconds, 60 to 86400"
+  [ -z "$acp$idle" ] || [ -z "$session$channel" ] || die 2 "--acp and --exit-idle are for an agent the bridge starts (--agent), not a terminal session"
+  [ -z "$acp" ] || extra+=(--acp)
+  [ -z "$idle" ] || extra+=(--exit-idle "$idle")
   require_token
   command -v node >/dev/null 2>&1 || die 2 "the bridge needs Node 22 or later (https://nodejs.org); it is not installed"
   node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null)"
@@ -5413,9 +5473,9 @@ cmd_bridge() {
   local dir_args=()
   [ -z "$dir_given" ] || dir_args=(--dir "$dir")
   if [ -n "$mcp" ]; then
-    exec node "$file" --api "$API" --page "$PAGE_ID" --agent "$agent" --mcp "$mcp" ${dir_args[@]+"${dir_args[@]}"}
+    exec node "$file" --api "$API" --page "$PAGE_ID" --agent "$agent" --mcp "$mcp" ${dir_args[@]+"${dir_args[@]}"} ${extra[@]+"${extra[@]}"}
   fi
-  exec node "$file" --api "$API" --page "$PAGE_ID" --agent "$agent" ${dir_args[@]+"${dir_args[@]}"}
+  exec node "$file" --api "$API" --page "$PAGE_ID" --agent "$agent" ${dir_args[@]+"${dir_args[@]}"} ${extra[@]+"${extra[@]}"}
 }
 
 # foldrender reply --page PAGE [--to N] TEXT|-|--file FILE: a terminal session's answer to
@@ -5760,10 +5820,16 @@ foldrender desk COMMAND [--desk ID] [--json]
                        here (each agent, its state, the last line it printed)
                        and how loaded the machine is, only when that changed,
                        with tokens, keys and passwords made [redacted] before
-                       anything leaves. With no token here it makes the machine
+                       anything leaves. It also starts the agent sidebar's
+                       bridge for a page published from this computer when its
+                       owner writes there and no bridge is with it (foldrender
+                       bridge --page P --exit-idle 1800; its log in bridges/
+                       beside the agent's own). With no token here it makes the machine
                        with your sign-in (NAME: this host's name); --replace
                        gives it a new token. Needs Node 22 or later
-  agent status         installed? running? connected? (exit 1: not running)
+  agent status         installed? running? connected? and what the last wakes
+                       (the sidebar asking for a bridge here) came to; exit 1:
+                       not running
   agent uninstall [--keep-token] | agent run [--detach]
   The same KEY again changes the thing (its revision goes up; an answer to an
   older revision is refused). Anything that looks like a secret (a key, a
@@ -6041,7 +6107,7 @@ foldrender answers --inbox | --ack ID,ID --to NAME
 EOF
     ;;
     bridge) cat <<'EOF'
-foldrender bridge --page PAGE [--dir DIR] [--agent claude|codex|gemini|antigravity|grok|devin|pi] [--mcp FILE]
+foldrender bridge --page PAGE [--dir DIR] [--agent claude|codex|gemini|antigravity|grok|devin|pi] [--mcp FILE] [--acp] [--exit-idle SECONDS]
 foldrender bridge --page PAGE --session NAME [--mesh-cli PATH]
 foldrender bridge --page PAGE --channel
   Connects a coding agent on this computer to PAGE's agent sidebar, and stays
@@ -6127,8 +6193,16 @@ foldrender bridge --page PAGE --channel
                        gets those the agent takes (stdio by all but pi, which
                        has no MCP; http and sse as it says). Their settings
                        stay on this computer.
-  --agent NAME         the agent, started as the ACP registry starts it:
-                       claude  Claude Code (default; its ACP adapter, via npx)
+  --agent NAME         the agent:
+                       claude  Claude Code (default): the claude on this
+                               computer, run by the bridge itself (claude -p
+                               on the session's own id: --resume, --session-id,
+                               --fork-session), as it runs in your terminal, so
+                               no other sign-in. A session that published a page
+                               from here is started with the settings files and
+                               model it was started with (noted on this computer
+                               by foldrender publish, never sent)
+                       The others, as the ACP registry starts them:
                        codex   Codex (codex-acp, via npx; signed in: codex login)
                        gemini  Gemini CLI (via npx, --acp; a Gemini API key or
                                Vertex: Google no longer lets a personal
@@ -6161,8 +6235,13 @@ foldrender bridge --page PAGE --channel
                        --dangerously-load-development-channels server:foldrender.
                        Messages arrive in that session as channel events; it
                        answers with the reply tool. Text only.
-  Needs Node 22 or later and the agent installed and signed in. The bridge
-  program is fetched once from the site and checked against this version.
+  --acp                Claude Code through its ACP adapter (via npx), as
+                       before 0.22.0, instead of its own CLI.
+  --exit-idle SECONDS  stop after that long with nothing to do (60 to 86400;
+                       the desk agent starts a bridge so when a message waits).
+  Needs Node 22 or later and the agent installed (and, for all but Claude
+  Code, signed in). The bridge program is fetched once from the site and
+  checked against this version.
 EOF
     ;;
     reply) cat <<'EOF'

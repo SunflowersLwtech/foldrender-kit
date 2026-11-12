@@ -1,6 +1,6 @@
 {
   "name": "foldrender",
-  "version": "0.21.3",
+  "version": "0.22.0",
   "description": "Publish an HTML page as a link that opens on any device, put several pages on one canvas, and read FoldRender pages, comments and answers back as text.",
   "author": {
     "name": "DuoCode Technology",
