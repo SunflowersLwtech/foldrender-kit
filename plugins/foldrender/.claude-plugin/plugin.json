@@ -1,7 +1,7 @@
 {
   "name": "foldrender",
   "displayName": "FoldRender",
-  "version": "0.21.2",
+  "version": "0.21.3",
   "description": "Publish an HTML page (a report, diagram, explainer or dashboard) as a link that opens on any device, put several pages on one canvas, and read FoldRender pages, comments and answers back as text. Works with an API key, a cloud provider or zero data retention.",
   "author": {
     "name": "DuoCode Technology",

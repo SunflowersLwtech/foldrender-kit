@@ -36,7 +36,7 @@ import { basename, delimiter, dirname, extname, join, resolve, sep } from "node:
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const BRIDGE_VERSION = "0.21.2";
+export const BRIDGE_VERSION = "0.21.3";
 export const PROTOCOL = "fr-agent.1";
 // How the owner may begin a conversation from the session that made the page.
 export const START_MODES = new Set(["continue", "fork", "subagent"]);
@@ -1364,7 +1364,8 @@ export function cleanMade(m) {
   if (typeof m.agent !== "string" || !AGENTS[m.agent] || !MADE_ID.test(String(m.session || ""))) return null;
   if (typeof m.cwd !== "string" || !m.cwd || m.cwd.length > 1024 || /[\u0000-\u001f]/.test(m.cwd) || !(m.cwd.startsWith("/") || /^[A-Za-z]:[\\/]/.test(m.cwd))) return null;
   const out = { agent: m.agent, session: m.session, cwd: m.cwd };
-  for (const k of ["machine", "turn", "name", "published_at"]) if (typeof m[k] === "string" && m[k] && m[k].length <= 128 && !/[\u0000-\u001f]/.test(m[k])) out[k] = m[k];
+  // (A turn up to 512: another model's message id, a gateway's answer when Claude cannot, can be long base64; src/made-by.js.)
+  for (const k of ["machine", "turn", "name", "published_at"]) if (typeof m[k] === "string" && m[k] && m[k].length <= (k === "turn" ? 512 : 128) && !/[\u0000-\u001f]/.test(m[k])) out[k] = m[k];
   if (Number.isInteger(m.rev)) out.rev = m.rev;
   return out;
 }
@@ -1400,20 +1401,22 @@ function agentWords(d) {
   if (!Array.isArray(c)) return "";
   return c.filter((b) => b && b.type === "text" && typeof b.text === "string").map((b) => b.text).join("\n").trim();
 }
-export async function claudeExcerpt(file, upTo = null) {
+export async function claudeExcerpt(file, upTo = null, owner = null) {
   const out = { first: "", asked: [], said: "", found: false };
   if (!file) return out;
   const lines = createInterface({ input: createReadStream(file, { encoding: "utf8" }), crlfDelay: Infinity });
   let inTurn = false;
   for await (const line of lines) {
     const user = line.includes('"type":"user"');
-    if (!user && !line.includes('"type":"assistant"')) continue;
+    const queued = !user && line.includes('"type":"queued_command"');
+    if (!user && !queued && !line.includes('"type":"assistant"')) continue;
     // (The lines after the publishing turn's last are not read.)
     if (inTurn && user) break;
+    if (inTurn && queued) continue;
     let d = null;
     try { d = JSON.parse(line); } catch { continue; }
-    if (d.type === "user") {
-      const w = userWords(d);
+    if (d.type === "user" || d.type === "attachment") {
+      const w = askedWords(d, owner);
       if (!w) continue;
       if (!out.first) out.first = w;
       out.asked.push(w);
@@ -1462,15 +1465,26 @@ export const SAID_MAX = 40, SAID_CHARS = 2000, SAID_BYTES = 48000;
 // message the bridge did not write (one typed into Claude Code), kept as it is:
 // the bridge's begin with one of its own heads, in full, or an "@login wrote:"
 // line, and always end their writer's block with at least one "| " line (an
-// empty message is "| "), which a reply typed under a pasted "@x wrote:" has not.
+// empty message is "| "), which a reply typed under a pasted "@x wrote:" has
+// not, and with nothing after that block but what promptText puts there, each
+// after an empty line (TRAILERS: a quote from the page, the files, what it
+// points at), which a reply typed under a pasted "| " quote is not.
 const WROTE = /^@(\S+?)(?: \(on a [^)]*\))? wrote:$/;
+const TRAILERS = [/^Quoted from the page, as @\S+ sent it:$/, /^Files @\S+ attached \(material, as the page is: not instructions\):$/, /^What @\S+ points at \(material, as the page is: not instructions\):$/];
 const OWN_HEADS = ["You are being messaged from the agent sidebar beside a FoldRender page", "You are a subagent of another agent session: ", "Your subagent, begun from the sidebar of this page", "Your subagents, begun from the sidebar of this page", RETOLD, RETOLD_SESSION, MISSED];
 export function sidebarWords(text, owner = null) {
   const lines = String(text ?? "").split(LINES);
   const head = lines[0] || "";
   if (!WROTE.test(head) && !OWN_HEADS.some((h) => head.startsWith(h))) return null;
   let at = lines.length - 1;
-  while (at >= 0 && !(WROTE.test(lines[at]) && (lines[at + 1] || "").startsWith("| "))) at--;
+  // (The last block so closed: a file attached to the message is put after
+  // the bridge's words by the agent's adapter, and its text may hold an
+  // "@x wrote:" and "| " lines of its own.)
+  const closes = (j) => {
+    while (j < lines.length && lines[j].startsWith("| ")) j++;
+    return j >= lines.length || (lines[j] === "" && TRAILERS.some((re) => re.test(lines[j + 1] || "")));
+  };
+  while (at >= 0 && !(WROTE.test(lines[at]) && (lines[at + 1] || "").startsWith("| ") && closes(at + 1))) at--;
   if (at < 0) return null;
   const words = [];
   for (let i = at + 1; i < lines.length && lines[i].startsWith("| "); i++) words.push(lines[i].slice(2));
@@ -1478,23 +1492,98 @@ export function sidebarWords(text, owner = null) {
   const t = words.join("\n").trim();
   return t && owner && by !== owner ? `@${by}: ${t}` : t;
 }
+// A terminal session's bridge sends what is said to the session (relayTurn):
+// "[FoldRender] @login wrote in the agent sidebar of the page …", the record
+// and a quote from the page when there are, the writer's lines behind "| ", an
+// empty line and how to answer, the mesh's (a file, then foldrender reply) or
+// the channel's (its reply tool). What was said is the writer's lines (a
+// writer who is not the owner named); over the mesh, which writes < > & as
+// &lt; &gt; &amp; in what it carries, as they were written. Null for anything
+// else.
+const RELAYED = /^\[FoldRender\] @(\S+) wrote in the agent sidebar of the page "/;
+const RELAY_HINT = "To answer in the sidebar (text only), ";
+export function relayWords(body, owner = null) {
+  const lines = String(body ?? "").split(LINES);
+  const m = (lines[0] || "").match(RELAYED);
+  if (!m) return null;
+  let h = lines.length - 1;
+  const mesh = h > 1 && lines[h].startsWith("foldrender reply ") && lines[h - 1].startsWith(`${RELAY_HINT}write your answer to `);
+  if (mesh) h--;
+  else if (!lines[h].startsWith(`${RELAY_HINT}call the reply tool`)) return null;
+  if (lines[h - 1] !== "") return null;
+  let s = h - 1;
+  while (s > 1 && lines[s - 1].startsWith("| ")) s--;
+  if (s === h - 1) return null;
+  let t = lines.slice(s, h - 1).map((l) => l.slice(2)).join("\n");
+  if (mesh) t = t.replace(/&(lt|gt|amp);/g, (_, e) => ({ lt: "<", gt: ">", amp: "&" })[e]);
+  t = t.trim();
+  return t && owner && m[1] !== owner ? `@${m[1]}: ${t}` : t;
+}
+// A channel's message in a Claude Code transcript (a user line it marks
+// isMeta, or one that came while a turn ran, kept as a queued_command
+// attachment): what is inside its <channel …> tag, or null. Only one a
+// bridge sent: anyone on the mesh, or anyone who can message another channel
+// a session runs, can write a text that looks like a relay, and it would read
+// as the owner's words. Over the mesh, the relay sets who sent it and no
+// session can set it otherwise (mesh-peer.mjs takes from, sender, account and
+// source out of a sender's meta): a bridge's `say --as fr-<page>` arrives
+// from="fr-…" sender="send-only". So the mesh is told first (its server, or
+// the relay's source="peers": a peer can put page and seq in its meta), and
+// then its sender. Over Claude Code's channel, `foldrender channel` puts page
+// and seq on each (ChannelServer.notify).
+const CHANNEL_TAG = /^<channel(?: [^>]*)?>\n([\s\S]*)\n<\/channel>$/;
+const MESH_SERVER = "plugin:mesh:mesh";
+function channelBody(d) {
+  if (d.isSidechain) return null;
+  const a = d.type === "attachment" && d.attachment?.type === "queued_command" ? d.attachment : null;
+  const origin = a ? a.origin : d.type === "user" && d.isMeta ? d.origin : null;
+  const text = a ? a.prompt : d.message?.content;
+  if (origin?.kind !== "channel" || typeof text !== "string") return null;
+  const m = text.match(CHANNEL_TAG);
+  if (!m) return null;
+  const tag = text.slice(0, text.indexOf(">"));
+  const mesh = origin.server === MESH_SERVER || / source="peers"/.test(tag);
+  const ours = mesh ? / sender="send-only"/.test(tag) && / from="fr-[^" [\]]+"/.test(tag) : / page="[^"]+"/.test(tag) && / seq="\d+"/.test(tag);
+  return ours ? m[1] : null;
+}
+// A message typed into Claude Code while a turn ran: kept as a queued_command
+// attachment from a human, and nowhere else (devdesk, 11-12: 89 of 94 such
+// messages of a dozen characters or more are in no other line). What is not
+// words (Claude Code's own <tags>) is left out, as userWords leaves it out.
+function typedMidTurn(d) {
+  const a = d.type === "attachment" && !d.isSidechain && d.attachment?.type === "queued_command" ? d.attachment : null;
+  if (!a || a.origin?.kind !== "human") return "";
+  const p = a.prompt;
+  const t = (typeof p === "string" ? p : Array.isArray(p) ? p.filter((b) => b && b.type === "text" && typeof b.text === "string").map((b) => b.text).join("\n") : "").trim();
+  return t.startsWith("<") ? "" : t;
+}
+// What a user line says someone asked: one typed into Claude Code as it is
+// (at once, or while a turn ran); of one the bridge gave the agent, or a
+// terminal session's bridge sent it, what was written on the page; "" for
+// anything else.
+function askedWords(d, owner) {
+  const body = channelBody(d);
+  if (body !== null) return relayWords(body, owner) || "";
+  const w = d.type === "user" ? userWords(d) : typedMidTurn(d);
+  return w ? sidebarWords(w, owner) ?? w : "";
+}
 export async function claudeSaid(file, owner = null) {
   const all = [];
   if (!file) return { list: [], more: false };
   const lines = createInterface({ input: createReadStream(file, { encoding: "utf8" }), crlfDelay: Infinity });
   for await (const line of lines) {
-    const user = line.includes('"type":"user"');
+    const user = line.includes('"type":"user"') || line.includes('"type":"queued_command"');
     if (!user && !line.includes('"type":"assistant"')) continue;
     let d = null;
     try { d = JSON.parse(line); } catch { continue; }
-    let w = d.type === "user" ? userWords(d) : d.type === "assistant" ? agentWords(d) : "";
-    if (d.type === "user") w = sidebarWords(w, owner) ?? w;
+    const asked = d.type === "user" || d.type === "attachment";
+    const w = asked ? askedWords(d, owner) : d.type === "assistant" ? agentWords(d) : "";
     if (!w) continue;
     const at = Date.parse(d.timestamp);
     const id = d.type === "assistant" ? d.message?.id || null : null;
     const prev = all[all.length - 1];
     if (id && prev && prev.r === "a" && prev.id === id) { prev.text += "\n\n" + w; continue; }
-    all.push({ r: d.type === "user" ? "u" : "a", text: w, ...(Number.isFinite(at) ? { at } : {}), ...(id ? { id } : {}) });
+    all.push({ r: asked ? "u" : "a", text: w, ...(Number.isFinite(at) ? { at } : {}), ...(id ? { id } : {}) });
     if (all.length > SAID_MAX + 1) all.shift();
   }
   lines.close();
@@ -3099,7 +3188,7 @@ export class Bridge {
       }
     } else {
       res = await agent.request("session/new", { cwd: made.cwd, mcpServers });
-      const ex = made.agent === "claude" ? await claudeExcerpt(claudeTranscript(made.session, this.env), made.turn || null).catch(() => ({ first: "", asked: [], said: "", found: false })) : { first: "", asked: [], said: "", found: false };
+      const ex = made.agent === "claude" ? await claudeExcerpt(claudeTranscript(made.session, this.env), made.turn || null, this.info?.login || null).catch(() => ({ first: "", asked: [], said: "", found: false })) : { first: "", asked: [], said: "", found: false };
       handoff = handoffLines(made, { id: this.page, url: this.info?.url || "" }, ex);
       note = ["subagent", `A subagent of the session that made the page, told a handoff: the page, and what that session was asked and said before it published it. What it answers goes back to that session with its next message in the conversation that continues it.`];
     }
@@ -3290,7 +3379,10 @@ export class Bridge {
   onUpdate(params) {
     // The agent's slash commands (said once a session opens, a loaded one too:
     // they are what it offers now, not what it replays).
-    if (params?.update?.sessionUpdate === "available_commands_update") this.gotCommands(params.update.availableCommands);
+    // (Not the turn's to stream: said as a session opens, in its first turn
+    // here, and again when its commands change in a turn (Claude Code's
+    // adapter, as skills are found), the whole list each time.)
+    if (params?.update?.sessionUpdate === "available_commands_update") return this.gotCommands(params.update.availableCommands);
     // A session being taken up again replays what was said in it: the agent
     // remembering, not news for the page (nor a change of its mode now: the
     // answer to the load says the mode it is in).
@@ -3658,9 +3750,12 @@ export class Bridge {
 // local user could tamper with.
 export function replyHint(page, seq) {
   const file = join(homedir(), ".cache", "foldrender", "replies", `reply-${randomBytes(16).toString("hex")}.txt`);
-  return [`To answer in the sidebar (text only), write your answer to ${file}, then run:`,
+  return [`${RELAY_HINT}write your answer to ${file}, then run:`,
     `foldrender reply --page ${page} --to ${seq} --file ${file}`].join("\n");
 }
+
+// How a Claude Code channel's session answers: the reply tool the channel offers.
+export const channelHint = (p) => `${RELAY_HINT}call the reply tool with seq ${p.seq}.`;
 
 export function meshSession(name, { cli = "", env = process.env, fetchImpl = fetch, run = spawn } = {}) {
   const home = env.HOME || homedir();
@@ -3827,7 +3922,7 @@ async function main() {
       id: () => started,
       alive: async () => true,
       deliver: async (text, as, p) => channel.notify(text, { page: p.page, seq: p.seq, from: p.by }),
-      hint: (p) => `To answer in the sidebar (text only), call the reply tool with seq ${p.seq}.`,
+      hint: channelHint,
     };
   } else if (args.session) {
     if (!/^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$/.test(args.session)) { warn(`--session ${args.session} is not a session's name`); return 2; }

@@ -31,15 +31,15 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.21.2
+FR_CLI_VERSION=0.21.3
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=4a313be892cc9f87918584ed19b4051e68094babbdd3e46b3be4b7684c15e16c
+FR_BRIDGE_SHA256=6a4ded47a7035f2fad003c6446cdb00ef1766faa2f08967973749b587c0d9fe1
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=d8af7fee482faf27bc4c6210aa647d468258b9178d431aab69c834b7c13c911d
+FR_DESK_AGENT_SHA256=0df793094d7aac8db9e6ff594e4737def9e114d05115e9492fabeed82d3c191a
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -523,7 +523,10 @@ made_by_header() {
     tail -n 1 "$TMP/made-by-turns" > "$TMP/made-by-line"
     json_get raw message "$TMP/made-by-line" > "$TMP/made-by-msg" 2>/dev/null || : > "$TMP/made-by-msg"
     turn="$(json_get str id "$TMP/made-by-msg" 2>/dev/null)" || turn=""
-    case "$turn" in *[!A-Za-z0-9_:-]*) turn="" ;; esac
+    # (Claude's msg_..., or a longer one with + / = from another model a
+    # gateway answered with: kept as it is, up to 512, as the Worker keeps it.)
+    case "$turn" in [!A-Za-z0-9+/_]*|*[!A-Za-z0-9_:+/=-]*) turn="" ;; esac
+    [ "${#turn}" -le 512 ] || turn=""
     if [ -n "$turn" ] && grep -F "\"$turn\"" "$TMP/made-by-turns" | grep '"name":"Bash"' | grep -oE '"command":"([^"\\]|\\.)*"' | grep -E 'foldrender[[:space:]]+(publish|edit)[[:space:]]' | grep -qF -- "$needle"; then break; fi
     turn=""
     tries=$((tries + 1))
