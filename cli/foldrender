@@ -31,15 +31,15 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.22.2
+FR_CLI_VERSION=0.22.3
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=85ce852308295a194b6c58a33cccf3ab22eb8011fb5dae6eae82650b39af5ea1
+FR_BRIDGE_SHA256=6ae3a6db205711d30882598ef0f48cab4c1e20194185ea9658e318d78c2f815a
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=d34d6b3979e58b073023044f27565ba903d47c1dbab7d6215be4d50007947d8c
+FR_DESK_AGENT_SHA256=271e4c046e241d6061b342a26f311d6d95d1c39469cb151ffe8bb251eda6b514
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -491,8 +491,189 @@ UPLOAD_TYPE=text/html
 # runs this one names, besides foldrender. The page's owner can then take that session up
 # beside the page (foldrender help bridge). Nothing with --no-session
 # (NO_SESSION) or FOLDRENDER_NO_SESSION=1, or when no agent says.
+# pi and OpenCode too (made_by_pi, made_by_opencode): the agent is the
+# innermost one whose session runs this command (made_by_agent).
 FR_MADE_BY=""
 made_by_header() {
+  FR_MADE_BY=""
+  [ -z "${FOLDRENDER_NO_SESSION:-}" ] && [ -z "${NO_SESSION:-}" ] || return 0
+  case "$(made_by_agent)" in
+    claude) made_by_claude "${1:-}" ;;
+    pi) made_by_pi ;;
+    opencode) made_by_opencode "${1:-}" ;;
+  esac
+}
+
+# made_by_agent: the agent whose session runs this command (claude, pi or
+# opencode), or nothing. Each gives the commands it runs its marks: Claude
+# Code CLAUDE_CODE_SESSION_ID and CLAUDE_PID, pi PI_SESSION_ID and
+# PI_SESSION_FILE, OpenCode OPENCODE and OPENCODE_PID. One agent started inside
+# another's session has the outer one's too, so with marks of two, the nearest
+# of this command's parent processes that is one of them says which: the
+# innermost (Claude Code's and OpenCode's by their pid, pi's by its program).
+# Where no parent says (none can be read), Claude Code's first, as before.
+made_by_agent() {
+  local c="" p="" o="" n=0 pid="$PPID" i=0
+  [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] && { c=1; n=$((n + 1)); }
+  [ -n "${PI_SESSION_ID:-}" ] && [ -n "${PI_SESSION_FILE:-}" ] && { p=1; n=$((n + 1)); }
+  [ -n "${OPENCODE:-}" ] && [ -n "${OPENCODE_PID:-}" ] && { o=1; n=$((n + 1)); }
+  [ "$n" -gt 0 ] || return 0
+  if [ "$n" -gt 1 ]; then
+    while [ "$i" -lt 64 ]; do
+      case "$pid" in ''|0|1|*[!0-9]*) break ;; esac
+      if [ -n "$c" ] && [ "$pid" = "${CLAUDE_PID:-}" ]; then echo claude; return 0; fi
+      if [ -n "$o" ] && [ "$pid" = "${OPENCODE_PID:-}" ]; then echo opencode; return 0; fi
+      if [ -n "$p" ] && proc_is_pi "$pid"; then echo pi; return 0; fi
+      pid="$(proc_ppid "$pid")"
+      i=$((i + 1))
+    done
+  fi
+  if [ -n "$c" ]; then echo claude; elif [ -n "$p" ]; then echo pi; else echo opencode; fi
+}
+# proc_ppid PID: its parent's pid (Linux /proc, else ps), or nothing.
+proc_ppid() {
+  local st
+  if [ -r "/proc/$1/stat" ]; then
+    st="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0
+    # (After its name, in parentheses that may hold anything: its state, then its parent.)
+    st="${st##*) }"
+    set -- $st
+    printf '%s' "${2:-}"
+  else
+    ps -o ppid= -p "$1" 2>/dev/null | tr -d ' '
+  fi
+}
+# proc_is_pi PID: whether that process is pi: its program, or a script of that
+# name, or pi's own package, that a runtime (node) runs.
+proc_is_pi() {
+  local a0="" a1=""
+  if [ -r "/proc/$1/cmdline" ]; then
+    { IFS= read -r -d '' a0; IFS= read -r -d '' a1; } < "/proc/$1/cmdline" 2>/dev/null
+  else
+    read -r a0 a1 _ <<< "$(ps -ww -o args= -p "$1" 2>/dev/null)"
+  fi
+  case "${a0##*/}:$a1" in pi:*|*:*/pi|*:*/pi-coding-agent/*) return 0 ;; esac
+  return 1
+}
+# cli_bin NAME: where the program of that name this command would run is, by
+# a path that stays (its folder's links resolved: fnm's per-shell folder is
+# gone once that shell is), or nothing.
+cli_bin() {
+  local f d
+  f="$(command -v "$1" 2>/dev/null)" || return 0
+  case "$f" in /*) ;; *) return 0 ;; esac
+  d="$(cd -P "${f%/*}" 2>/dev/null && pwd)" || return 0
+  [ -f "$d/${f##*/}" ] && [ -x "$d/${f##*/}" ] && printf '%s' "$d/${f##*/}"
+}
+# made_note AGENT SESSION CWD [KEY VALUE]...: that this session published from
+# this computer, and how its CLI is started, noted here only (never sent):
+# ${XDG_STATE_HOME:-~/.local/state}/foldrender/made/SESSION.json, mode 600.
+# The KEYs: bin (the CLI), file (pi's session file), model, and an env name
+# (PI_CODING_AGENT_DIR, OPENCODE_CONFIG), each kept only when it is given.
+made_note() {
+  local agent="$1" sid="$2" cwd="$3" dir k v env=""
+  shift 3
+  dir="${XDG_STATE_HOME:-$HOME/.local/state}/foldrender/made"
+  ( umask 077
+    mkdir -p "$dir" 2>/dev/null && chmod 700 "$dir" 2>/dev/null
+    { printf '{"agent":%s,"session":%s,"cwd":%s' "$(json_arg "$agent")" "$(json_arg "$sid")" "$(json_arg "$cwd")"
+      while [ $# -ge 2 ]; do
+        k="$1"; v="$2"; shift 2
+        [ -n "$v" ] || continue
+        case "$k" in
+          bin|file|model) printf ',"%s":%s' "$k" "$(json_arg "$v")" ;;
+          *) env="${env:+$env,}$(json_arg "$k"):$(json_arg "$v")" ;;
+        esac
+      done
+      [ -z "$env" ] || printf ',"env":{%s}' "$env"
+      printf ',"at":%s}\n' "$(date +%s)"
+    } > "$dir/$sid.json.tmp.$$" && mv -f "$dir/$sid.json.tmp.$$" "$dir/$sid.json" ) 2>/dev/null || true
+}
+# made_by_send AGENT SESSION CWD: FR_MADE_BY for a session with no turn and no
+# name (pi's, OpenCode's).
+made_by_send() {
+  local machine="${FOLDRENDER_MACHINE:-$(default_machine_name)}"
+  printf '{"agent":%s,"session":%s,"cwd":%s,"machine":%s}' "$(json_arg "$1")" "$(json_arg "$2")" "$(json_arg "$3")" "$(json_arg "$machine")" > "$TMP/made-by.json"
+  FR_MADE_BY="$(base64 < "$TMP/made-by.json" | tr -d '\n=' | tr '+/' '-_')"
+}
+
+# made_by_pi: pi gives the commands it runs PI_SESSION_ID and PI_SESSION_FILE
+# (<its folder>/sessions/<the session's folder>/<when>_<id>.jsonl), whose first
+# line says the session's id and folder. No turn: pi forks a whole session.
+made_by_pi() {
+  local sid="${PI_SESSION_ID:-}" f="${PI_SESSION_FILE:-}" cwd="" model="" dir=""
+  case "$sid" in ''|*[!A-Za-z0-9._:-]*|[!A-Za-z0-9]*) return 0 ;; esac
+  [ "${#sid}" -le 128 ] || return 0
+  case "$f" in /*_"$sid".jsonl) ;; *) return 0 ;; esac
+  [ -f "$f" ] || return 0
+  head -n 1 "$f" 2>/dev/null | head -c 65536 > "$TMP/made-by-line"
+  [ "$(json_get str type "$TMP/made-by-line" 2>/dev/null)" = session ] && [ "$(json_get str id "$TMP/made-by-line" 2>/dev/null)" = "$sid" ] || return 0
+  cwd="$(json_get str cwd "$TMP/made-by-line" 2>/dev/null)" || cwd=""
+  case "$cwd" in /*) ;; *) return 0 ;; esac
+  # Its model as pi names one: provider/id.
+  [ -z "${PI_PROVIDER:-}" ] || [ -z "${PI_MODEL:-}" ] || model="$PI_PROVIDER/$PI_MODEL"
+  case "$model" in *[!A-Za-z0-9._:/\[\]-]*) model="" ;; esac
+  [ -z "${PI_CODING_AGENT_DIR:-}" ] || [ ! -d "$PI_CODING_AGENT_DIR" ] || dir="$(cd -P "$PI_CODING_AGENT_DIR" 2>/dev/null && pwd)"
+  made_note pi "$sid" "$cwd" bin "$(cli_bin pi)" file "$f" model "$model" PI_CODING_AGENT_DIR "$dir"
+  made_by_send pi "$sid" "$cwd"
+}
+
+# made_by_opencode NEEDLE: OpenCode gives the commands it runs OPENCODE and
+# OPENCODE_PID but not its session. Its store (opencode.db under
+# ${XDG_DATA_HOME:-~/.local/share}/opencode, SQLite, read here with Python's
+# sqlite3, read only) holds the bash call running now: the one whose command
+# runs foldrender publish or edit and names NEEDLE is this one, and its
+# session, and that session's folder, are the page's. With no NEEDLE, only
+# when one session alone runs such a command. Measured on 1.19.5
+# (2026-11-12): the call is kept as running, with its command, while it runs.
+made_by_opencode() {
+  local needle="${1:-}" db sid="" cwd="" tries=0 cfg=""
+  case "${OPENCODE_PID:-}" in ''|*[!0-9]*) return 0 ;; esac
+  kill -0 "$OPENCODE_PID" 2>/dev/null || return 0
+  db="${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db"
+  [ -f "$db" ] && command -v python3 >/dev/null 2>&1 || return 0
+  cat > "$TMP/oc-made.py" <<'PY'
+import json, re, sqlite3, sys, time, urllib.parse
+db, needle = sys.argv[1], sys.argv[2]
+c = sqlite3.connect("file:" + urllib.parse.quote(db) + "?mode=ro", uri=True, timeout=2)
+since = int((time.time() - 3600) * 1000)
+rows = c.execute("select p.session_id, s.directory, p.data from part p join session s on s.id = p.session_id where p.time_created > ? and p.data like '%running%' order by p.time_created desc limit 200", (since,)).fetchall()
+hits = []
+for sid, d, data in rows:
+    try:
+        x = json.loads(data)
+    except Exception:
+        continue
+    st = x.get("state") or {}
+    cmd = (st.get("input") or {}).get("command") or ""
+    if x.get("type") != "tool" or x.get("tool") != "bash" or st.get("status") != "running" or not isinstance(cmd, str):
+        continue
+    if not re.search(r"foldrender\s+(publish|edit)\s", cmd + " ") or (needle and needle not in cmd):
+        continue
+    if (sid, d) not in hits:
+        hits.append((sid, d))
+if hits and (needle or len(hits) == 1):
+    print(hits[0][0] + "\t" + hits[0][1])
+PY
+  while :; do
+    python3 -I "$TMP/oc-made.py" "$db" "$needle" > "$TMP/oc-made" 2>/dev/null || : > "$TMP/oc-made"
+    IFS=$'\t' read -r sid cwd < "$TMP/oc-made" || true
+    [ -z "$sid" ] || break
+    tries=$((tries + 1))
+    [ "$tries" -lt "${FR_MADE_BY_TRIES:-10}" ] || return 0
+    sleep 0.25
+  done
+  case "$sid" in ses_*) ;; *) return 0 ;; esac
+  case "$sid" in *[!A-Za-z0-9_]*) return 0 ;; esac
+  [ "${#sid}" -le 128 ] || return 0
+  case "$cwd" in /*) ;; *) return 0 ;; esac
+  [ -z "${OPENCODE_CONFIG:-}" ] || [ ! -f "$OPENCODE_CONFIG" ] || cfg="$(cd -P "${OPENCODE_CONFIG%/*}" 2>/dev/null && pwd)/${OPENCODE_CONFIG##*/}"
+  made_note opencode "$sid" "$cwd" bin "$(cli_bin opencode)" OPENCODE_CONFIG "$cfg"
+  made_by_send opencode "$sid" "$cwd"
+}
+
+# made_by_claude NEEDLE: Claude Code's session, as below.
+made_by_claude() {
   local needle="${1:-}" sid="${CLAUDE_CODE_SESSION_ID:-}" root f="" cwd="" turn="" name="" machine tries=0
   FR_MADE_BY=""
   [ -z "${FOLDRENDER_NO_SESSION:-}" ] && [ -z "${NO_SESSION:-}" ] || return 0
@@ -5424,7 +5605,7 @@ cmd_bridge() {
     esac
   done
   [ -n "$target" ] || die 2 "which page? foldrender bridge --page PAGE"
-  case "$agent" in claude|codex|gemini|antigravity|grok|devin|pi) ;; *) die 2 "unknown agent: $agent (one of: claude, codex, gemini, antigravity, grok, devin, pi)" ;; esac
+  case "$agent" in claude|codex|gemini|antigravity|grok|devin|pi|opencode) ;; *) die 2 "unknown agent: $agent (one of: claude, codex, gemini, antigravity, grok, devin, pi, opencode)" ;; esac
   [ -z "$mesh_cli" ] || [ -n "$session" ] || die 2 "--mesh-cli goes with --session NAME (the mesh's CLI that session's messages are sent with)"
   [ -d "$dir" ] || die 2 "--dir $dir is not a folder"
   [ -z "$mcp" ] || [ -z "$session$channel" ] || die 2 "--mcp is for an agent the bridge starts (--agent), not a terminal session"
@@ -6107,7 +6288,7 @@ foldrender answers --inbox | --ack ID,ID --to NAME
 EOF
     ;;
     bridge) cat <<'EOF'
-foldrender bridge --page PAGE [--dir DIR] [--agent claude|codex|gemini|antigravity|grok|devin|pi] [--mcp FILE] [--acp] [--exit-idle SECONDS]
+foldrender bridge --page PAGE [--dir DIR] [--agent claude|codex|gemini|antigravity|grok|devin|pi|opencode] [--mcp FILE] [--acp] [--exit-idle SECONDS]
 foldrender bridge --page PAGE --session NAME [--mesh-cli PATH]
 foldrender bridge --page PAGE --channel
   Connects a coding agent on this computer to PAGE's agent sidebar, and stays
@@ -6120,8 +6301,8 @@ foldrender bridge --page PAGE --channel
   folder, no PreToolUse or PermissionRequest hook, no self-running sandbox,
   no plugin, nothing in what the organisation or an MDM puts on this computer
   (a managed settings file, its drop-ins, a macOS or Windows policy, or what
-  its admin console delivers); Codex: its read-only mode; pi never asks;
-  Gemini, Antigravity, Grok and Devin are not known), what your collaborators say waits for
+  its admin console delivers); Codex: its read-only mode; pi and OpenCode
+  never ask; Gemini, Antigravity, Grok and Devin are not known), what your collaborators say waits for
   you to hand it to the agent; it says so on start. Messages sent while the
   bridge is away wait for it. The page's
   Markdown panel (its plan) is kept in DIR/.foldrender/PAGE/plan.md: the
@@ -6171,7 +6352,9 @@ foldrender bridge --page PAGE --channel
   computer) takes over from the first. FoldRender runs no model: the agent
   runs here, signed in as you.
   The session that made the page: a page published from a Claude Code
-  session (foldrender 0.20.0 or later) names it to its owner, and the
+  session (foldrender 0.20.0 or later), or a pi or OpenCode one (0.22.3 or
+  later: the innermost, when one agent runs inside another's session), names
+  it to its owner, and the
   owner's sidebar offers three ways to begin a conversation from it: Continue
   it (that session itself, taken up with session/resume or load, which
   remembers everything it did; refused while it is still open in a terminal
@@ -6183,7 +6366,9 @@ foldrender bridge --page PAGE --channel
   continues it). The session's files are on the computer it ran on, so run
   the bridge there; without --dir it then works in that session's folder
   (the sidebar says which computer; elsewhere a start is refused, saying so).
-  Only the owner writes in those conversations. Claude Code only for now.
+  Only the owner writes in those conversations. pi and OpenCode fork the
+  whole session (they take no point to fork at), and a subagent of theirs is
+  told the page and the handoff without excerpts of their sessions.
   --dir DIR            the folder the agent works in (default: the folder of
                        the session that made the page, when it is on this
                        computer; else this one)
@@ -6191,8 +6376,9 @@ foldrender bridge --page PAGE --channel
                        ({"mcpServers": {name: {command, args, env} or
                        {type: "http" or "sse", url, headers}}}): each session
                        gets those the agent takes (stdio by all but pi, which
-                       has no MCP; http and sse as it says). Their settings
-                       stay on this computer.
+                       has no MCP, and OpenCode's own CLI, which takes those
+                       of its own configuration; http and sse as it says).
+                       Their settings stay on this computer.
   --agent NAME         the agent:
                        claude  Claude Code (default): the claude on this
                                computer, run by the bridge itself (claude -p
@@ -6202,6 +6388,16 @@ foldrender bridge --page PAGE --channel
                                from here is started with the settings files and
                                model it was started with (noted on this computer
                                by foldrender publish, never sent)
+                       pi      pi, its own CLI too (pi -p --mode json, the
+                               message on its stdin: --session-id, --session
+                               with the session's file, --fork), with the pi,
+                               the PI_CODING_AGENT_DIR and the model the session
+                               that published ran with; it asks no one
+                       opencode  OpenCode, its own CLI (opencode run --format
+                               json, the message on its stdin: --session,
+                               --fork), with the opencode and OPENCODE_CONFIG
+                               the session that published ran with; run asks no
+                               one
                        The others, as the ACP registry starts them:
                        codex   Codex (codex-acp, via npx; signed in: codex login)
                        gemini  Gemini CLI (via npx, --acp; a Gemini API key or
@@ -6213,7 +6409,6 @@ foldrender bridge --page PAGE --channel
                                ~/.gemini/antigravity-acp/settings.json)
                        grok    Grok Build (grok agent stdio when installed)
                        devin   Devin (devin acp; its CLI installed)
-                       pi      pi (pi-acp, via npx; its own model settings)
   The sidebar shows what the agent says its session may be set to (its
   modes, its models); only you change them, and only to one it offers. A
   long list (pi's models, 100 and more) opens with a search, the one it is
@@ -6235,8 +6430,9 @@ foldrender bridge --page PAGE --channel
                        --dangerously-load-development-channels server:foldrender.
                        Messages arrive in that session as channel events; it
                        answers with the reply tool. Text only.
-  --acp                Claude Code through its ACP adapter (via npx), as
-                       before 0.22.0, instead of its own CLI.
+  --acp                the agent through its ACP adapter instead of its own
+                       CLI, as before 0.22.0: Claude Code's and pi's via npx
+                       (claude-agent-acp, pi-acp), OpenCode's own opencode acp.
   --exit-idle SECONDS  stop after that long with nothing to do (60 to 86400;
                        the desk agent starts a bridge so when a message waits).
   Needs Node 22 or later and the agent installed (and, for all but Claude

@@ -28,7 +28,7 @@
 //   FOLDRENDER_ACP_COMMAND  a JSON array: start this instead of the agent's
 //                        adapter (the tests' stand-in agent)
 
-import { spawn, spawnSync } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, closeSync, constants as fsConstants, createReadStream, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, renameSync, rmSync, statSync, unwatchFile, watchFile, writeFileSync } from "node:fs";
 import { hostname, homedir, tmpdir } from "node:os";
@@ -108,6 +108,13 @@ export const AGENTS = {
     // Lody takes pi: its load is for bringing in history, not for going on).
     resumeFirst: true,
   },
+  opencode: {
+    name: "OpenCode",
+    adapter: "opencode",
+    // Its own ACP server (`opencode acp`), for --acp: install it from opencode.ai first.
+    local: ["opencode", "acp"],
+    signIn: ["opencode auth login"],
+  },
 };
 
 // The program on the PATH, if there is one.
@@ -134,9 +141,10 @@ export function agentCommand(known, env = process.env) {
   return null;
 }
 
-// How an agent's own CLI starts here: found, or null (not installed).
-export function cliHow(def, env = process.env) {
-  const bin = def.find(env);
+// How an agent's own CLI starts here: the one the publish noted (madeLaunch's
+// bin), or found here, or null (not installed).
+export function cliHow(def, env = process.env, launch = null) {
+  const bin = launch?.bin || def.find(env);
   return bin ? { command: [bin], version: "installed" } : null;
 }
 
@@ -820,14 +828,21 @@ export class AgentProcess {
 // result with no turns and no API time, "No conversation found with session
 // ID" on stderr.
 const CLAUDE_INSIDE = ["CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "CLAUDE_PLUGIN_DATA", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SESSION_ATTENDED"];
+// (What pi and OpenCode give the commands they run: a process with them is
+// one run inside that agent's session, and the CLI the bridge starts is not.
+// Not their configuration, PI_CODING_AGENT_DIR or OPENCODE_CONFIG: those
+// are the owner's.)
+const PI_INSIDE = ["PI_CODING_AGENT", "PI_SESSION_ID", "PI_SESSION_FILE", "PI_MODEL", "PI_PROVIDER"];
+const OPENCODE_INSIDE = ["OPENCODE", "OPENCODE_PID"];
+const AGENT_INSIDE = [...CLAUDE_INSIDE, ...PI_INSIDE, ...OPENCODE_INSIDE];
 export const CLI_AGENTS = {
   claude: {
     name: "Claude Code",
     bin: "claude",
     find: (env) => findClaude(env),
-    // (What marks a process as one run inside a Claude Code session: the
+    // (What marks a process as one run inside an agent's session: the
     // bridge may be one, and the CLI it starts is not.)
-    inside: CLAUDE_INSIDE,
+    inside: AGENT_INSIDE,
     // A turn: the session's own settings first, then how it goes on.
     args: ({ launch, start, mcp }) => [
       ...launch.settings.flatMap((f) => ["--settings", f]),
@@ -851,7 +866,125 @@ export const CLI_AGENTS = {
     message: (blocks) => ({ type: "user", message: { role: "user", content: claudeContent(blocks) } }),
     stream: () => new ClaudeStream(),
   },
+  // pi (pi-coding-agent), as 1.3.0 is (2026-11-12: measured on devdesk, and
+  // its dist/main.js and core/session-manager.js read): `-p --mode json`, the
+  // message on its stdin (piped stdin is the prompt); `--session-id ID` a new
+  // session of that id; `--session FILE` goes on in one, by its file (by id
+  // pi matches a prefix, and a session of another folder it offers on the
+  // terminal to fork); `--fork FILE --session-id NEW` a fork, of the whole
+  // session (it takes no point to fork at). A session it cannot find: "No
+  // session found matching" on stderr, before any model call. It asks no
+  // permission: what it may do is its own configuration's. Stopped by
+  // SIGINT, as Ctrl+C stops it.
+  pi: {
+    name: "pi",
+    bin: "pi",
+    find: (env) => findCli(env, "pi"),
+    inside: AGENT_INSIDE,
+    input: "text",
+    cancel: "signal",
+    asks: false,
+    args: ({ launch, start }) => ["-p", "--mode", "json", ...(launch.model ? ["--model", launch.model] : []), ...start],
+    begin: {
+      new: (id) => ["--session-id", id],
+      resume: (id, file) => ["--session", file],
+      fork: (from, id, at, file) => ["--fork", file, "--session-id", id],
+    },
+    transcript: (id, env, launch) => piSessionFile(id, env, launch),
+    // (Not found by id; a fork whose file is not a session. A file named with
+    // --session that is not there it makes a new session of, so the bridge
+    // checks the file is there before each turn: fileOrNew, CliAgent.prompt.)
+    gone: (stderr) => /no session found matching|cannot fork: source session/i.test(stderr),
+    fileOrNew: true,
+    message: (blocks) => cliText(blocks),
+    stream: () => new PiStream(),
+  },
+  // OpenCode, as 1.19.5 is (2026-11-12, measured on devdesk): `run --format
+  // json`, the message on its stdin; `--session ID` goes on in a session,
+  // `--session ID --fork` forks it (the whole session). It names its sessions
+  // itself (ses_..., in each event of its stream), so a new one or a fork is
+  // known by its first turn (ownIds). A session it cannot find: "Session not
+  // found" on stderr, exit 1, before any model call. In `run` it asks no
+  // permission: what its configuration does not allow it does not do.
+  opencode: {
+    name: "OpenCode",
+    bin: "opencode",
+    find: (env) => findCli(env, "opencode", [join(".opencode", "bin", "opencode")]),
+    inside: AGENT_INSIDE,
+    input: "text",
+    cancel: "signal",
+    asks: false,
+    ownIds: true,
+    args: ({ launch, start }) => ["run", "--format", "json", ...(launch.model ? ["--model", launch.model] : []), ...start],
+    begin: {
+      new: () => [],
+      resume: (id) => ["--session", id],
+      fork: (from) => ["--session", from, "--fork"],
+    },
+    // (Its sessions are in its own database: whether one is there is known
+    // when it is asked for, by "Session not found".)
+    transcript: null,
+    gone: (stderr) => /session not found/i.test(stderr),
+    message: (blocks) => cliText(blocks),
+    stream: () => new OpenCodeStream(),
+  },
 };
+
+// The program by its name on the PATH, or in one of the places under the
+// home folder its installer puts it (`extra`), or "".
+export function findCli(env, name, extra = []) {
+  const found = onPath(name, env);
+  if (found) return found;
+  const home = env.HOME || env.USERPROFILE || homedir();
+  for (const rel of extra) {
+    const f = join(home, rel);
+    try {
+      if (existsSync(f) && statSync(f).isFile()) return f;
+    } catch {
+      // not one we may read
+    }
+  }
+  return "";
+}
+
+// An ACP prompt's blocks as the words a CLI that takes text on its stdin is
+// given (pi's, OpenCode's): text as it is, a file's text as context, a link
+// as one. An image is said to be there, not given (they take images as files).
+export function cliText(blocks) {
+  const out = [];
+  for (const b of Array.isArray(blocks) ? blocks : []) {
+    if (b?.type === "text" && typeof b.text === "string") out.push(b.text);
+    else if (b?.type === "resource" && typeof b.resource?.text === "string") out.push(`<context ref="${String(b.resource.uri || "").replace(/[<>"]/g, "")}">\n${b.resource.text}\n</context>`);
+    else if (b?.type === "resource_link" && typeof b.uri === "string") out.push(`[@${String(b.name || b.uri)}](${b.uri})`);
+    else if (b?.type === "image") out.push("(An image was attached in the sidebar; it is not given to this agent here.)");
+  }
+  return out.join("\n\n");
+}
+
+// Where pi keeps a session here (<its folder>/sessions/<the session's
+// folder>/<when>_<id>.jsonl; its folder is PI_CODING_AGENT_DIR or ~/.pi/agent),
+// or null. The file the publish noted first (madeLaunch: pi's PI_SESSION_FILE,
+// for sessions kept elsewhere), when it is that session's.
+export function piSessionFile(id, env = process.env, launch = null) {
+  if (!MADE_ID.test(String(id || ""))) return null;
+  const ending = `_${id}.jsonl`;
+  const noted = launch?.file;
+  if (typeof noted === "string" && basename(noted).endsWith(ending)) {
+    try { if (statSync(noted).isFile()) return noted; } catch { /* not there now */ }
+  }
+  const home = env.HOME || env.USERPROFILE || homedir();
+  const dir = env.PI_CODING_AGENT_DIR ? env.PI_CODING_AGENT_DIR.replace(/^~(?=$|\/)/, home) : join(home, ".pi", "agent");
+  const root = join(dir, "sessions");
+  let folders = [];
+  try { folders = readdirSync(root); } catch { return null; }
+  for (const f of folders.slice(0, 5000)) {
+    let names = [];
+    try { names = readdirSync(join(root, f)); } catch { continue; }
+    const n = names.find((x) => x.endsWith(ending));
+    if (n) return join(root, f, n);
+  }
+  return null;
+}
 
 // The uuid of the last transcript line of the assistant message with this
 // API id (not a subagent's), or null.
@@ -986,6 +1119,136 @@ export class ClaudeStream {
   }
 }
 
+// A tool call of pi's or OpenCode's as ACP says one (as claudeToolCall):
+// its kind, a title (OpenCode gives its own), the file it names and, for an
+// edit, its diff, with its input. Their tools by their own names and fields.
+const PI_KINDS = { bash: "execute", read: "read", edit: "edit", write: "edit", grep: "search", find: "search", ls: "search" };
+const OPENCODE_KINDS = { bash: "execute", read: "read", edit: "edit", write: "edit", patch: "edit", multiedit: "edit", glob: "search", grep: "search", list: "search", webfetch: "fetch", websearch: "fetch", task: "think", todowrite: "think", todoread: "think" };
+export function cliToolCall(agent, id, name, input, given = "") {
+  const i = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+  const str = (v) => (typeof v === "string" ? v : "");
+  const line = (v) => str(v).split("\n")[0].slice(0, 200);
+  const pi = agent === "pi";
+  const path = (pi ? str(i.path) : str(i.filePath) || str(i.path)) || null;
+  const Name = name ? name[0].toUpperCase() + name.slice(1) : "Tool";
+  const title = cut(str(given), 200)
+    || (name === "bash" ? line(i.command) || "Run a command"
+      : path && /^(read|edit|write|patch|multiedit)$/.test(name) ? `${Name} ${path}`
+      : name === "grep" ? `Search for ${line(i.pattern)}`
+      : name === "find" || name === "glob" ? `Find ${line(i.pattern)}`
+      : name === "webfetch" ? `Fetch ${line(i.url)}`
+      : Name);
+  const edits = pi ? (Array.isArray(i.edits) ? i.edits : []).slice(0, 20).map((e) => [str(e?.oldText), str(e?.newText)]) : name === "edit" ? [[str(i.oldString), str(i.newString)]] : [];
+  const diffs = name === "write" && path ? [{ type: "diff", path, oldText: null, newText: str(i.content) }]
+    : name === "edit" && path ? edits.map(([o, n]) => ({ type: "diff", path, oldText: o, newText: n }))
+    : [];
+  return {
+    toolCallId: String(id || ""),
+    title,
+    kind: (pi ? PI_KINDS : OPENCODE_KINDS)[name] || "other",
+    status: "pending",
+    rawInput: i,
+    ...(path ? { locations: [{ path }] } : {}),
+    ...(diffs.length ? { content: diffs } : {}),
+  };
+}
+const textOf = (r) => (typeof r === "string" ? r : Array.isArray(r?.content) ? r.content.filter((c) => c?.type === "text" && typeof c.text === "string").map((c) => c.text).join("\n") : "");
+const resultUpdate = (id, failed, text) => ({ sessionUpdate: "tool_call_update", toolCallId: String(id || ""), status: failed ? "failed" : "completed", ...(text ? { content: [{ type: "content", content: { type: "text", text: cut(text, 20000) } }] } : {}) });
+
+// pi's `--mode json` stream, as ACP's session/update: its words and thinking
+// as they come (message_update's deltas), its tool calls as they start and
+// end (one another tool made is marked with it, as a subagent's are), and
+// what each model call used. `end(event)` says how the turn ended, at
+// agent_settled: stopped, its model call's error, or done.
+export class PiStream {
+  constructor() {
+    this.session = null; // its id, as its first line says
+    this.error = null; // the last answer's error, if it ended in one
+    this.stop = null;
+    this.cost = 0;
+  }
+  line(m) {
+    if (!m || typeof m !== "object") return [];
+    if (m.type === "session" && typeof m.id === "string") { this.session = m.id; return []; }
+    if (m.type === "message_update") {
+      const e = m.assistantMessageEvent || {};
+      if (e.type === "text_delta" && typeof e.delta === "string" && e.delta) return [{ sessionUpdate: "agent_message_chunk", content: { type: "text", text: e.delta } }];
+      if (e.type === "thinking_delta" && typeof e.delta === "string" && e.delta) return [{ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: e.delta } }];
+      return [];
+    }
+    if (m.type === "message_end" && m.message?.role === "assistant") {
+      const r = m.message.stopReason;
+      // (An error pi then retries past is not the turn's.)
+      this.error = r === "error" ? cut(String(m.message.errorMessage || "its model call failed"), 1500) : null;
+      this.stop = r === "aborted" ? "cancelled" : r === "length" ? "max_tokens" : null;
+      return [];
+    }
+    const parent = typeof m.parentToolCallId === "string" && m.parentToolCallId ? { _meta: { claudeCode: { parentToolUseId: m.parentToolCallId } } } : {};
+    if (m.type === "tool_execution_start") return [{ sessionUpdate: "tool_call", ...cliToolCall("pi", m.toolCallId, String(m.toolName || ""), m.args), ...parent }];
+    if (m.type === "tool_execution_end") return [{ ...resultUpdate(m.toolCallId, m.isError === true, textOf(m.result)), ...parent }];
+    if (m.type === "turn_end" && m.message?.usage && typeof m.message.usage === "object") {
+      const u = m.message.usage;
+      const cost = Number(u.cost?.total);
+      if (Number.isFinite(cost)) this.cost += cost;
+      const used = ["input", "output", "cacheRead", "cacheWrite"].reduce((n, k) => n + (Number(u[k]) || 0), 0);
+      return [{ sessionUpdate: "usage_update", used, ...(this.cost ? { cost: { amount: this.cost, currency: "USD" } } : {}) }];
+    }
+    return [];
+  }
+  end(m) {
+    if (m?.type !== "agent_settled") return null;
+    if (m.aborted === true || this.stop === "cancelled") return { stop: "cancelled" };
+    if (this.error) return { error: this.error };
+    return { stop: this.stop || "end_turn" };
+  }
+  closed() {
+    return this.error ? { error: this.error } : null;
+  }
+}
+
+// OpenCode's `run --format json` stream, as ACP's session/update: its words
+// a part at a time (it sends each when it is whole), each tool call once it
+// has run, with what came of it, its plan (todowrite), and what each step
+// used. Its session's id is in every event (`session`). It ends with its
+// process: exit 0 is done, an error event is the turn's error.
+export class OpenCodeStream {
+  constructor() {
+    this.session = null;
+    this.error = null;
+    this.cost = 0;
+  }
+  line(m) {
+    if (!m || typeof m !== "object") return [];
+    if (typeof m.sessionID === "string" && /^ses_[A-Za-z0-9]{1,100}$/.test(m.sessionID)) this.session = m.sessionID;
+    const p = m.part && typeof m.part === "object" ? m.part : {};
+    if (m.type === "text" && typeof p.text === "string" && p.text && !p.synthetic) return [{ sessionUpdate: "agent_message_chunk", content: { type: "text", text: p.text } }];
+    if (m.type === "reasoning" && typeof p.text === "string" && p.text) return [{ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: p.text } }];
+    if (m.type === "tool_use") {
+      const st = p.state && typeof p.state === "object" ? p.state : {};
+      const name = String(p.tool || "");
+      const call = cliToolCall("opencode", p.callID, name, st.input, st.title);
+      const out = [{ sessionUpdate: "tool_call", ...call }];
+      if (name === "todowrite" && Array.isArray(st.input?.todos)) {
+        out.push({ sessionUpdate: "plan", entries: st.input.todos.slice(0, 50).map((t) => ({ content: String(t?.content || ""), status: ["pending", "in_progress", "completed"].includes(t?.status) ? t.status : "pending", priority: ["high", "medium", "low"].includes(t?.priority) ? t.priority : "medium" })) });
+      }
+      if (st.status === "completed" || st.status === "error") out.push(resultUpdate(p.callID, st.status === "error", typeof st.output === "string" ? st.output : typeof st.error === "string" ? st.error : ""));
+      return out;
+    }
+    if (m.type === "step_finish" && p.tokens && typeof p.tokens === "object") {
+      const t = p.tokens;
+      if (Number.isFinite(Number(p.cost))) this.cost += Number(p.cost);
+      const used = (Number(t.input) || 0) + (Number(t.output) || 0) + (Number(t.cache?.read) || 0) + (Number(t.cache?.write) || 0);
+      return [{ sessionUpdate: "usage_update", used, ...(this.cost ? { cost: { amount: this.cost, currency: "USD" } } : {}) }];
+    }
+    if (m.type === "error") this.error = cut(String(m.error?.data?.message || m.error?.message || m.error?.name || "OpenCode could not answer"), 1500);
+    return [];
+  }
+  closed(code) {
+    if (this.error) return { error: this.error };
+    return code === 0 ? { stop: "end_turn" } : null;
+  }
+}
+
 const rpcError = (code, message) => Object.assign(new Error(message), { code });
 
 // What the session that made the page was started with on this computer, as
@@ -996,18 +1259,29 @@ const rpcError = (code, message) => Object.assign(new Error(message), { code });
 export function madeDir(env = process.env) {
   return join(env.XDG_STATE_HOME || join(env.HOME || homedir(), ".local", "state"), "foldrender", "made");
 }
+// For pi and OpenCode, also: the CLI the session ran (`bin`: the PATH a
+// service starts the bridge with may not have it), the configuration it was
+// given by the environment (LAUNCH_ENV, as a folder or a file that is
+// there), and pi's session file (`file`, for sessions it keeps elsewhere).
+const LAUNCH_ENV = { pi: { PI_CODING_AGENT_DIR: "dir" }, opencode: { OPENCODE_CONFIG: "file" } };
+const absThere = (f, dir = false) => {
+  if (typeof f !== "string" || !isAbsolute(f) || f.length > 1024 || /[\u0000-\u001f]/.test(f)) return false;
+  try { const st = statSync(f); return dir ? st.isDirectory() : st.isFile(); } catch { return false; }
+};
 export function madeLaunch(made, env = process.env) {
-  const none = { settings: [], model: null };
+  const none = { settings: [], model: null, env: {}, bin: null, file: null };
   if (!made || typeof made.session !== "string" || !MADE_ID.test(made.session)) return none;
   let o = null;
   try { o = JSON.parse(readFileSync(join(madeDir(env), `${made.session}.json`), "utf8")); } catch { return none; }
   if (!o || o.session !== made.session || o.agent !== made.agent) return none;
-  const settings = (Array.isArray(o.settings) ? o.settings : []).filter((f) => {
-    if (typeof f !== "string" || !isAbsolute(f) || f.length > 1024 || /[\u0000-\u001f]/.test(f)) return false;
-    try { return statSync(f).isFile(); } catch { return false; }
-  }).slice(0, 8);
+  const settings = (Array.isArray(o.settings) ? o.settings : []).filter((f) => absThere(f)).slice(0, 8);
   const model = typeof o.model === "string" && /^[A-Za-z0-9][A-Za-z0-9._:/[\]-]{0,99}$/.test(o.model) ? o.model : null;
-  return { settings, model };
+  const given = {};
+  for (const [k, kind] of Object.entries(LAUNCH_ENV[o.agent] || {})) if (absThere(o.env?.[k], kind === "dir")) given[k] = o.env[k];
+  const def = CLI_AGENTS[o.agent];
+  const bin = def && o.agent !== "claude" && absThere(o.bin) && basename(o.bin).replace(/\.(exe|cmd)$/i, "") === def.bin ? o.bin : null;
+  const file = o.agent === "pi" && absThere(o.file) && basename(o.file).endsWith(`_${made.session}.jsonl`) ? o.file : null;
+  return { settings, model, env: given, bin, file };
 }
 
 // The owner's MCP servers for a CLI's turn (ACP's list, as --mcp gave them):
@@ -1025,11 +1299,12 @@ export class CliAgent {
     Object.assign(this, { def, cwd, handlers, spawnImpl, interruptMs });
     this.env = { ...env };
     for (const k of def.inside || []) delete this.env[k];
-    this.launch = launch || { settings: [], model: null };
-    this.bin = def.find(this.env);
+    this.launch = { settings: [], model: null, env: {}, bin: null, file: null, ...(launch || {}) };
+    Object.assign(this.env, this.launch.env || {});
+    this.bin = this.launch.bin || def.find(this.env);
     this.closed = false;
     this.stderr = "";
-    this.sessions = new Map(); // session id -> {cwd, mcp, start}
+    this.sessions = new Map(); // session id -> {cwd, mcp, start, cli: the CLI's own id for it, once known}
     this.turns = new Map(); // session id -> the turn running in it
     this.next = 1;
     this.exited = new Promise((done) => { this.ended = done; });
@@ -1064,29 +1339,38 @@ export class CliAgent {
     if (method === "initialize") {
       return { protocolVersion: 1, agentInfo: { name: d.name, version: this.version() }, agentCapabilities: { loadSession: false, promptCapabilities: { image: true, embeddedContext: true }, sessionCapabilities: { resume: {}, fork: {} } } };
     }
+    // (A CLI that names its sessions itself, ownIds: a new session and a fork
+    // are known here by an id of the bridge's until the CLI's first turn says
+    // its own. One it cannot be asked about beforehand, transcript null, is
+    // found or not when the turn runs: its "not found" is the same -32002.)
+    const gone = (id) => rpcError(-32002, `No conversation found with session ID: ${id} on this computer`);
     if (method === "session/new") {
       const id = randomUUID();
-      this.sessions.set(id, { cwd, mcp: p.mcpServers, start: d.begin.new(id) });
+      this.sessions.set(id, { cwd, mcp: p.mcpServers, start: d.begin.new(id), cli: d.ownIds ? null : id });
       return { sessionId: id };
     }
     if (method === "session/resume") {
       const id = String(p.sessionId || "");
-      if (!d.transcript(id, this.env)) throw rpcError(-32002, `No conversation found with session ID: ${id} on this computer`);
-      this.sessions.set(id, { cwd, mcp: p.mcpServers, start: d.begin.resume(id) });
+      if (!MADE_ID.test(id)) throw gone(id);
+      const file = d.transcript ? d.transcript(id, this.env, this.launch) : null;
+      if (d.transcript && !file) throw gone(id);
+      this.sessions.set(id, { cwd, mcp: p.mcpServers, start: d.begin.resume(id, file), cli: id, file });
       return {};
     }
     if (method === "session/fork") {
       const from = String(p.sessionId || "");
-      const file = d.transcript(from, this.env);
-      if (!file) throw rpcError(-32002, `No conversation found with session ID: ${from} on this computer`);
+      if (!MADE_ID.test(from)) throw gone(from);
+      const file = d.transcript ? d.transcript(from, this.env, this.launch) : null;
+      if (d.transcript && !file) throw gone(from);
+      // (A point to fork at, where the CLI takes one: else the whole session.)
       const point = p._meta?.jetbrains?.air?.fork?.messageId;
       let at = null;
-      if (typeof point === "string" && point) {
+      if (typeof point === "string" && point && d.forkPoint) {
         at = d.forkPoint(file, point);
         if (!at) throw rpcError(-32602, `Fork point message ${point} was not found in session ${from}`);
       }
       const id = randomUUID();
-      this.sessions.set(id, { cwd, mcp: p.mcpServers, start: d.begin.fork(from, id, at) });
+      this.sessions.set(id, { cwd, mcp: p.mcpServers, start: d.begin.fork(from, id, at, file), cli: d.ownIds ? null : id, file });
       return { sessionId: id };
     }
     if (method === "session/prompt") return this.prompt(String(p.sessionId || ""), p.prompt);
@@ -1101,10 +1385,13 @@ export class CliAgent {
     if (!s) return Promise.reject(rpcError(-32002, `No session ${id} is open here`));
     if (this.turns.has(id)) return Promise.reject(rpcError(-32603, "a turn is already running in this session"));
     if (!this.bin) return Promise.reject(new Error(`${d.name} is not installed here (${d.bin} is not on the PATH)`));
+    // (The session's file, which this turn goes on from, gone since, for a CLI
+    // that would make a new session in its place, fileOrNew: refused instead.)
+    if (d.fileOrNew && s.file && !existsSync(s.file)) return Promise.reject(rpcError(-32002, `No conversation found with session ID: ${s.cli || id} on this computer`));
     // (The owner's MCP servers, their env with them, in a file only the owner
     // reads, for this turn: never on the command line, which every user of
     // the computer can read.)
-    const mcpJson = cliMcpConfig(s.mcp);
+    const mcpJson = d.input === "text" ? null : cliMcpConfig(s.mcp);
     let mcpDir = null;
     let mcp = null;
     if (mcpJson) {
@@ -1118,7 +1405,10 @@ export class CliAgent {
     return new Promise((resolveTurn, rejectTurn) => {
       let child;
       try {
-        child = this.spawnImpl(this.bin, args, { cwd: s.cwd, env: this.env, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", windowsHide: true });
+        // (PWD as well as the folder: OpenCode takes its folder from PWD, which a
+        // spawn's cwd does not change, and run on a session of another folder
+        // answers and then never ends: measured on 1.19.5, 2026-11-12.)
+        child = this.spawnImpl(this.bin, args, { cwd: s.cwd, env: { ...this.env, PWD: s.cwd }, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", windowsHide: true });
       } catch (err) {
         gone();
         rejectTurn(err);
@@ -1135,8 +1425,14 @@ export class CliAgent {
         this.turns.delete(id);
         gone();
         try { child.stdin.end(); } catch { /* closed */ }
-        // From now on the session is one to go on in (once there is one).
-        if (d.transcript(id, this.env)) s.start = d.begin.resume(id);
+        // From now on the session is one to go on in (once there is one): by
+        // the CLI's own id for it, once its stream has said it (ownIds).
+        const real = (d.ownIds && stream.session) || s.cli;
+        if (real) {
+          s.cli = real;
+          const file = d.transcript ? d.transcript(real, this.env, this.launch) : null;
+          if (!d.transcript || file) { s.start = d.begin.resume(real, file); s.file = file; }
+        }
         if (err) rejectTurn(err); else resolveTurn(value);
       };
       child.stderr.on("data", (b) => { turn.stderr = (turn.stderr + b.toString()).slice(-4000); this.stderr = turn.stderr; if (DEBUG) process.stderr.write(`[agent] ${b}`); });
@@ -1146,16 +1442,30 @@ export class CliAgent {
         if (turn.done) return;
         if (d.gone(turn.stderr)) return finish(rpcError(-32002, `No conversation found with session ID: ${id}`));
         if (turn.cancelled) return finish(null, { stopReason: "cancelled" });
+        // (A CLI whose turn ends with its process: how its stream says it did.)
+        const ended = stream.closed ? stream.closed(code, signal) : null;
+        if (ended) return settle(ended);
         finish(new Error(`${d.name} stopped (${signal || code})${turn.stderr ? `: ${cut(turn.stderr.trim().split("\n").slice(-3).join(" "), 400)}` : ""}`));
       });
+      const settle = (o) => {
+        if (turn.cancelled || o.stop === "cancelled") return finish(null, { stopReason: "cancelled" });
+        if (o.error) return finish(new Error(o.error));
+        finish(null, { stopReason: o.stop || "end_turn" });
+      };
       createInterface({ input: child.stdout }).on("line", (line) => {
         debug("<", line);
         let m;
         try { m = JSON.parse(line); } catch { return; }
         if (!m || typeof m !== "object") return;
-        if (m.type === "control_request") return this.control(id, m, write);
+        if (m.type === "control_request" && d.input !== "text") return this.control(id, m, write);
         for (const u of stream.line(m)) {
           try { this.handlers.update({ sessionId: id, update: u }); } catch (err) { warn("an update was not passed on:", err.message); }
+        }
+        // (A stream that says itself when the turn ends: pi's agent_settled.)
+        if (stream.end) {
+          const ended = stream.end(m);
+          if (ended) settle(ended);
+          return;
         }
         if (m.type === "result") {
           turn.result = m;
@@ -1166,7 +1476,11 @@ export class CliAgent {
           return finish(new Error(cut(why || `${d.name} could not answer (${m.subtype || "error"})`, 1500)));
         }
       });
-      write(d.message(blocks));
+      // The message: as a stream-json line, its stdin kept open for the
+      // answers to its questions; or its words, and its stdin closed.
+      if (d.input === "text") {
+        try { child.stdin.end(d.message(blocks)); } catch { /* gone */ }
+      } else write(d.message(blocks));
     });
   }
 
@@ -1208,7 +1522,8 @@ export class CliAgent {
     const t = this.turns.get(id);
     if (!t || t.cancelled) return;
     t.cancelled = true;
-    try { t.child.stdin.write(JSON.stringify({ type: "control_request", request_id: `fr-interrupt-${this.next++}`, request: { subtype: "interrupt" } }) + "\n"); } catch { /* gone */ }
+    if (this.def.cancel === "signal") killGroup(t.child, "SIGINT");
+    else try { t.child.stdin.write(JSON.stringify({ type: "control_request", request_id: `fr-interrupt-${this.next++}`, request: { subtype: "interrupt" } }) + "\n"); } catch { /* gone */ }
     t.timer = setTimeout(() => killGroup(t.child, "SIGTERM"), this.interruptMs);
   }
 
@@ -1842,11 +2157,28 @@ export function cleanMade(m) {
 }
 // Whether that session is on this computer: "here", "elsewhere", or null (the
 // page names none, or one of an agent whose sessions the bridge does not look
-// for: it is tried, and the agent says).
+// for: it is tried, and the agent says). Claude Code's by its transcript, pi's
+// by its session file; OpenCode's (kept in its database) by the note its
+// publish wrote here.
 export function madeWhere(made, env = process.env) {
   if (!made) return null;
   if (made.agent === "claude") return claudeTranscript(made.session, env) ? "here" : "elsewhere";
+  if (made.agent === "pi") {
+    const l = madeLaunch(made, env);
+    return piSessionFile(made.session, { ...env, ...l.env }, l) ? "here" : "elsewhere";
+  }
+  if (made.agent === "opencode" && madeNoted(made, env)) return "here";
   return null;
+}
+// Whether this computer's publish noted that session (madeLaunch's note).
+function madeNoted(made, env = process.env) {
+  if (typeof made?.session !== "string" || !MADE_ID.test(made.session)) return false;
+  try {
+    const o = JSON.parse(readFileSync(join(madeDir(env), `${made.session}.json`), "utf8"));
+    return o?.session === made.session && o?.agent === made.agent;
+  } catch {
+    return false;
+  }
 }
 // What a subagent is told of the session that made the page, from that
 // session's transcript (Claude Code's), up to the turn that published it:
@@ -2058,6 +2390,11 @@ export async function claudeSaid(file, owner = null) {
     if (all.length > SAID_MAX + 1) all.shift();
   }
   lines.close();
+  return saidList(all);
+}
+// The newest of what was said, as the sidebar takes it: at most SAID_MAX
+// messages, each cut at SAID_CHARS, all within SAID_BYTES.
+function saidList(all) {
   const list = [];
   let bytes = 0;
   for (let i = all.length - 1; i >= 0 && list.length < SAID_MAX; i--) {
@@ -2069,6 +2406,58 @@ export async function claudeSaid(file, owner = null) {
     list.unshift({ ...x, text, ...(text.length < x.text.length ? { cut: true } : {}) });
   }
   return { list, more: all.length > list.length };
+}
+// A message said, into `all`: what someone asked (what was written on the
+// page, for one the bridge gave the agent), or the agent's words, which follow
+// on from its words before them (one turn's model calls are one answer).
+function saidPush(all, role, text, owner, at = null) {
+  const w = role === "u" ? sidebarWords(text, owner) ?? text : text;
+  if (!w.trim()) return;
+  const prev = all[all.length - 1];
+  if (role === "a" && prev?.r === "a") { prev.text += "\n\n" + w; return; }
+  all.push({ r: role, text: w, ...(Number.isFinite(at) ? { at } : {}) });
+  if (all.length > SAID_MAX + 1) all.shift();
+}
+// What was said in a pi session, from its file (a JSON line each; a message's
+// text blocks; not its thinking or its tools').
+export async function piSaid(file, owner = null) {
+  const all = [];
+  if (!file) return { list: [], more: false };
+  const lines = createInterface({ input: createReadStream(file, { encoding: "utf8" }), crlfDelay: Infinity });
+  for await (const line of lines) {
+    if (!line.includes('"type":"message"')) continue;
+    let d = null;
+    try { d = JSON.parse(line); } catch { continue; }
+    const m = d?.type === "message" ? d.message : null;
+    if (m?.role !== "user" && m?.role !== "assistant") continue;
+    const text = Array.isArray(m.content) ? m.content.filter((c) => c?.type === "text" && typeof c.text === "string").map((c) => c.text).join("\n") : typeof m.content === "string" ? m.content : "";
+    saidPush(all, m.role === "user" ? "u" : "a", text, owner, Date.parse(d.timestamp));
+  }
+  lines.close();
+  return saidList(all);
+}
+// What was said in an OpenCode session: its own `opencode export ID` (its
+// store is a database of its own; export reads it, no model is called),
+// within 20 s and 64 MB. Its text parts, not the ones it marks synthetic.
+export function openCodeSaid({ bin, id, env, cwd, owner = null, execImpl = execFile }) {
+  if (!bin || !/^ses_[A-Za-z0-9]{1,100}$/.test(String(id || ""))) return Promise.resolve({ list: [], more: false });
+  return new Promise((done, fail) => {
+    const child = execImpl(bin, ["export", id], { cwd, env: { ...env, PWD: cwd }, timeout: 20000, maxBuffer: 64 * 1024 * 1024, windowsHide: true }, (err, stdout) => {
+      if (err) return fail(new Error(`opencode export: ${cut(String(err.message || err), 200)}`));
+      let d = null;
+      try { d = JSON.parse(String(stdout).slice(String(stdout).indexOf("{"))); } catch { return fail(new Error("opencode export: not JSON")); }
+      const all = [];
+      for (const m of Array.isArray(d?.messages) ? d.messages : []) {
+        const role = m?.info?.role;
+        if (role !== "user" && role !== "assistant") continue;
+        const text = (Array.isArray(m.parts) ? m.parts : []).filter((p) => p?.type === "text" && typeof p.text === "string" && !p.synthetic).map((p) => p.text).join("\n");
+        saidPush(all, role === "user" ? "u" : "a", text, owner, Number(m.info?.time?.created));
+      }
+      done(saidList(all));
+    });
+    // (Nothing on its stdin: closed, so it does not wait for any.)
+    try { child?.stdin?.end(); } catch { /* none */ }
+  });
 }
 
 // pi's own reason for a turn that ended without a word: its ACP adapter
@@ -2822,13 +3211,15 @@ export class Bridge {
   // to `options` (the agent's own modes): Claude Code as its settings and
   // that mode say (the app starts each in the mode that asks); Codex only in
   // its read-only mode; pi never asks; another agent, or Codex before it says
-  // its mode, is not known (null). Not after a Claude Code session took a
+  // its mode, is not known (null); OpenCode's CLI does not ask either (run
+  // asks no one). Not after a Claude Code session took a
   // mode that does not ask, or the owner allowed something always.
   asksFor(options) {
     if (this.loosened) return false;
     const mode = (options || []).find((x) => x.id === "mode" || x.category === "mode")?.current || null;
     if (this.agentId === "claude") return claudeAsks(this.dir, this.env, mode || (this.agentFactory ? "default" : null), this.managedPolicy(), this.launchFiles());
     if (this.agentId === "pi") return false;
+    if (this.cli?.asks === false) return false;
     if (this.agentId === "codex" && mode) return mode === "read-only";
     return null;
   }
@@ -2924,6 +3315,9 @@ export class Bridge {
       const claude = findClaude(env);
       if (claude) env.CLAUDE_CODE_EXECUTABLE = claude;
     }
+    // (Its CLI: by now the page has said which session made it, whose publish
+    // may have noted where that CLI is.)
+    if (this.cli) this.how = cliHow(this.cli, this.env, this.madeLaunchHere());
     if (!this.how) throw new Error(`${this.known.name} is not installed here (its CLI, ${this.cli?.bin || this.known.local?.[0] || "?"}, is not on the PATH)`);
     const command = this.how.command;
     if (this.cli) log(`starting ${this.known.name} (its own CLI, ${command[0]})`);
@@ -2935,7 +3329,7 @@ export class Bridge {
       client: (method, params) => this.onClient(method, params),
     };
     const agent = this.agentFactory ? this.agentFactory({ env, cwd: this.dir, handlers })
-      : this.cli ? new CliAgent(this.cli, { env, cwd: this.dir, handlers, launch: madeLaunch(this.madeBy, this.env), spawnImpl: this.cliSpawn })
+      : this.cli ? new CliAgent(this.cli, { env, cwd: this.dir, handlers, launch: this.madeLaunchHere(), spawnImpl: this.cliSpawn })
       : new AgentProcess(command, { env, cwd: this.dir, handlers });
     this.agent = agent;
     this.sessions.clear();
@@ -3054,7 +3448,7 @@ export class Bridge {
         }
         this.panel.pull().then(() => { if (!this.panel.off && this.panel.rev !== null) log(`the page's Markdown panel is in ${this.panel.file}`); });
         if (asks !== true) {
-          const what = auto && (auto.commands || auto.edits) ? `your Claude Code settings let it ${[auto.commands && "run commands", auto.edits && "change files"].filter(Boolean).join(" and ")} without asking` : `${this.known.name} may act without asking here (${this.agentId === "claude" ? "its mode, an allow rule, a hook or a plugin in its settings" : this.agentId === "pi" ? "it never asks" : this.agentId === "codex" ? "only its read-only mode asks first" : "FoldRender cannot tell whether it asks first"})`;
+          const what = auto && (auto.commands || auto.edits) ? `your Claude Code settings let it ${[auto.commands && "run commands", auto.edits && "change files"].filter(Boolean).join(" and ")} without asking` : `${this.known.name} may act without asking here (${this.agentId === "claude" ? "its mode, an allow rule, a hook or a plugin in its settings" : this.agentId === "pi" ? "it never asks" : this.cli?.asks === false ? "its own CLI asks no one" : this.agentId === "codex" ? "only its read-only mode asks first" : "FoldRender cannot tell whether it asks first"})`;
           warn(`${what}; the sidebar says so to everyone on the page, and what others say there waits for you to hand it to the agent`);
         }
         // A heartbeat while it is quiet: a socket that hears nothing for 40 s is
@@ -3134,8 +3528,7 @@ export class Bridge {
       if (Date.now() - (this.saidAt || 0) < 2000) return;
       this.saidAt = Date.now();
       const made = this.madeBy;
-      const file = made && made.agent === "claude" ? claudeTranscript(made.session, this.env) : null;
-      claudeSaid(file, this.info?.login || null).then((said) => this.send({ t: "made-said", here: Boolean(file), ...said }), (err) => warn("what that session said was not read:", err.message));
+      this.madeSaid(made, this.info?.login || null).then((said) => this.send({ t: "made-said", ...said }), (err) => warn("what that session said was not read:", err.message));
       return;
     }
     if (m.t === "panel-choose" && (m.choice === "panel" || m.choice === "agent")) return this.panel.choose(m.choice, typeof m.by === "string" ? m.by : null);
@@ -3702,11 +4095,42 @@ export class Bridge {
     turn.record.parts.push({ k: "note", code: "report-kept", text: "Its answer goes back to the session that made the page, with that session's next message in the conversation that continues it." });
   }
 
+  // What was said in the session that made the page, read on this computer,
+  // for the owner's sidebar: Claude Code's transcript, pi's session file,
+  // OpenCode's own export of it. {here, list, more}.
+  async madeSaid(made, owner) {
+    if (made?.agent === "claude") {
+      const file = claudeTranscript(made.session, this.env);
+      return { here: Boolean(file), ...(await claudeSaid(file, owner)) };
+    }
+    const launch = madeLaunch(made, this.env);
+    if (made?.agent === "pi") {
+      const file = piSessionFile(made.session, { ...this.env, ...launch.env }, launch);
+      return { here: Boolean(file), ...(await piSaid(file, owner)) };
+    }
+    if (made?.agent === "opencode") {
+      const def = CLI_AGENTS.opencode;
+      const env = { ...this.env, ...launch.env };
+      for (const k of def.inside) delete env[k];
+      delete env.FOLDRENDER_TOKEN;
+      return { here: true, ...(await openCodeSaid({ bin: launch.bin || def.find(env), id: made.session, env, cwd: made.cwd, owner })) };
+    }
+    return { here: false, list: [], more: false };
+  }
+
   // The settings files the agent's CLI is started with here (--settings, as
   // the session that made the page was: madeLaunch), which decide with the
   // folder's and the user's whether it asks first. None through an adapter.
   launchFiles() {
-    return this.cli ? madeLaunch(this.madeBy, this.env).settings : [];
+    return this.cli ? this.madeLaunchHere().settings : [];
+  }
+
+  // What the publish noted for the session that made the page (madeLaunch),
+  // only when this bridge runs that session's agent: a note is written for
+  // one agent's CLI (its bin, model, settings, environment), so a bridge
+  // started with another --agent runs its own CLI as it would anywhere.
+  madeLaunchHere() {
+    return madeLaunch(this.madeBy?.agent === this.agentId ? this.madeBy : null, this.env);
   }
 
   // Who answered a turn, for the sidebar to say beside it: the agent, its own
@@ -4451,6 +4875,11 @@ async function main() {
   } else if (args.agent === "claude" && !findClaude()) {
     warn("Claude Code is not installed here (https://docs.claude.com/en/docs/claude-code): install it and sign in, then run this again");
     return 2;
+  } else if (CLI_AGENTS[args.agent] && !args.acp) {
+    // (Its own CLI: here, or where the publish of the session that made the
+    // page noted it, which is known once the page says which session.)
+    const def = CLI_AGENTS[args.agent];
+    if (!def.find(process.env)) warn(`${def.name}'s CLI (${def.bin}) is not on the PATH here: the session that made the page is taken up with the one its publish noted, if any`);
   } else if (!agentCommand(AGENTS[args.agent])) {
     warn(`${AGENTS[args.agent].name} is not installed here (its CLI, ${AGENTS[args.agent].local?.[0]}, is not on the PATH): ${AGENTS[args.agent].install || "install it"}, ${signInWords(AGENTS[args.agent])}, then run this again`);
     return 2;
