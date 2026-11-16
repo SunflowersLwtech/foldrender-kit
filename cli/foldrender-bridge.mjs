@@ -36,7 +36,7 @@ import { basename, delimiter, dirname, extname, isAbsolute, join, resolve, sep }
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const BRIDGE_VERSION = "0.22.2";
+export const BRIDGE_VERSION = "0.22.4";
 export const PROTOCOL = "fr-agent.1";
 // How the owner may begin a conversation from the session that made the page.
 export const START_MODES = new Set(["continue", "fork", "subagent"]);
@@ -1740,7 +1740,10 @@ export function historyLines(history, header, maxBytes = 48000) {
     if (e.kind === "user" && REACHED.has(e.state)) blocks.push([`@${e.by || "someone"} wrote:`, ...quoted(cut(e.text, 2000)), ...(Array.isArray(e.files) && e.files.length ? [`(and attached: ${e.files.map((f) => sanitizeAttachmentFileName(String(f?.name || "file"))).join(", ")})`] : [])]);
     else if (e.kind === "turn") {
       const words = (e.record?.parts || []).filter((x) => x.k === "text").map((x) => x.text).join(" ");
-      if (words) blocks.push(["the agent answered:", ...quoted(cut(words, 2000))]);
+      // (FoldRender's assistant answered in the agent's place when it could
+      // not, the room's record says so: never retold as the agent's words.)
+      const host = e.record?.by?.via === "host";
+      if (words) blocks.push([host ? "FoldRender's assistant answered, in your place (not your words):" : "the agent answered:", ...quoted(cut(words, 2000))]);
     }
   }
   const kept = [];

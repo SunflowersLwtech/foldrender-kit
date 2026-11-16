@@ -11,11 +11,17 @@
 # to stdout, briefly by default; --json prints the API's answer as it is.
 #
 #   FOLDRENDER_TOKEN       API token; takes precedence over any saved account.
+#   FOLDRENDER_MEM_TOKEN   the same for the desk memory's host (--service mem),
+#                          which never reads FOLDRENDER_TOKEN.
 #   FOLDRENDER_ACCOUNT     A saved account's GitHub login (as --as LOGIN): this
 #                          command runs as that account, whichever is the
 #                          default (foldrender auth switch).
+#   FOLDRENDER_SERVICE     which service: foldrender (default) or mem (the desk
+#                          memory's own SaaS host, mem.foldrender.dev; its own
+#                          accounts under ~/.config/foldrender-mem).
 #   FOLDRENDER_API         API base URL (default https://foldrender.dev/artifacts,
-#                          where the app is; its API is under /api there).
+#                          where the app is; its API is under /api there; with
+#                          FOLDRENDER_SERVICE=mem, https://mem.foldrender.dev, its root).
 #   FOLDRENDER_NO_BROWSER  Set to 1 to print the sign-in link, not open it.
 #   FOLDRENDER_READ_MAX_TOKENS  How much `read` prints before it stops, says how
 #                          to go on and lists the sections (default 6000,
@@ -31,20 +37,28 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.22.3
+FR_CLI_VERSION=0.23.0
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=6ae3a6db205711d30882598ef0f48cab4c1e20194185ea9658e318d78c2f815a
+FR_BRIDGE_SHA256=0474aa21041e7549ed17addd7c5c3994282178184b4235b43a699cf8b27fdaa0
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=271e4c046e241d6061b342a26f311d6d95d1c39469cb151ffe8bb251eda6b514
+FR_DESK_AGENT_SHA256=cf705a0b46c870d6e7b254bf0e9d70b2d21c436118e905db7546ec8bc26a500f
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
 CARD_MAX_BYTES=2097152
 CANVAS_MAX_CARDS=24
+# Which service the command talks to (0.23.0): foldrender, the default (the
+# FoldRender app), or mem, the desk memory's own host (mem.foldrender.dev, the
+# workspaces): its own accounts and sign-ins, kept under foldrender-mem beside
+# this folder, so signing in there never touches a foldrender.dev sign-in.
+# FOLDRENDER_SERVICE, or --service anywhere on the command line (read with
+# --as, at the end); use_service sets the API (unless FOLDRENDER_API names
+# one) and the folders from it.
+SERVICE="${FOLDRENDER_SERVICE:-foldrender}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/foldrender"
 # Saved accounts (0.16.0): accounts/<login> holds that account's token (mode
 # 600), accounts/<login>.slugs its slug map and accounts/<login>.desk the id of
@@ -87,6 +101,28 @@ die() {
 note() {
   printf 'foldrender: %s\n' "$*" >&2
 }
+
+# use_service: API, CONFIG_DIR and the account files for SERVICE. The mem
+# host serves its API at its root (no /artifacts there).
+use_service() {
+  local base
+  case "$SERVICE" in
+    foldrender) base="https://foldrender.dev/artifacts"; CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/foldrender" ;;
+    mem) base="https://mem.foldrender.dev"; CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/foldrender-mem" ;;
+    *) die 2 "the service is foldrender or mem (--service, FOLDRENDER_SERVICE), not ${SERVICE:-empty}" ;;
+  esac
+  API="${FOLDRENDER_API:-$base}"
+  API="${API%/}"
+  # The token in the environment that stands in for a sign-in: each host its
+  # own, so a foldrender.dev token is never sent to the desk memory's host.
+  if [ "$SERVICE" = mem ]; then ENV_TOKEN_VAR=FOLDRENDER_MEM_TOKEN; ENV_TOKEN="${FOLDRENDER_MEM_TOKEN:-}"
+  else ENV_TOKEN_VAR=FOLDRENDER_TOKEN; ENV_TOKEN="${FOLDRENDER_TOKEN:-}"; fi
+  ACCOUNTS_DIR="$CONFIG_DIR/accounts"
+  ACTIVE_FILE="$CONFIG_DIR/active"
+  LEGACY_TOKEN="$CONFIG_DIR/token"
+  SLUG_MAP="$CONFIG_DIR/slugs"
+}
+use_service
 
 # need COUNT FLAG: a flag that takes a value must not be the last argument.
 need() {
@@ -137,11 +173,12 @@ use_account() {
 select_account() {
   local login="" from=""
   TOKEN=""; ACCOUNT=""; ACCOUNT_FROM=""; ACCOUNT_ERROR=""; TOKEN_FILE=""; SLUG_MAP="$CONFIG_DIR/slugs"; DESK_FILE=""
-  if [ -n "${FOLDRENDER_TOKEN:-}" ]; then
-    TOKEN="$FOLDRENDER_TOKEN"
+  if [ -n "$ENV_TOKEN" ]; then
+    TOKEN="$ENV_TOKEN"
     ACCOUNT_FROM=FOLDRENDER_TOKEN
     return 0
   fi
+  [ "$SERVICE" != mem ] || [ -z "${FOLDRENDER_TOKEN:-}" ] || note "FOLDRENDER_TOKEN is foldrender.dev's and is not sent to the desk memory's host; that host's is FOLDRENDER_MEM_TOKEN"
   if [ -n "$AS_LOGIN" ]; then
     login="$AS_LOGIN"; from=--as
   elif [ -n "${FOLDRENDER_ACCOUNT:-}" ]; then
@@ -173,7 +210,7 @@ select_account() {
 
 require_token() {
   [ -z "$ACCOUNT_ERROR" ] || die 3 "$ACCOUNT_ERROR"
-  [ -n "$TOKEN" ] || die 3 "not signed in. Run: foldrender login"
+  [ -n "$TOKEN" ] || die 3 "not signed in. Run: foldrender login$([ "$SERVICE" != mem ] || printf ' --service mem')"
 }
 
 # api METHOD PATH [curl args...]: sets STATUS and leaves the body in $TMP/body
@@ -930,7 +967,7 @@ migrate_legacy() {
 }
 
 warn_env_token() {
-  [ -z "${FOLDRENDER_TOKEN:-}" ] || note "FOLDRENDER_TOKEN is set, so it is used instead of the saved accounts"
+  [ -z "$ENV_TOKEN" ] || note "$ENV_TOKEN_VAR is set, so it is used instead of the saved accounts"
 }
 
 # json_field KEY: the string under KEY in a JSON body (no quotes inside), or
@@ -1282,8 +1319,8 @@ cmd_logout() {
       rm -f "$ACTIVE_FILE"
     fi
   fi
-  [ -n "$list$all" ] || [ "$ACCOUNT_FROM" = saved ] || [ -n "${FOLDRENDER_TOKEN:-}" ] || printf 'No account was signed in here.\n'
-  [ -z "${FOLDRENDER_TOKEN:-}" ] || note "FOLDRENDER_TOKEN is still set in this shell, and is not signed out by this. Unset it to sign out completely."
+  [ -n "$list$all" ] || [ "$ACCOUNT_FROM" = saved ] || [ -n "$ENV_TOKEN" ] || printf 'No account was signed in here.\n'
+  [ -z "$ENV_TOKEN" ] || note "$ENV_TOKEN_VAR is still set in this shell, and is not signed out by this. Unset it to sign out completely."
   [ -z "$failed" ] || exit 6
 }
 
@@ -1307,9 +1344,9 @@ cmd_auth() {
         printf '* a sign-in saved before 0.16.0 (whose, the server could not say just now)\n'
         n=$((n + 1))
       fi
-      [ "$n" -gt 0 ] || { printf 'No account is signed in here. Run: foldrender login\n'; [ -z "${FOLDRENDER_TOKEN:-}" ] || note "FOLDRENDER_TOKEN is set: commands run as its account"; exit 3; }
+      [ "$n" -gt 0 ] || { printf 'No account is signed in here. Run: foldrender login\n'; [ -z "$ENV_TOKEN" ] || note "$ENV_TOKEN_VAR is set: commands run as its account"; exit 3; }
       case "$ACCOUNT_FROM" in
-        FOLDRENDER_TOKEN) note "commands run as FOLDRENDER_TOKEN's account here, not as one of these" ;;
+        FOLDRENDER_TOKEN) note "commands run as $ENV_TOKEN_VAR's account here, not as one of these" ;;
         --as|FOLDRENDER_ACCOUNT) note "this command ran as $ACCOUNT ($ACCOUNT_FROM)" ;;
       esac
       [ -z "$ACCOUNT_ERROR" ] || note "$ACCOUNT_ERROR"
@@ -1329,7 +1366,7 @@ cmd_auth() {
       [ -f "$ACCOUNTS_DIR/$to" ] || die 2 "$to is not signed in on this machine (signed in: $(saved_logins | paste -sd ' ' - | sed 's/ /, /g')). To add it: foldrender login"
       set_active "$to"
       printf 'The default account is now %s.\n' "$to"
-      [ -z "${FOLDRENDER_TOKEN:-}" ] || note "FOLDRENDER_TOKEN is set in this shell, and still comes first"
+      [ -z "$ENV_TOKEN" ] || note "$ENV_TOKEN_VAR is set in this shell, and still comes first"
       [ -z "${FOLDRENDER_ACCOUNT:-}" ] || note "FOLDRENDER_ACCOUNT=$FOLDRENDER_ACCOUNT is set in this shell, and still comes first"
       ;;
     *) die 2 "usage: foldrender auth list | foldrender auth switch LOGIN" ;;
@@ -1615,7 +1652,7 @@ cmd_account() {
   fi
   printf 'Deleted the account %s: %s page(s) and %s API token(s).\n' "$login" "${pages:-?}" "${tokens:-?}"
   printf 'Removed the saved token and the slug map from this machine.\n'
-  [ -z "${FOLDRENDER_TOKEN:-}" ] || note "FOLDRENDER_TOKEN is still set in this shell. Unset it to sign out completely."
+  [ -z "$ENV_TOKEN" ] || note "$ENV_TOKEN_VAR is still set in this shell. Unset it to sign out completely."
 }
 
 # publish FILE... [options]: each file to its page, one address a line on
@@ -3432,9 +3469,21 @@ cmd_answers() {
 # without one, the saved sign-in is used.
 DESK_ID=""
 DESK_KEPT=""
+# desk_token_check: FOLDRENDER_DESK_TOKEN is the kind this service takes, or
+# exit 2. Run in the command's own shell (main), before any request: desk_auth
+# runs inside $(...), where a die ends only that subshell and the request went
+# on with no token.
+desk_token_check() {
+  [ -n "${FOLDRENDER_DESK_TOKEN:-}" ] || return 0
+  case "$SERVICE:$FOLDRENDER_DESK_TOKEN" in foldrender:frdk_*|mem:frtk_*) ;;
+    mem:*) die 2 "on the desk memory's host (--service mem) FOLDRENDER_DESK_TOKEN is a workspace's agent token (frtk_...: foldrender desk workspace token add ID --name NAME --service mem)" ;;
+    foldrender:frtk_*) die 2 "FOLDRENDER_DESK_TOKEN is a desk token (frdk_...); a workspace token (frtk_) is for the desk memory host: add --service mem" ;;
+    *) die 2 "FOLDRENDER_DESK_TOKEN is a desk token (frdk_...)" ;;
+  esac
+}
 desk_auth() {
   if [ -n "${FOLDRENDER_DESK_TOKEN:-}" ]; then
-    case "$FOLDRENDER_DESK_TOKEN" in frdk_*) ;; *) die 2 "FOLDRENDER_DESK_TOKEN is a desk token (frdk_...)" ;; esac
+    desk_token_check
     ( umask 077 && printf 'Authorization: Bearer %s\n' "$FOLDRENDER_DESK_TOKEN" > "$TMP/dauth" ) || die 1 "cannot write $TMP/dauth"
     printf '@%s' "$TMP/dauth"
   else
@@ -3551,6 +3600,12 @@ desk2_fail() {
 cmd_desk() {
   local sub="${1:-}" mode=text key="" a
   [ $# -eq 0 ] || shift
+  # The desk memory's host has the memory and the workspaces, nothing else of a
+  # desk: said before anything here asks it (a machine's, the owner's name, a picture).
+  case "$SERVICE:$sub" in
+    mem:mem|mem:workspace) ;;
+    mem:*) die 2 "desk ${sub:-(none)} is foldrender.dev's; the desk memory's host (--service mem) has desk mem and desk workspace" ;;
+  esac
   # A machine's, not a desk page's: no --desk.
   case "$sub" in
     agent) cmd_desk_agent "$@"; return ;;
@@ -3558,6 +3613,7 @@ cmd_desk() {
     owner) cmd_desk_owner "$@"; return ;;
     image) cmd_desk_image "$@"; return ;;
     mem) cmd_desk_mem "$@"; return ;;
+    workspace) cmd_desk_workspace "$@"; return ;;
   esac
   # The default desk is the account's own: the id desk init kept for a saved
   # account, or "desk", which the API reads as the caller's own (the desk a
@@ -4652,10 +4708,11 @@ cmd_desk_mem_todo() {
 #   kept in a 600 file the hook reads, and what was said goes to the hook on
 #   stdin and on to the Worker in a file: neither is ever on a command line.
 cmd_desk_mem_install() {
-  local agents="" conf token="" remove=0
+  local agents="" conf token="" remove=0 workspace="" want=frdk_
   while [ $# -gt 0 ]; do
     case "$1" in
       --agent) need $# "$1"; agents="$agents,$2"; shift 2 ;;
+      --workspace) need $# "$1"; workspace="$2"; shift 2 ;;
       --remove) remove=1; shift ;;
       -*) die 2 "desk mem install: unknown option $1 (foldrender help desk-mem)" ;;
       *) agents="$agents,$1"; shift ;;
@@ -4672,7 +4729,7 @@ cmd_desk_mem_install() {
     esac
   done
   command -v python3 >/dev/null 2>&1 || die 1 "desk mem install needs python3 (it edits the agents' hook files)"
-  conf="${FOLDRENDER_DESK_MEM_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/foldrender/desk-mem}"
+  conf="${FOLDRENDER_DESK_MEM_CONFIG:-$CONFIG_DIR/desk-mem}"
   if [ "$remove" = 1 ]; then
     [ -f "$conf/install.py" ] || die 7 "nothing installed under $conf"
     [ -z "$list" ] || FR_MEM_CONF="$conf" python3 "$conf/install.py" --remove $list
@@ -4683,18 +4740,37 @@ cmd_desk_mem_install() {
   # made with your sign-in and kept in a 600 file. It is never printed: the
   # hook reads it from the file into FOLDRENDER_DESK_TOKEN when it runs.
   ( umask 077 && mkdir -p "$conf" ) || die 1 "cannot make $conf"
-  if ! { [ -f "$conf/token" ] && head -n 1 "$conf/token" | grep -Eq '^frdk_[A-Za-z0-9_-]{20,200}$'; }; then
+  # On the desk memory's host it is a workspace's agent token (frtk_), made
+  # in the workspace --workspace names.
+  [ "$SERVICE" != mem ] || want=frtk_
+  if ! { [ -f "$conf/token" ] && head -n 1 "$conf/token" | grep -Eq "^${want}[A-Za-z0-9_-]{20,200}\$"; }; then
     case "${FOLDRENDER_DESK_TOKEN:-}" in
-      frdk_*) token="$FOLDRENDER_DESK_TOKEN" ;;
+      "$want"*) token="$FOLDRENDER_DESK_TOKEN" ;;
       *)
         require_token
-        DESK_ID="${FOLDRENDER_DESK:-desk}"; check_slug "$DESK_ID" 2>/dev/null || DESK_ID=desk
-        printf '{"role":"agent","name":"mem-hook-%s"}' "$(default_machine_name | tr -cd 'A-Za-z0-9_.-' | cut -c1-40)" > "$TMP/req"
-        desk_send POST /tokens -H "$(auth_header)" -H "Content-Type: application/json" --data-binary "@$TMP/req"
-        [ "${STATUS#2}" != "$STATUS" ] || mem_fail
-        token="$(json_get str token 2>/dev/null)" ;;
+        if [ "$SERVICE" = mem ]; then
+          case "$workspace" in
+            '') die 2 "desk mem install --service mem --workspace ID: the workspace the hooks write to (foldrender desk workspace ls --service mem lists yours)" ;;
+            *[!0-9a-f]*) die 2 "--workspace takes a workspace's id (16 hex characters; foldrender desk workspace ls --service mem)" ;;
+          esac
+          [ "${#workspace}" = 16 ] || die 2 "--workspace takes a workspace's id (16 hex characters; foldrender desk workspace ls --service mem)"
+          printf '{"name":"mem-hook-%s"}' "$(default_machine_name | tr -cd 'A-Za-z0-9_.-' | cut -c1-40)" > "$TMP/req"
+          api POST "/api/desk/tenants/$workspace/tokens" -H "$(auth_header)" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+          [ "${STATUS#2}" != "$STATUS" ] || workspace_fail
+          token="$(json_get str token 2>/dev/null)"
+        else
+          DESK_ID="${FOLDRENDER_DESK:-desk}"; check_slug "$DESK_ID" 2>/dev/null || DESK_ID=desk
+          printf '{"role":"agent","name":"mem-hook-%s"}' "$(default_machine_name | tr -cd 'A-Za-z0-9_.-' | cut -c1-40)" > "$TMP/req"
+          desk_send POST /tokens -H "$(auth_header)" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+          [ "${STATUS#2}" != "$STATUS" ] || mem_fail
+          token="$(json_get str token 2>/dev/null)"
+        fi ;;
     esac
-    case "$token" in frdk_*) ;; *) die 1 "no desk agent token: run  foldrender desk token add --role agent --name mem-hook  and put the frdk_... it prints into $conf/token (chmod 600)" ;; esac
+    case "$SERVICE:$token" in
+      foldrender:frdk_*|mem:frtk_*) ;;
+      mem:*) die 1 "no workspace agent token: run  foldrender desk mem install --service mem --workspace ID  signed in on the desk memory's host, or put a frtk_... from  foldrender desk workspace token add ID --name mem-hook --service mem  into $conf/token (chmod 600)" ;;
+      *) die 1 "no desk agent token: run  foldrender desk token add --role agent --name mem-hook  and put the frdk_... it prints into $conf/token (chmod 600)" ;;
+    esac
     ( umask 077 && printf '%s\n' "$token" > "$conf/token" ) || die 1 "cannot write $conf/token"
     token=""
   fi
@@ -4713,6 +4789,9 @@ FOLDRENDER_DESK_TOKEN="$(head -n 1 "$conf/token" 2>/dev/null)"; export FOLDRENDE
 # The command and the API it was installed with (an API only when one was named).
 cli="${FOLDRENDER_CLI:-$(head -n 1 "$conf/cli" 2>/dev/null)}"; cli="${cli:-foldrender}"
 if [ -z "${FOLDRENDER_API:-}" ] && [ -s "$conf/api" ]; then FOLDRENDER_API="$(head -n 1 "$conf/api")"; export FOLDRENDER_API; fi
+# And the service it was installed for, whatever the agent's environment says
+# (the desk memory's host takes a workspace's frtk_, foldrender.dev a desk's frdk_).
+if [ -s "$conf/service" ]; then FOLDRENDER_SERVICE="$(head -n 1 "$conf/service")"; export FOLDRENDER_SERVICE; fi
 log="$conf/hook.log"
 t="$(umask 077 && mktemp "${TMPDIR:-/tmp}/fr-mem.XXXXXX")" || exit 0
 cat > "$t"
@@ -4848,10 +4927,186 @@ for agent in [a for a in args if a in FILES]:
     print(f"{agent}: {'removed from' if remove else 'hooks in'} {path}")
 PY
   ( umask 077 && cp "$TMP/hook" "$conf/desk-mem-hook.sh" && chmod 700 "$conf/desk-mem-hook.sh" && cp "$TMP/event" "$conf/event.py" && cp "$TMP/install" "$conf/install.py" \
-    && cli_path > "$conf/cli" && if [ -n "${FOLDRENDER_API:-}" ]; then printf '%s\n' "$API" > "$conf/api"; else rm -f "$conf/api"; fi ) || die 1 "cannot write the hook under $conf"
+    && cli_path > "$conf/cli" \
+    && { if [ "$SERVICE" = mem ] || [ -n "${FOLDRENDER_API:-}" ]; then printf '%s\n' "$API" > "$conf/api"; else rm -f "$conf/api"; fi; } \
+    && printf '%s\n' "$SERVICE" > "$conf/service" ) || die 1 "cannot write the hook under $conf"
   FR_MEM_CONF="$conf" python3 "$conf/install.py" $list || die 1 "the agents' hook files could not be written"
   case " $list " in *" codex "*) note "codex: open codex, run /hooks and trust the three foldrender desk mem hooks once; until then Codex does not run them" ;; esac
   note "desk memory hooks are under $conf (token in $conf/token, 600). A new session is handed what  foldrender desk mem inject --repo REPO  prints; take them out with  foldrender desk mem install --remove"
+}
+
+# foldrender desk workspace ...: the workspaces on the desk memory's host
+# (--service mem; src/desk-tenants.js on the Worker): a team's memory, each
+# member's in a room of its own there, and the agent tokens (frtk_) that write
+# it. Managed with your own sign-in there (foldrender login --service mem),
+# never an agent's token, and never on foldrender.dev.
+workspace_fail() {
+  local msg
+  msg="$(error_text)"
+  case "$STATUS" in
+    401) die 3 "not signed in on the desk memory's host, or the token was rejected; sign in with: foldrender login --service mem ($msg)" ;;
+    403) die 3 "${msg:-refused}" ;;
+    404) die 7 "${msg:-not found}: no such workspace, or you are not in it (foldrender desk workspace ls --service mem)" ;;
+    429) die 4 "$msg" ;;
+    400|409|422) die 1 "refused ($msg)" ;;
+    *) fail_http ;;
+  esac
+}
+# ws_id ID: a workspace's id (16 hex characters), or exit 2.
+ws_id() {
+  case "$1" in ''|*[!0-9a-f]*) die 2 "a workspace's id is 16 hex characters (foldrender desk workspace ls --service mem)" ;; esac
+  [ "${#1}" = 16 ] || die 2 "a workspace's id is 16 hex characters (foldrender desk workspace ls --service mem)"
+}
+# ws_field NAME: a string or number field of the one JSON object on stdin.
+ws_field() {
+  sed -n "s/.*\"$1\" *: *\"\\{0,1\\}\\([^\",}]*\\)\"\\{0,1\\}.*/\\1/p" | head -n 1
+}
+cmd_desk_workspace() {
+  case "${1:-}" in --help|-h|help) cmd_help desk-workspace; return 0 ;; esac
+  [ "$SERVICE" = mem ] || die 2 "workspaces are on the desk memory's host: add --service mem (foldrender help desk-workspace)"
+  local op="${1:-ls}" mode=text name="" role="" confirm="" rest=() id obj n
+  [ $# -eq 0 ] || shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) mode=json; shift ;;
+      --name) need $# "$1"; name="$2"; shift 2 ;;
+      --role) need $# "$1"; role="$2"; shift 2 ;;
+      --confirm) need $# "$1"; confirm="$2"; shift 2 ;;
+      --help|-h) cmd_help desk-workspace; return 0 ;;
+      -) rest+=("$1"); shift ;;
+      -*) die 2 "desk workspace $op: unknown option $1 (foldrender help desk-workspace)" ;;
+      *) rest+=("$1"); shift ;;
+    esac
+  done
+  set -- ${rest[@]+"${rest[@]}"}
+  # What is refused for its words, before the sign-in is asked for.
+  case "$op" in
+    redeem) [ $# -eq 2 ] && [ "$2" = - ] || die 2 "desk workspace redeem ID - (the code on stdin, never an argument: printf '%s' \"\$CODE\" | foldrender desk workspace redeem ID - --service mem)" ;;
+    rm|delete) [ $# -eq 1 ] && [ "$confirm" = "$1" ] || die 2 "deleting a workspace empties every member's memory in it and cannot be undone: desk workspace rm ID --confirm ID" ;;
+  esac
+  ACCEPT="application/json"
+  require_token
+  case "$op" in
+    ls)
+      [ $# -eq 0 ] || die 2 "desk workspace ls takes no argument"
+      api GET /api/desk/tenants -H "$(auth_header)"
+      [ "${STATUS#2}" != "$STATUS" ] || workspace_fail
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      n=0
+      while IFS= read -r obj; do
+        n=$((n + 1))
+        printf '%s  %s  %s, %s seat%s  %s%s\n' "$(printf '%s' "$obj" | ws_field id)" "$(printf '%s' "$obj" | ws_field slug)" \
+          "$(printf '%s' "$obj" | ws_field plan)" "$(printf '%s' "$obj" | ws_field seats)" "$([ "$(printf '%s' "$obj" | ws_field seats)" = 1 ] || printf s)" \
+          "$(printf '%s' "$obj" | ws_field role)" "$([ "$(printf '%s' "$obj" | ws_field seat_status)" = invited ] && printf ' (invited: foldrender desk workspace join ID --service mem)')"
+      done < <(grep -o '{[^{}]*}' "$TMP/body")
+      [ "$n" -gt 0 ] || printf 'No workspace yet. Make one: foldrender desk workspace new SLUG --service mem\n'
+      ;;
+    new)
+      [ $# -eq 1 ] || die 2 "desk workspace new SLUG [--name NAME]"
+      printf '{"slug":%s%s}' "$(json_arg "$1")" "${name:+,\"name\":$(json_arg "$name")}" > "$TMP/req"
+      api POST /api/desk/tenants -H "$(auth_header)" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+      [ "${STATUS#2}" != "$STATUS" ] || workspace_fail
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      id="$(ws_field id < "$TMP/body")"
+      printf '%s\n' "$id"
+      note "made workspace $1 (the Free plan, one seat), id $id. Feed it from this machine: foldrender desk mem install --service mem --workspace $id"
+      ;;
+    show)
+      [ $# -eq 1 ] || die 2 "desk workspace show ID"
+      ws_id "$1"
+      api GET "/api/desk/tenants/$1" -H "$(auth_header)"
+      [ "${STATUS#2}" != "$STATUS" ] || workspace_fail
+      cat "$TMP/body"; printf '\n'
+      ;;
+    invite)
+      [ $# -eq 2 ] || die 2 "desk workspace invite ID LOGIN [--role admin]"
+      ws_id "$1"
+      case "${role:-member}" in member|admin) ;; *) die 2 "--role is member or admin" ;; esac
+      printf '{"login":%s,"role":"%s"}' "$(json_arg "$2")" "${role:-member}" > "$TMP/req"
+      api POST "/api/desk/tenants/$1/members" -H "$(auth_header)" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+      [ "${STATUS#2}" != "$STATUS" ] || workspace_fail
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      printf 'invited %s\n' "$2"
+      note "they join with: foldrender desk workspace join $1 --service mem (signed in there as $2)"
+      ;;
+    join)
+      [ $# -eq 1 ] || die 2 "desk workspace join ID"
+      ws_id "$1"
+      api POST "/api/desk/tenants/$1/join" -H "$(auth_header)"
+      [ "${STATUS#2}" != "$STATUS" ] || workspace_fail
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      if grep -q '"joined" *: *true' "$TMP/body"; then printf 'joined %s\n' "$1"; else printf 'already in %s\n' "$1"; fi
+      ;;
+    remove)
+      [ $# -eq 2 ] || die 2 "desk workspace remove ID LOGIN (yourself, to leave)"
+      ws_id "$1"
+      api DELETE "/api/desk/tenants/$1/members/$(urlencode "$2")" -H "$(auth_header)"
+      [ "${STATUS#2}" != "$STATUS" ] || workspace_fail
+      printf 'removed %s; their tokens in it are revoked\n' "$2"
+      ;;
+    token)
+      local top="${1:-ls}"
+      [ $# -eq 0 ] || shift
+      case "$top" in
+        add)
+          [ $# -eq 1 ] && [ -n "$name" ] || die 2 "desk workspace token add ID --name NAME"
+          ws_id "$1"
+          printf '{"name":%s}' "$(json_arg "$name")" > "$TMP/req"
+          api POST "/api/desk/tenants/$1/tokens" -H "$(auth_header)" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+          [ "${STATUS#2}" != "$STATUS" ] || workspace_fail
+          [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+          json_get str token
+          note "an agent token for workspace $1, id $(ws_field id < "$TMP/body"); shown once. Keep it where the agent reads it (FOLDRENDER_DESK_TOKEN from a secret store or a 600 file), never in a command line. Revoke: foldrender desk workspace token rm $1 ID --service mem"
+          ;;
+        ls)
+          [ $# -eq 1 ] || die 2 "desk workspace token ls ID"
+          ws_id "$1"
+          api GET "/api/desk/tenants/$1/tokens" -H "$(auth_header)"
+          [ "${STATUS#2}" != "$STATUS" ] || workspace_fail
+          [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+          n=0
+          while IFS= read -r obj; do
+            n=$((n + 1))
+            printf '%s  %s  made %s, last used %s\n' "$(printf '%s' "$obj" | ws_field id)" "$(printf '%s' "$obj" | ws_field name)" \
+              "$(printf '%s' "$obj" | ws_field created_at | cut -c1-10)" "$(printf '%s' "$obj" | ws_field last_used_at | cut -c1-10 | sed 's/^null$/never/;s/^$/never/')"
+          done < <(grep -o '{[^{}]*}' "$TMP/body")
+          [ "$n" -gt 0 ] || printf 'No token of yours in it.\n'
+          ;;
+        rm)
+          [ $# -eq 2 ] || die 2 "desk workspace token rm ID TOKEN_ID"
+          ws_id "$1"; ws_id "$2"
+          api DELETE "/api/desk/tenants/$1/tokens/$2" -H "$(auth_header)"
+          [ "${STATUS#2}" != "$STATUS" ] || workspace_fail
+          printf 'revoked token %s\n' "$2"
+          ;;
+        *) die 2 "desk workspace token add|ls|rm" ;;
+      esac
+      ;;
+    redeem)
+      # A design partner's code is a secret: read on stdin, never an argument
+      # (said above, before the sign-in).
+      ws_id "$1"
+      local code
+      code="$(head -n 1 | tr -d ' \t\r\n')"
+      [ -n "$code" ] || die 2 "no code on stdin"
+      printf '{"invite":%s}' "$(json_arg "$code")" > "$TMP/req"
+      code=""
+      api POST "/api/desk/tenants/$1/redeem" -H "$(auth_header)" -H "Content-Type: application/json" --data-binary "@$TMP/req"
+      rm -f "$TMP/req"
+      [ "${STATUS#2}" != "$STATUS" ] || workspace_fail
+      [ "$mode" = json ] && { cat "$TMP/body"; printf '\n'; return 0; }
+      printf 'workspace %s is on the Team plan, %s seats (a design partner, for a year)\n' "$1" "$(grep -o '"tenant" *: *{[^{}]*}' "$TMP/body" | ws_field seats)"
+      ;;
+    rm|delete)
+      # Its --confirm ID is said above, before the sign-in.
+      ws_id "$1"
+      api DELETE "/api/desk/tenants/$1" -H "$(auth_header)"
+      [ "${STATUS#2}" != "$STATUS" ] || workspace_fail
+      [ "$STATUS" = 200 ] || die 1 "deleted workspace $1, but some members' memory did not say it was emptied: $(cat "$TMP/body")"
+      printf 'deleted workspace %s\n' "$1"
+      ;;
+    *) die 2 "unknown desk workspace command: $op (ls, new, show, invite, join, remove, token, redeem, rm; foldrender help desk-workspace)" ;;
+  esac
 }
 
 cmd_desk_machine() {
@@ -5262,7 +5517,7 @@ cmd_thread() {
 PACK_ITEM_MAX=16384
 # The same prefixes as the server's (src/desk.js SECRET_RES), so that what the
 # server would refuse is never sent to it. A prefix added there goes here too.
-PACK_SECRET_RE='(sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{8,}|github_pat_|gh[ousr]_[A-Za-z0-9]{8,}|frat_[A-Za-z0-9]|frdk_[A-Za-z0-9]|AKIA[0-9A-Z]{12,}|xox[abprs]-[A-Za-z0-9-]*|tk_[0-9A-Z]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|[?&]k=[A-Za-z0-9_-]{6,}|glpat-[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{8,}|sk_live_[A-Za-z0-9]|hf_[A-Za-z0-9]{8,}|npm_[A-Za-z0-9]{8,}|SG\.[A-Za-z0-9_-]{8,}|frdm_[A-Za-z0-9_-]{8,})'
+PACK_SECRET_RE='(sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{8,}|github_pat_|gh[ousr]_[A-Za-z0-9]{8,}|frat_[A-Za-z0-9]|frdk_[A-Za-z0-9]|frtk_[A-Za-z0-9]|frinv_[A-Za-z0-9]|AKIA[0-9A-Z]{12,}|xox[abprs]-[A-Za-z0-9-]*|tk_[0-9A-Z]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|[?&]k=[A-Za-z0-9_-]{6,}|glpat-[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{8,}|sk_live_[A-Za-z0-9]|hf_[A-Za-z0-9]{8,}|npm_[A-Za-z0-9]{8,}|SG\.[A-Za-z0-9_-]{8,}|frdm_[A-Za-z0-9_-]{8,})'
 pack_ref() {
   case "$1" in
     p-*) case "$1" in p-[a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9]) return 0 ;; esac ;;
@@ -6115,6 +6370,33 @@ Examples: foldrender desk card gw-caps --question "Raise the two monthly caps?" 
           foldrender desk mark 12 doing --key gw-caps --result "raising them now" --correct
 EOF
     ;;
+    desk-workspace|workspace) cat <<'EOF'
+foldrender desk workspace COMMAND --service mem [--json]
+  The workspaces on the desk memory's own host (mem.foldrender.dev): a team's
+  memory, each member's in a room of its own, written by the agent tokens
+  (frtk_) made in it. Only with --service mem (or FOLDRENDER_SERVICE=mem),
+  signed in there (foldrender login --service mem), with your own sign-in:
+  an agent's token manages nothing.
+  ls                     yours: id, slug, plan and seats, your role
+  new SLUG [--name NAME] one more (the Free plan, one seat; your GitHub account
+                         at least 30 days old; at most 3 a login): its id
+  show ID                one, its members, this month's use and limits (JSON)
+  invite ID LOGIN [--role admin]
+                         a seat for LOGIN (owner, admin); they join it
+  join ID                take the seat you were invited to
+  remove ID LOGIN        take a member out (yourself, to leave): their tokens
+                         in it are revoked; their memory there is kept
+  token add ID --name NAME
+                         an agent token (frtk_), printed once: keep it in a
+                         secret store or a 600 file, as FOLDRENDER_DESK_TOKEN
+  token ls ID            your tokens in it (no secrets); token rm ID TOKEN_ID
+  redeem ID -            a design partner's code, on stdin (never an
+                         argument): the Free workspace becomes Team
+  rm ID --confirm ID     delete it: every member's memory in it is emptied
+  The hooks for a workspace: foldrender desk mem install --service mem
+  --workspace ID makes their token itself and never prints it.
+EOF
+    ;;
     desk-mem|mem) cat <<'EOF'
 foldrender desk mem COMMAND [--json]
   The desk's memory: what your agents asked and answered on each machine
@@ -6122,7 +6404,8 @@ foldrender desk mem COMMAND [--json]
   and the notes, discoveries, changes and asks agents keep. It lives in your
   desk's room: only your tokens read it, and one login's memory can never
   reach another's. Read and written with the desk's agent token
-  (FOLDRENDER_DESK_TOKEN, frdk_ role agent) or your sign-in, as the desk's
+  (FOLDRENDER_DESK_TOKEN: a desk's frdk_ role agent; on the SaaS host a
+  workspace's frtk_) or your sign-in, as the desk's
   cards are; a feed token, a machine token and a browser session get nothing.
   status                 how much is kept (sessions, events, obs) and
                          written today; summarize (off, on or not_set_up),
@@ -6228,7 +6511,8 @@ foldrender desk mem COMMAND [--json]
                          (default claude and codex): a session's start prints
                          desk mem inject into it; each prompt, and the last
                          reply at a stop, are sent as events. A desk agent
-                         token (frdk_) is made with your sign-in and kept in
+                         token (frdk_, or a workspace's frtk_ on the SaaS
+                         host) is made with your sign-in and kept in
                          ~/.config/foldrender/desk-mem/token (600), never
                          printed; what was said reaches the hook on stdin,
                          never a command line. Codex runs the hooks once you
@@ -6648,11 +6932,14 @@ or not unique, the page moved on from --base, or a canvas edit was refused),
 11 no new answer before --timeout (answers --wait), 12 the id or address
 publish was asked for is another page's (the error names the page and the
 command to update it).
-Environment: FOLDRENDER_TOKEN (a token instead of the saved accounts),
+Environment: FOLDRENDER_TOKEN (a token instead of the saved accounts;
+FOLDRENDER_MEM_TOKEN on the desk memory's host, which never reads it),
 FOLDRENDER_ACCOUNT (a saved account's login, as --as),
 FOLDRENDER_API (the API, for testing), FOLDRENDER_NO_BROWSER=1,
 FOLDRENDER_READ_MAX_TOKENS, FOLDRENDER_NO_UPDATE_NOTE=1 (never say that a
-newer CLI is out). Free plan: 10 pages, 30 days each, 5 MB a page.
+newer CLI is out), --service|FOLDRENDER_SERVICE=mem for the desk memory's
+own SaaS host (mem.foldrender.dev; its own sign-ins). Free plan: 10 pages,
+30 days each, 5 MB a page.
 EOF
     ;;
     *) die 2 "no help for $1; try: foldrender help" ;;
@@ -6691,12 +6978,22 @@ main() {
           cat) cmd_help read ;;
           auth) cmd_help login ;;
           version) cmd_help ;;
-          desk) if [ "${1:-}" = mem ]; then cmd_help desk-mem; else cmd_help desk; fi ;;
+          desk) case "${1:-}" in mem) cmd_help desk-mem ;; workspace) cmd_help desk-workspace ;; *) cmd_help desk ;; esac ;;
           *) cmd_help "$cmd" ;;
         esac
         return 0
       fi ;;
   esac
+  # The desk memory's host answers its sign-in, the account, the memory and
+  # the workspaces, and nothing else: said here, before any request.
+  if [ "$SERVICE" = mem ]; then
+    case "$cmd" in
+      login|logout|auth|account|whoami|desk|version|--version|help|-h|--help) ;;
+      *) die 2 "$cmd is foldrender.dev's; the desk memory's host (--service mem) has login, logout, auth, whoami, account, desk mem and desk workspace" ;;
+    esac
+  fi
+  # A desk token of the wrong kind stops here, before any request.
+  case "$cmd" in desk|thread|pack|reply) desk_token_check ;; esac
   case "$cmd" in
     login) cmd_login "$@" ;;
     logout) cmd_logout "$@" ;;
@@ -6730,8 +7027,9 @@ main() {
   esac
 }
 
-# --as LOGIN (or --as=LOGIN), anywhere: this command runs as that saved
-# account. Not the value of an option that takes one (edit --old --as).
+# --as LOGIN (or --as=LOGIN) and --service foldrender|mem, anywhere: this
+# command runs as that saved account / against that service. Not the value of
+# an option that takes one (edit --old --as, edit --service).
 ARGS=()
 skip=""
 first=""
@@ -6741,6 +7039,8 @@ while [ $# -gt 0 ]; do
     --link) ARGS+=("$1"); case "$first" in canvas|desk) skip=1 ;; esac; shift; continue ;;
     --as) [ $# -ge 2 ] || die 2 "--as needs a value"; AS_LOGIN="$2"; shift 2 ;;
     --as=*) AS_LOGIN="${1#--as=}"; [ -n "$AS_LOGIN" ] || die 2 "--as needs a value"; shift ;;
+    --service) [ $# -ge 2 ] || die 2 "--service needs a value"; SERVICE="$2"; shift 2 ;;
+    --service=*) SERVICE="${1#--service=}"; [ -n "$SERVICE" ] || die 2 "--service needs a value"; shift ;;
     --old|--new|--title|--name|--folder|--share|--slug|--edits|--patch|--base|--assets|--save|-o|\
     --section|--card|--from|--max-tokens|--max-chars|--meta|--access|-n|--add|--rm|--note|--owner|\
     --confirm|--token|--timeout|--after|--notify|--ack|--to|--idempotency-key|--page|--agent|--dir|\
@@ -6752,5 +7052,6 @@ while [ $# -gt 0 ]; do
     *) [ -n "$first" ] || case "$1" in -*) ;; *) first="$1" ;; esac; ARGS+=("$1"); shift ;;
   esac
 done
+use_service
 select_account
 main ${ARGS[@]+"${ARGS[@]}"}
