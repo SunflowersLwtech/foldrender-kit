@@ -37,7 +37,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.23.0
+FR_CLI_VERSION=0.23.1
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -45,7 +45,7 @@ FR_BRIDGE_SHA256=0474aa21041e7549ed17addd7c5c3994282178184b4235b43a699cf8b27fdaa
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=cf705a0b46c870d6e7b254bf0e9d70b2d21c436118e905db7546ec8bc26a500f
+FR_DESK_AGENT_SHA256=bc5cf8ccf987ab29252308b358a93ecbebbcd8a0fd42e53fb350faccbe37fa25
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -1604,7 +1604,10 @@ cmd_export() {
 
 # account delete [--confirm LOGIN]: deletes the account with its pages and API
 # tokens, then the saved token and slug map on this machine. Without a terminal
-# it needs --confirm LOGIN; at a terminal the user types the login.
+# it needs --confirm LOGIN; at a terminal the user types the login. An account
+# taken off the desk memory's private beta cannot be read there (403
+# private_beta) and still deletes: its login is the saved account's or the one
+# given, and the server deletes the caller's own and no other.
 cmd_account() {
   [ "${1:-}" = delete ] || die 2 "usage: foldrender account delete [--confirm LOGIN]"
   shift
@@ -1624,11 +1627,18 @@ cmd_account() {
   fi
   require_token
   api_auth GET /api/me
-  expect_2xx
-  login="$(field login)"
-  pages="$(field used)"
-  [ -n "$login" ] || die 1 "could not read the account login"
-  printf 'Account %s has %s page(s).\nDeleting it removes every page, every API token and the account. It cannot be undone.\nTo keep a copy of your pages first, run: foldrender export\n' "$login" "${pages:-?}" >&2
+  if [ "$STATUS" = 403 ] && [ "$(json_field code)" = private_beta ]; then
+    login="$ACCOUNT"
+    [ -n "$login" ] || login="$(lower "$confirm")"
+    [ -n "$login" ] || die 2 "this account is not in the private beta, so it cannot be read here; to delete it, run again with --confirm <your login>"
+    printf 'Account %s is not in the private beta: what it holds cannot be read here, and it can still be deleted.\nDeleting it removes the workspaces it owns, everything it holds, every API token and the account. It cannot be undone.\n' "$login" >&2
+  else
+    expect_2xx
+    login="$(field login)"
+    pages="$(field used)"
+    [ -n "$login" ] || die 1 "could not read the account login"
+    printf 'Account %s has %s page(s).\nDeleting it removes every page, every API token and the account. It cannot be undone.\nTo keep a copy of your pages first, run: foldrender export\n' "$login" "${pages:-?}" >&2
+  fi
   if [ -z "$confirm" ]; then
     printf 'Type %s to confirm: ' "$login" >&2
     read -r typed || die 1 "no answer; nothing was deleted"
@@ -1637,6 +1647,8 @@ cmd_account() {
   confirm="$(printf '%s' "$confirm" | tr -d ' \r\t' | tr '[:upper:]' '[:lower:]')"
   [ "$confirm" = "$login" ] || die 1 "the login given does not match $login; nothing was deleted"
   api_auth DELETE "/api/me?confirm=$login"
+  # Not the caller's login (the server checks it): nothing was deleted.
+  [ "$STATUS" != 400 ] || die 1 "nothing was deleted: $(error_text)"
   if [ "$STATUS" = 403 ]; then
     die 1 "this account cannot be deleted from here: it is the operator's account, or the token is an admin token ($(error_text)). Nothing was deleted."
   fi
@@ -6900,6 +6912,8 @@ foldrender account delete [--confirm LOGIN]
   Deletes the account, every page and every API token; it cannot be undone.
   Asks for the login on a terminal; without one, --confirm LOGIN is required.
   Run foldrender export first to keep a copy.
+  With --service mem, an account no longer in the desk memory's private beta
+  still deletes (its own login only; nothing else of it can be read there).
 EOF
     ;;
     versions|restore|undo|log|diff) cat <<'EOF'

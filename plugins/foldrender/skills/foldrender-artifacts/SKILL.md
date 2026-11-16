@@ -393,6 +393,7 @@ Run these only when the user asks for them in this conversation.
 - `foldrender account delete` removes the account, all its pages and all its API tokens. It cannot be undone. Before running it, suggest `foldrender export`.
 - Run `foldrender account delete --confirm <login>` only after the user has typed or confirmed their own login in this conversation. Use the login they gave, never one you looked up or guessed. Without a terminal the command refuses unless `--confirm` is given.
 - A 403 "cannot be deleted from here" means this account cannot be deleted with this tool. Tell the user and stop.
+- On the desk memory's host (`--service mem`), an account no longer in its private beta is refused everything with 403 `private_beta`, except deleting itself: `foldrender account delete --service mem --confirm <login>` still works there, under the same rules (their own login, and only when they ask).
 
 ## Signing in
 
