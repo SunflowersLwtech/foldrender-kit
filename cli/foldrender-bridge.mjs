@@ -36,7 +36,7 @@ import { basename, delimiter, dirname, extname, isAbsolute, join, resolve, sep }
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const BRIDGE_VERSION = "0.22.0";
+export const BRIDGE_VERSION = "0.22.2";
 export const PROTOCOL = "fr-agent.1";
 // How the owner may begin a conversation from the session that made the page.
 export const START_MODES = new Set(["continue", "fork", "subagent"]);
@@ -1591,8 +1591,23 @@ export class PanelSync {
     this.watching = true;
     watchFile(this.file, { interval: 700 }, () => {
       clearTimeout(this.timer);
-      this.timer = setTimeout(() => this.push(), 600);
+      this.timer = setTimeout(() => this.pushSettled(), 600);
     });
+  }
+  // The watcher's own push. Its quiet beat is counted from the file's own
+  // last change, not from when a poll last saw one: a write still in flight
+  // (the file read between its writer's truncate and its write) would be
+  // written back half-made, as a revision that never was a text anyone
+  // wrote. A file changed inside the beat is left for the next poll, which
+  // re-arms this against the finished text. The turn's own push (after the
+  // agent has answered) is not held by this: its write is done. A file dated
+  // in the future (a clock ahead of this one's, a copy that kept its date)
+  // is held until that time has passed; the turn's push still writes it.
+  pushSettled() {
+    let st = null;
+    try { st = statSync(this.file); } catch { return null; /* gone: nothing to push */ }
+    if (Date.now() - st.mtimeMs < 600) return null;
+    return this.push();
   }
   // The file back to the panel, if it changed.
   push() {
