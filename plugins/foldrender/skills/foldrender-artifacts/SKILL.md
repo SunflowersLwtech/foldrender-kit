@@ -404,6 +404,8 @@ When a command fails with "not signed in" (exit code 3):
 
 If the user gives you a token, run `foldrender login --token <token>` and do not repeat it back.
 
+An account holds at most 100 live API tokens, and each sign-in (the CLI on any machine, an app) makes one. At that cap the approval page tells the user no token was made, and `foldrender login` keeps waiting. Tell the user to revoke one they no longer use under Account & CLI tokens on the account page, then approve the same code again before it expires. Do not revoke tokens yourself to make room unless the user asks: another machine or app may be using it. Through the API, `POST /artifacts/api/tokens` answers 409 with `code: "tokens_full"`, `limit` and `live`; `GET /artifacts/api/tokens` lists the live ones with when each was last used.
+
 ### Several accounts
 
 One machine can be signed in to several GitHub accounts. `foldrender auth list` shows them, the default marked; `foldrender whoami` says which one a command runs as.

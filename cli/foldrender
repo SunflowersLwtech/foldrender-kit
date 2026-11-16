@@ -31,7 +31,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.22.0
+FR_CLI_VERSION=0.22.1
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -39,7 +39,7 @@ FR_BRIDGE_SHA256=4504c2d162a21c0f2558727500adbc6e8039571a2c0dcdf065f6985ce70117b
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=1ea9c977ae2addffd348c267824e9bf8516615b940fad76793121c4d9ed96544
+FR_DESK_AGENT_SHA256=6b976ad61fe3bafa5f9cbaa3ab52e30d55a3caa5c3eae3db611a524539945e80
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -6403,6 +6403,11 @@ foldrender auth list             the accounts signed in here, the default marked
 foldrender auth switch LOGIN     make LOGIN the default (with two, the other one)
 foldrender logout [LOGIN|--all]  revoke the token on the server and remove it here:
                                  the account in use, LOGIN, or every one
+Each login (here, in another terminal or in an app) makes an API token, and an
+account holds at most 100 live ones. At that cap the approval page says so and
+the terminal keeps waiting: revoke one it no longer uses (Account & CLI tokens
+on the account page, or foldrender logout where it is not needed), then approve
+the same code again before it expires.
 Which account a command runs as, first to last: FOLDRENDER_TOKEN (a token; not
 one of the saved accounts), --as LOGIN anywhere on the command line or
 FOLDRENDER_ACCOUNT=LOGIN (a saved account: an agent sets this, so that a switch
