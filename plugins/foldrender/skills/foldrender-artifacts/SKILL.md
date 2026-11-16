@@ -373,7 +373,7 @@ foldrender pack show pr321-review                            # paste this into t
 
 - Free: 10 pages, each expiring 30 days after it was published, 5 MB per page.
 - Pro: 1,000 pages, 2 GB in all, no expiry; $10 a month or $96 a year (USD; tax may apply).
-- Every kind of page (a page, a canvas, a sheet) counts as one page. Team and Enterprise are sold by email (sales@duocodetech.com), not from the command.
+- Every kind of page (a page, a canvas, a sheet) counts as one page. Team and Enterprise are sold by email (duocodetechu@gmail.com), not from the command.
 - The plans and their limits, as the site has them: https://foldrender.dev/pricing, or `GET https://foldrender.dev/artifacts/api/billing/plans` (JSON, no sign-in).
 
 If a publish fails with "plan limit reached" (exit 4), tell the user the limit. Offer either to delete a page they no longer need (`foldrender ls --all`; never delete without asking) or to upgrade.
