@@ -37,7 +37,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.23.1
+FR_CLI_VERSION=0.24.0
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -45,7 +45,7 @@ FR_BRIDGE_SHA256=0474aa21041e7549ed17addd7c5c3994282178184b4235b43a699cf8b27fdaa
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=bc5cf8ccf987ab29252308b358a93ecbebbcd8a0fd42e53fb350faccbe37fa25
+FR_DESK_AGENT_SHA256=e9b2fd840b895a1123bfc1bc8dcf08b36fa9ed8148745db6162539b976e9dcfa
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -358,12 +358,32 @@ check_logins() {
   esac
 }
 
+# check_team_name NAME [WHAT]: a team's name in any command that names one
+# (team create, team add/remove, team show/delete, share's --team and
+# -team:NAME): 1-64 characters, no commas or spaces, as the API keeps it.
+check_team_name() {
+  case "$1" in
+    ''|*[[:space:],/\\?#%]*|*[!A-Za-z0-9._-]*) die 2 "a team's name is 1 to 64 letters, digits, dots, dashes or underscores${2:+ $2}: $1" ;;
+  esac
+  [ "${#1}" -le 64 ] || die 2 "a team's name is 1 to 64 letters, digits, dots, dashes or underscores${2:+ $2}: $1"
+}
+
 # json_array a,b: the JSON array ["a","b"]. The API wants arrays for share_add
 # and share_remove, not strings. Logins were checked by check_logins first.
 json_array() {
   printf '['
   printf '%s' "$1" | awk -F, '{ for (i = 1; i <= NF; i++) printf "%s\"%s\"", (i > 1 ? "," : ""), $i }'
   printf ']'
+}
+
+# check_subjects "bob,team:eng,carol": a comma list of GitHub logins, each
+# optionally team: to say a team (foldrender team's) — what share's level flags
+# name. A team's name is the caller's to give, so it is checked loose like one.
+check_subjects() {
+  case "$1" in
+    ''|-*|*[!A-Za-z0-9:,_-]*|,*|*,|*,,*) die 2 "not a comma-separated list of GitHub logins and team:NAMEs: $1" ;;
+    *team::*|*team:,*|*team:) die 2 "not a team's name: $1" ;;
+  esac
 }
 
 # A slug, or a page URL, to the slug.
@@ -1125,6 +1145,11 @@ json_get() {
         m = parts(v, K2, V2)
         for (i = 1; i <= m; i++) if (substr(V2[i], 1, 1) == "\"") printf "%s\t%s\n", K2[i], unstr(V2[i])
       }
+      else if (mode == "items") {
+        # An array of objects, one a line (a word about each: the grants, teams).
+        m = parts(v, K2, V2); if (m <= 0) exit 1
+        for (i = 1; i <= m; i++) if (substr(V2[i], 1, 1) == "{") print V2[i]
+      }
     }' "${3:-$TMP/body}"
 }
 
@@ -1503,7 +1528,9 @@ export_abort() {
 # parts. After 3 such rounds it stops and removes what it saved. It never ends
 # with a set that misses a page the account had when its last part was saved.
 cmd_export() {
-  [ $# -le 1 ] || die 2 "usage: foldrender export [FILE.zip]"
+  # export SHEET FILE: one sheet as a file; else the account's zip.
+  if [ $# -ge 2 ] && case "$1$2" in -*) false ;; *) true ;; esac; then cmd_sheet_export "$@"; return; fi
+  [ $# -le 1 ] || die 2 "usage: foldrender export [FILE.zip] | export SHEET FILE.xlsx|FILE.csv"
   local target="${1:-}" login="" i k q name mplan cuts same rounds=0 start=1
   local saved=() old_after=() old_to=()
   EXPORT_FILES=()
@@ -1631,7 +1658,14 @@ cmd_account() {
     login="$ACCOUNT"
     [ -n "$login" ] || login="$(lower "$confirm")"
     [ -n "$login" ] || die 2 "this account is not in the private beta, so it cannot be read here; to delete it, run again with --confirm <your login>"
-    printf 'Account %s is not in the private beta: what it holds cannot be read here, and it can still be deleted.\nDeleting it removes the workspaces it owns, everything it holds, every API token and the account. It cannot be undone.\n' "$login" >&2
+    # With no saved account (a token from the environment) the login is the one
+    # given, not one read from the account: it is not named as the account's.
+    if [ -n "$ACCOUNT" ]; then
+      printf 'Account %s is not in the private beta: what it holds cannot be read here, and it can still be deleted.\n' "$login" >&2
+    else
+      printf 'This account is not in the private beta: what it holds cannot be read here, and it can still be deleted.\nDeleting with the login you gave, %s; the server checks it is yours.\n' "$login" >&2
+    fi
+    printf 'Deleting it removes the workspaces it owns, everything it holds, every API token and the account. It cannot be undone.\n' >&2
   else
     expect_2xx
     login="$(field login)"
@@ -1833,6 +1867,10 @@ publish_one() {
     held_page
     die 12 "${label}not published: $HELD_URL is already your page $HELD_ID. To update that page: foldrender publish $(hint_file "$file") --slug $HELD_ID. To make a new page, choose another ${name:+--name}${name:---slug}."
   fi
+  # An old address's name (src/old-addresses.js): whose it is, and the command that frees it.
+  if [ "$STATUS" = 409 ] && [ -n "$(json_field release)" ]; then
+    die 12 "${label}not published: $(json_field message)"
+  fi
   if [ "$STATUS" = 409 ]; then
     die 12 "${label}not published: another of your pages is already at that address (${name:+name $name}${folder:+, folder $folder}). Choose another with --name or --folder"
   fi
@@ -1901,6 +1939,13 @@ publish_report() {
     else action=updated
     fi
   fi
+  # A publish that made an existing page private took off everyone it was
+  # shared with, as share --private does: it says how many.
+  case "$(field revoked)" in
+    ''|0|*[!0-9]*) ;;
+    1) note "${label}took 1 invited person or team off: the page is Only you now" ;;
+    *) note "${label}took $(field revoked) invited people and teams off: the page is Only you now" ;;
+  esac
   case "$action" in
     created) note "${label}created a new page, id $PAGE_ID${vis:+, $vis}: $PAGE_URL" ;;
     updated) note "${label}updated page $PAGE_ID in place, rev $rev: +$(field added) -$(field removed) lines: $PAGE_URL" ;;
@@ -1941,6 +1986,8 @@ publish_report() {
 # them as JSON: an array of {"old": ..., "new": ...}, or the request's object.
 # --base REV refuses to edit a page that has moved on from that revision.
 cmd_edit() {
+  # A change to an artifact with a room (a sheet): its batch against a seq.
+  case " $* " in *" --ops "*|*" --undo "*) cmd_edit_ops "$@"; return ;; esac
   local target="" base="" title="" efile="" n=0 have_old="" as_json="" c message=""
   : > "$TMP/edits.json"
   while [ $# -gt 0 ]; do
@@ -2200,19 +2247,157 @@ cmd_undo() {
   restore_version "$1" "$vid"
 }
 
+# mv PAGE NEWNAME [--folder F]: a page to another address of yours (its name,
+# its folder, or both; --folder "" for no folder). Where it was stays open: the
+# old address redirects to the new one for anyone the page opens for, and no
+# other page takes its name until you let it go. mv --release-old ADDRESS lets
+# one go. Reads the text answer (old_address=, old_address_dropped=) unless --json.
+cmd_mv() {
+  local page="" name="" folder="" folder_set="" as_json="" json="" old warn
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --release-old)
+        shift
+        [ $# -eq 1 ] || die 2 "usage: foldrender mv --release-old ADDRESS"
+        release_old "$1"
+        return
+        ;;
+      --folder) need $# "$1"; [ -z "$folder_set" ] || die 2 "--folder takes one folder"; folder="$2"; folder_set=1; shift 2 ;;
+      --json) as_json=1; shift ;;
+      -*) die 2 "unknown option: $1 (mv PAGE NEWNAME [--folder F])" ;;
+      *) if [ -z "$page" ]; then page="$1"; elif [ -z "$name" ]; then name="$1"; else die 2 "mv takes one page and one name"; fi; shift ;;
+    esac
+  done
+  { [ -n "$page" ] && { [ -n "$name" ] || [ -n "$folder_set" ]; }; } ||
+    die 2 "usage: foldrender mv PAGE NEWNAME [--folder F] (or: foldrender mv --release-old ADDRESS)"
+  [ -z "$name" ] || check_name "$name" NEWNAME
+  [ -z "$folder" ] || check_name "$folder" --folder
+  require_token
+  page_id "$page"
+  check_slug "$PAGE_ID"
+  [ -z "$name" ] || json="\"name\":\"$name\""
+  [ -z "$folder_set" ] || json="${json:+$json,}\"folder\":\"$folder\""
+  if [ -n "$as_json" ]; then ACCEPT="application/json"; else ACCEPT="text/plain"; fi
+  api_auth PATCH "/api/artifacts/$PAGE_ID" -H "Content-Type: application/json" --data "{$json}"
+  [ "$STATUS" != 404 ] || die 7 "no page named $PAGE_ID among yours"
+  [ "$STATUS" != 409 ] || mv_taken
+  expect_2xx
+  if [ -n "$as_json" ]; then
+    cat "$TMP/body"; printf '\n'
+    return 0
+  fi
+  read_page_url
+  printf '%s\n' "$PAGE_URL"
+  old="$(field old_address)"
+  note "moved $PAGE_ID to $PAGE_URL"
+  [ -z "$old" ] || note "its old address $old still opens it (no other page takes the name; foldrender mv --release-old $old lets it go)"
+  # The old addresses past the account's limit, each with the page it opened.
+  sed -n 's/^old_address_dropped=//p' "$TMP/body" | tr -d '\r' |
+    awk -F '\t' '{ printf "past your account'"'"'s limit of old addresses the oldest was let go: %s (it opened %s%s)\n", $1, $2, ($3 != "" && $3 != "-") ? ", now at " $3 : "" }' |
+    while IFS= read -r line; do note "$line"; done
+  warn="$(field warning)"
+  [ -z "$warn" ] || note "warning: $warn"
+}
+
+# mv_taken: the 409 of a taken address, with the server's words on stderr:
+# whose old address it is and the command that frees it, or that a page holds it.
+mv_taken() {
+  [ -z "$(json_field release)" ] || die 1 "$(json_field message)"
+  die 1 "that address is taken by another of your pages ($(json_field path)); choose another name or --folder"
+}
+
+# merge PAGE --into PAGE [-m MSG]: one page goes into another. The page that
+# went in is gone; its address, its older addresses and its link by id open the
+# page it went into (for whoever that page opens); its last body is kept in the
+# other page's history, and its own history goes with it. stderr says what the
+# server says to tell its holders (note=), e.g. that a key no longer opens it.
+cmd_merge() {
+  local from="" into="" msg="" as_json="" fid json old
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --into) need $# "$1"; [ -z "$into" ] || die 2 "--into takes one page"; into="$2"; shift 2 ;;
+      -m) need $# "$1"; msg="$2"; shift 2 ;;
+      --json) as_json=1; shift ;;
+      -*) die 2 "unknown option: $1 (merge PAGE --into PAGE [-m MSG])" ;;
+      *) [ -z "$from" ] || die 2 "merge takes one page and one --into"; from="$1"; shift ;;
+    esac
+  done
+  [ -n "$from" ] && [ -n "$into" ] || die 2 "usage: foldrender merge PAGE --into PAGE [-m MSG]"
+  require_token
+  page_id "$from"
+  check_slug "$PAGE_ID"
+  fid="$PAGE_ID"
+  page_id "$into"
+  check_slug "$PAGE_ID"
+  json="{\"into\":\"$PAGE_ID\""
+  [ -z "$msg" ] || json="$json,\"message\":$(json_arg "$msg")"
+  json="$json}"
+  if [ -n "$as_json" ]; then ACCEPT="application/json"; else ACCEPT="text/plain"; fi
+  api_auth POST "/api/artifacts/$fid/merge" -H "Content-Type: application/json" --data "$json"
+  case "$STATUS" in
+    404) die 7 "no page $(json_field id) among yours" ;;
+    400|409) die 2 "$(json_field message)" ;;
+    # The day's rows of merges, team and sharing changes (the account's or the
+    # site's) are used up: the server says how much is left and when it resets.
+    429) die 4 "$(error_text)" ;;
+  esac
+  expect_2xx
+  if [ -n "$as_json" ]; then
+    cat "$TMP/body"; printf '\n'
+    return 0
+  fi
+  read_page_url
+  printf '%s\n' "$PAGE_URL"
+  note "merged $fid into $PAGE_ID (rev $(field rev); its last body is version $(field version)): its address, its older addresses and its link by id now open this page"
+  sed -n 's/^note=//p' "$TMP/body" | tr -d '\r' | while IFS= read -r line; do note "$line"; done
+  sed -n 's/^old_address_dropped=//p' "$TMP/body" | tr -d '\r' |
+    awk -F '\t' '{ printf "past your account'"'"'s limit of old addresses the oldest was let go: %s (it opened %s%s)\n", $1, $2, ($3 != "" && $3 != "-") ? ", now at " $3 : "" }' |
+    while IFS= read -r line; do note "$line"; done
+}
+
+# release_old ADDRESS: one of your old addresses, let go. It stops opening the
+# page it opened, and its name is free for another page. Prints the address.
+release_old() {
+  local address="$1"
+  case "$address" in
+    /artifacts/*|http://*/artifacts/*|https://*/artifacts/*) ;;
+    *) die 2 "$address is not a page address (.../artifacts/<login>/[<folder>/]<name>)" ;;
+  esac
+  require_token
+  ACCEPT="text/plain"
+  api_auth DELETE "/api/artifacts/-/old-addresses?path=$(urlencode "$address")"
+  [ "$STATUS" != 404 ] || die 7 "$(json_field message)"
+  expect_2xx
+  printf '%s\n' "$(field released)"
+  note "released: it no longer opens page $(field id), and its name is free for a new page (foldrender publish --name)"
+}
+
 # share PAGE... [+login ...] [-login ...] [--private|--shared|--link|--public]
-# [--reset-link] [--collab|--no-collab] [--copy|--no-copy]: who can open the
-# pages, said after each in the words of the site's Share panel (src/access.js).
-# People are added and removed as the panel does it (accessChange there): on a
-# page open to anyone with the link, or public, the list is kept and who can open
-# the page does not change; on a private page the first person added makes it
-# shared ("Only people added"), and on a shared page the last one removed makes
-# it private again. --shared asks for "Only people added" itself. +login with
-# --private is refused: private is the owner alone.
+# [--reset-link] [--collab|--no-collab] [--copy|--no-copy] [--view x,...]
+# [--comment x,...] [--edit x,...] [--team NAME,...] [--pin REV|latest]
+# who can open the pages, said after each in the words of the site's Share panel
+# (src/access.js). People are added and removed as the panel does it
+# (accessChange there): on a page open to anyone with the link, or public, the
+# list is kept and who can open the page does not change; on a private page the
+# first person added makes it shared ("Only people added"), and on a shared page
+# the last one removed makes it private again. --shared asks for "Only people
+# added" itself. +login with --private is refused: private is the owner alone.
+# Levels: --view/--comment/--edit each take GitHub logins and team:NAMEs (a
+# team as foldrender team makes it; a team's members stand for it). --view can
+# open it; --comment adds the page's own notes and comments; --edit adds the
+# page's surface a collaborator writes (a canvas's room). --team grants those
+# teams at the level of the --view/--comment/--edit on the same line. -login
+# removes the login (its grant with the list's name); -team:NAME the team's.
+# --pin pins the page's link to a version, by its revision or id (latest
+# unpins): whoever holds the link sees that version and never a newer one.
+# With nothing to change, share PAGE says who can open it, each person's and
+# team's level, and the page's pin if it has one.
 cmd_share() {
   local targets=() vis="" adds="" removes="" arg json reset="" as_json="" t collab="" copy="" now visit
-  for arg in "$@"; do
-    case "$arg" in
+  local views="" comments="" edits="" team_names="" level="" pin=""
+  local remove_logins="" remove_teams="" s flag
+  while [ $# -gt 0 ]; do
+    case "$1" in
       --public) vis=public ;;
       --link) vis=link ;;
       --private) vis=private ;;
@@ -2222,30 +2407,101 @@ cmd_share() {
       --no-collab) collab=false ;;
       --copy) copy=true ;;
       --no-copy) copy=false ;;
+      --view|--comment|--edit)
+        flag="$1"
+        need $# "$flag"
+        s="$2"; shift
+        check_subjects "$s"
+        case "$flag" in
+          --view) views="${views:+$views,}${s// /}"; level=view ;;
+          --comment) comments="${comments:+$comments,}${s// /}"; level=comment ;;
+          --edit) edits="${edits:+$edits,}${s// /}"; level=edit ;;
+        esac ;;
+      --team)
+        flag="$1"
+        need $# "$flag"
+        s="$2"; shift
+        check_team_name "$s"
+        [ -n "$level" ] || die 2 "--team needs a level on the same line: --view, --comment or --edit before it"
+        team_names="${team_names:+$team_names,}${s// /}" ;;
+      --pin) need $# "$1"; pin="${2// /}"; shift ;;
       --json) as_json=1 ;;
-      --*) die 2 "unknown option: $arg" ;;
-      +?*) check_logins "${arg#+}"; adds="${adds:+$adds,}${arg#+}" ;;
-      -?*) check_logins "${arg#-}"; removes="${removes:+$removes,}${arg#-}" ;;
-      ?*) targets+=("$arg") ;;
+      --*) die 2 "unknown option: $1" ;;
+      +?*) check_logins "${1#+}"; adds="${adds:+$adds,}${1#+}" ;;
+      -?*)
+        case "$1" in
+          -team:*) check_team_name "${1#-team:}"; remove_teams="${remove_teams:+$remove_teams,}${1#-team:}" ;;
+          *) s="${1#-}"; check_logins "$s"; removes="${removes:+$removes,}$s" ;;
+        esac ;;
+      ?*) targets+=("$1") ;;
       *) die 2 "expected a page, +login, -login, --private, --shared, --link, --public, --reset-link, --collab or --copy" ;;
     esac
+    shift
   done
-  [ ${#targets[@]} -gt 0 ] || die 2 "usage: foldrender share PAGE... [+login ...] [-login ...] [--private|--shared|--link|--public] [--reset-link] [--collab|--no-collab] [--copy|--no-copy]"
-  [ -n "$adds$removes$vis$reset$collab$copy" ] || die 2 "nothing to change: give +login, -login, --private, --shared, --link, --public, --reset-link, --collab or --copy"
+  [ ${#targets[@]} -gt 0 ] || die 2 "usage: foldrender share PAGE... [+login ...] [-login ...] [--private|--shared|--link|--public] [--reset-link] [--collab|--no-collab] [--copy|--no-copy] [--view|--comment|--edit LOGIN|team:NAME,...] [--team NAME,...] [--pin REV|latest]"
+  # A removal named a login (team:NAME went to remove_teams as it parsed).
+  local remove_logins="$removes"
+  [ -n "$adds$remove_logins$remove_teams$vis$reset$collab$copy$pin$views$comments$edits" ] || state=say
   if [ -n "$adds" ] && [ "$vis" = private ]; then
     die 2 "--private is you alone, so +login would let nobody in. To share with the people you name: foldrender share PAGE +login"
+  fi
+  [ -z "$views" ] || [ -z "$comments$edits" ] || die 2 "--view, --comment and --edit ask separate lines: one level a line (foldrender share PAGE --view bob --edit team:eng)"
+  # A team's grant: --team's names join the level's list as team:NAMEs.
+  if [ -n "$team_names" ]; then
+    for s in $(printf '%s' "$team_names" | tr ',' ' '); do
+      case "$level" in
+        view) views="${views:+$views,}team:$s" ;;
+        comment) comments="${comments:+$comments,}team:$s" ;;
+        edit) edits="${edits:+$edits,}team:$s" ;;
+      esac
+    done
   fi
 
   json=""
   [ -z "$reset" ] || json="\"reset_link\":true"
   [ -z "$adds" ] || json="${json:+$json,}\"share_add\":$(json_array "$adds")"
-  [ -z "$removes" ] || json="${json:+$json,}\"share_remove\":$(json_array "$removes")"
+  [ -z "$remove_logins" ] || json="${json:+$json,}\"share_remove\":$(json_array "$remove_logins")"
   [ -z "$collab" ] || json="${json:+$json,}\"collab\":$collab"
   [ -z "$copy" ] || json="${json:+$json,}\"copy\":$copy"
+  # The grants' entries: {login, level} or {team, level} as they are asked for.
+  local gjson="" gadds="" gremoves="" who2
+  for who2 in $(printf '%s' "$views" | tr ',' ' '); do
+    case "$who2" in
+      team:*) gadds="${gadds:+$gadds,}{\"team\":\"${who2#team:}\",\"level\":\"view\"}" ;;
+      *) gadds="${gadds:+$gadds,}{\"login\":\"$who2\",\"level\":\"view\"}" ;;
+    esac
+  done
+  for who2 in $(printf '%s' "$comments" | tr ',' ' '); do
+    case "$who2" in
+      team:*) gadds="${gadds:+$gadds,}{\"team\":\"${who2#team:}\",\"level\":\"comment\"}" ;;
+      *) gadds="${gadds:+$gadds,}{\"login\":\"$who2\",\"level\":\"comment\"}" ;;
+    esac
+  done
+  for who2 in $(printf '%s' "$edits" | tr ',' ' '); do
+    case "$who2" in
+      team:*) gadds="${gadds:+$gadds,}{\"team\":\"${who2#team:}\",\"level\":\"edit\"}" ;;
+      *) gadds="${gadds:+$gadds,}{\"login\":\"$who2\",\"level\":\"edit\"}" ;;
+    esac
+  done
+  for who2 in $(printf '%s' "$remove_logins" | tr ',' ' '); do
+    gremoves="${gremoves:+$gremoves,}{\"login\":\"$who2\"}"
+  done
+  for who2 in $(printf '%s' "$remove_teams" | tr ',' ' '); do
+    gremoves="${gremoves:+$gremoves,}{\"team\":\"$who2\"}"
+  done
+  [ -z "$gadds" ] || gjson="\"add\":[$gadds]"
+  [ -z "$gremoves" ] || gjson="${gjson:+$gjson,}\"remove\":[$gremoves]"
   ACCEPT="application/json"
   for t in "${targets[@]}"; do
     page_id "$t"
     check_slug "$PAGE_ID"
+    if [ "$state" = say ]; then
+      api_auth GET "/api/artifacts/$PAGE_ID/grants"
+      [ "$STATUS" != 404 ] || die 7 "no page named $PAGE_ID among yours"
+      expect_2xx
+      if [ -n "$as_json" ]; then cat "$TMP/body"; printf '\n'; else say_grants "$t"; fi
+      continue
+    fi
     visit="$vis"
     # People added with no access asked for: a page open to the link, or public,
     # stays so (the server would make it shared with them alone).
@@ -2256,25 +2512,137 @@ cmd_share() {
       now="$(json_get str visibility 2>/dev/null)"
       case "$now" in link|public) visit="$now" ;; esac
     fi
-    api_auth PATCH "/api/artifacts/$PAGE_ID" -H "Content-Type: application/json" \
-      --data "{${visit:+\"visibility\":\"$visit\"}${visit:+${json:+,}}$json}"
-    [ "$STATUS" != 404 ] || die 7 "no page named $PAGE_ID among yours"
-    expect_2xx
-    # Shared with nobody (the last person removed, or --shared on an empty
-    # list): the page is its owner's alone, which the panel calls private.
-    if [ "$(json_get str visibility)" = shared ] && [ "$(json_get len share)" = 0 ]; then
-      api_auth PATCH "/api/artifacts/$PAGE_ID" -H "Content-Type: application/json" --data '{"visibility":"private"}'
+    if [ -n "$json$visit" ]; then
+      api_auth PATCH "/api/artifacts/$PAGE_ID" -H "Content-Type: application/json" \
+        --data "{${visit:+\"visibility\":\"$visit\"}${visit:+${json:+,}}$json}"
+      [ "$STATUS" != 404 ] || die 7 "no page named $PAGE_ID among yours"
       expect_2xx
+      # Shared with nobody (the last person removed, or --shared on an empty
+      # list): the page is its owner's alone, which the panel calls private.
+      # Only when its grants name nobody either: a private write takes every
+      # grant off, and the answer's list is the server's to fill (a server
+      # from before teams named in it answered a team-held page empty). A
+      # server from before grants has no /grants (404): its list was all.
+      if [ "$(json_get str visibility)" = shared ] && [ "$(json_get len share)" = 0 ]; then
+        cp "$TMP/body" "$TMP/pageresp"
+        api_auth GET "/api/artifacts/$PAGE_ID/grants"
+        [ "$STATUS" = 404 ] || expect_2xx
+        if [ "$STATUS" = 404 ] || [ "$(json_get len grants 2>/dev/null || echo 0)" = 0 ]; then
+          api_auth PATCH "/api/artifacts/$PAGE_ID" -H "Content-Type: application/json" --data '{"visibility":"private"}'
+          expect_2xx
+        else
+          cp "$TMP/pageresp" "$TMP/body"
+        fi
+      fi
+      # What the page answers is what the display below reads, whatever the
+      # grants and the pin's own answers do to $TMP/body next.
+      cp "$TMP/body" "$TMP/pageresp"
+    fi
+    if [ -n "$gjson" ]; then
+      api_auth POST "/api/artifacts/$PAGE_ID/grants" -H "Content-Type: application/json" --data "{$gjson}"
+      # A server from before grants has no /grants (404): the page's own
+      # PATCH carried the change, and there is nothing else to ask of it.
+      # (A page that is not this account's failed the PATCH above.)
+      # 429: the day's rows of sharing changes are used up. No one was added;
+      # whom the same request took away is taken away all the same (the server
+      # does that first, and its words say so, with what is left and when it
+      # resets). What the PATCH above changed (access, the share list) stands.
+      if [ "$STATUS" = 429 ]; then
+        [ -z "$json$visit" ] || note "$t: its access and share list were changed as asked"
+        die 4 "$t: $(error_text)"
+      fi
+      [ "$STATUS" = 404 ] || expect_2xx
+    fi
+    if [ -n "$pin" ]; then
+      if [ "$pin" = latest ]; then
+        api_auth PATCH "/api/artifacts/$PAGE_ID" -H "Content-Type: application/json" --data '{"link_version":"latest"}'
+        [ "$STATUS" != 404 ] || die 7 "no page named $PAGE_ID among yours"
+        expect_2xx
+        [ -n "$as_json" ] || note "$t: the link shows the page's latest version again"
+      else
+        api_auth GET "/api/artifacts/$PAGE_ID/versions" -H "Accept: application/json"
+        [ "$STATUS" != 404 ] || die 7 "no page named $PAGE_ID among yours"
+        expect_2xx
+        # The pin names a version by its id (16 hex), or by its revision number.
+        case "$pin" in
+          ????????????????) pinid="$pin" ;;
+          [0-9]*) pinid="$(json_version_id "$TMP/body" "$pin")" ;;
+          *) die 2 "the version to pin is its id (16 hex), its revision number, or latest: $pin" ;;
+        esac
+        [ -n "$pinid" ] || die 7 "the page has no version at revision $pin to pin; foldrender log $PAGE_ID for the list"
+        api_auth PATCH "/api/artifacts/$PAGE_ID" -H "Content-Type: application/json" --data "{\"link_version\":\"$pinid\"}"
+        expect_2xx
+        [ -n "$as_json" ] || note "$t: the link is pinned to version $pinid"
+      fi
     fi
     if [ -n "$as_json" ]; then
+      api_auth GET "/api/artifacts/$PAGE_ID/grants"
+      expect_2xx
       cat "$TMP/body"
       printf '\n'
-    else
+    elif [ -n "$json$visit" ]; then
+      cp "$TMP/pageresp" "$TMP/body"
       json_get str page_url 2>/dev/null || json_get str url
       printf '\n'
+      say_access "$t" "$collab" "$copy"
+    elif [ -n "$gjson$pin" ]; then
+      api_auth GET "/api/artifacts/$PAGE_ID/grants"
+      expect_2xx
+      say_grants "$t"
     fi
-    say_access "$t" "$collab" "$copy"
   done
+}
+
+# say_grants PAGE: who can open the page now (the /grants answer in $TMP/body,
+# read as the API keeps it), said as the Share panel says it: the General
+# access, each person and team with their level, and the pin when there is one.
+say_grants() {
+  local vis word arr obj
+  vis="$(json_get str visibility 2>/dev/null)"
+  case "$vis" in
+    public) word="Public" ;;
+    link) word="Anyone with the link" ;;
+    shared) word="Only people added" ;;
+    *) word="Only you" ;;
+  esac
+  note "$1: who can open it: $word"
+  json_get items grants 2>/dev/null | while IFS= read -r obj; do
+    [ -n "$obj" ] || continue
+    printf '%s\n' "$obj" > "$TMP/grant"
+    case "$(json_get str level 2>/dev/null "$TMP/grant")" in
+      comment) word="can comment" ;;
+      edit) word="can edit" ;;
+      *) word="can view" ;;
+    esac
+    if [ "$(json_get str subject_type 2>/dev/null "$TMP/grant")" = team ]; then
+      note "- the team $(json_get str team_name 2>/dev/null "$TMP/grant" || json_get str team 2>/dev/null "$TMP/grant"): $word"
+    else
+      note "- $(json_get str login 2>/dev/null "$TMP/grant"): $word"
+    fi
+  done
+  word="$(json_get str link_version 2>/dev/null)"
+  [ -z "$word" ] || note "- the link is pinned to version $word"
+}
+
+# json_version_id FILE REV: the id of the version whose revision is REV, from
+# the versions answer's JSON ({"rev": N, "versions": [{id, …, rev?}]}), or
+# nothing. Each version is read from a file of its own: json_get reads a file,
+# never its stdin, and the answer's own "rev" (the page's) is no version's.
+json_version_id() {
+  local obj
+  json_get items versions 2>/dev/null "$1" | while IFS= read -r obj; do
+    [ -n "$obj" ] || continue
+    printf '%s\n' "$obj" > "$TMP/version"
+    [ "$(json_get raw rev 2>/dev/null "$TMP/version")" = "$2" ] || continue
+    json_get str id 2>/dev/null "$TMP/version"
+    break
+  done
+}
+
+# share_names: the answer's share list (the body) as a sentence names it: its
+# logins, and a team the server names as team/NAME as "the team NAME".
+share_names() {
+  json_get raw share 2>/dev/null | tr -d '[]" ' | sed 's#team/\([^,]*\)#the team \1#g; s/,/, /g'
 }
 
 # say_access PAGE COLLAB COPY: on stderr, who can open the page just written
@@ -2286,14 +2654,21 @@ say_access() {
     public) who="Public" ;;
     link) who="Anyone with the link" ;;
     shared)
-      names="$(json_get raw share 2>/dev/null | tr -d '[]" ' | sed 's/,/, /g')"
+      names="$(share_names)"
       if [ -n "$names" ]; then who="Only people added ($names)"; else who="Only you"; fi ;;
     *) who="Only you" ;;
   esac
   note "$1: who can open it: $who"
+  # A write that made it private says how many it took off (the people and
+  # teams it was shared with, who no longer open it).
+  case "$(json_get raw revoked 2>/dev/null)" in
+    ''|0|*[!0-9]*) ;;
+    1) note "$1: took 1 invited person or team off" ;;
+    *) note "$1: took $(json_get raw revoked 2>/dev/null) invited people and teams off" ;;
+  esac
   case "$(json_get str visibility 2>/dev/null)" in
     link|public)
-      names="$(json_get raw share 2>/dev/null | tr -d '[]" ' | sed 's/,/, /g')"
+      names="$(share_names)"
       [ -z "$names" ] || note "$1: people added ($names) are kept for when it is Only people added: foldrender share $1 --shared" ;;
   esac
   case "$2" in
@@ -2304,6 +2679,75 @@ say_access() {
     true) note "$1: readers can copy this page" ;;
     false) note "$1: copies of this page are off" ;;
   esac
+}
+
+# team: the account's own groups of GitHub logins, granted a page at once.
+#   team create NAME [MEMBER...]    make one (up to 50; 200 members a team)
+#   team list                       the account's teams: name, members, id
+#   team show NAME|ID               its members
+#   team add NAME MEMBER...         add members
+#   team remove NAME MEMBER...      remove members
+#   team delete NAME|ID             delete it; the grants that named it go too
+cmd_team() {
+  local sub="${1:-}"; [ -n "$sub" ] || die 2 "usage: foldrender team create NAME [MEMBER...] | team list | team show NAME | team add NAME MEMBER... | team remove NAME MEMBER... | team delete NAME"
+  shift
+  local json="" path="" method="GET" bodyfile
+  case "$sub" in
+    list|ls)
+      method=GET; path="/api/teams" ;;
+    create|new)
+      [ $# -ge 1 ] || die 2 "usage: foldrender team create NAME [MEMBER...]"
+      local name="$1"; shift
+      # A team's name: 1 to 64 characters, no commas or spaces (as the API
+      # keeps it; it is what share's team:NAME then names).
+      check_team_name "$name"
+      local members="" mlist=""
+      if [ $# -gt 0 ]; then
+        mlist="$1"; shift
+        for m in "$@"; do mlist="$mlist,$m"; done
+        check_logins "$mlist"
+        members=",\"members\":$(json_array "$mlist")"
+      fi
+      method=POST; path="/api/teams"
+      json="{\"name\":\"$name\"$members}" ;;
+    show)
+      [ $# -ge 1 ] || die 2 "usage: foldrender team show NAME|ID"
+      check_team_name "$1"
+      method=GET; path="/api/teams/$1" ;;
+    add|remove)
+      [ $# -ge 2 ] || die 2 "usage: foldrender team $sub NAME MEMBER..."
+      local what="$1"; shift
+      check_team_name "$what"
+      local mlist="$1"; shift
+      for m in "$@"; do mlist="$mlist,$m"; done
+      check_logins "$mlist"
+      case "$sub" in
+        add) json="{\"add\":$(json_array "$mlist")}" ;;
+        remove) json="{\"remove\":$(json_array "$mlist")}" ;;
+      esac
+      method=POST; path="/api/teams/$what/members" ;;
+    rm|delete)
+      [ $# -ge 1 ] || die 2 "usage: foldrender team delete NAME|ID"
+      check_team_name "$1"
+      method=DELETE; path="/api/teams/$1" ;;
+    *) die 2 "usage: foldrender team create NAME [MEMBER...] | team list | team show NAME | team add NAME MEMBER... | team remove NAME MEMBER... | team delete NAME" ;;
+  esac
+  api_auth "$method" "$path" ${json:+-H "Content-Type: application/json"} ${json:+--data "$json"}
+  [ "$STATUS" != 404 ] || die 7 "no team like that among yours"
+  # The day's rows of team and sharing changes are used up: the server's words
+  # say how much is left and when it resets (taking members out never is).
+  [ "$STATUS" != 429 ] || die 4 "$(error_text)"
+  expect_2xx
+  if [ "$sub" = list ]; then
+    # {"teams":[{id,name,members,created_at}]}: a line a team: name (n) id.
+    json_get items teams 2>/dev/null | while IFS= read -r t_obj; do
+      [ -n "$t_obj" ] || continue
+      printf '%s\n' "$t_obj" > "$TMP/team"
+      printf '%s\t%s\t%s\n' "$(json_get str name 2>/dev/null "$TMP/team")" "$(json_get raw members 2>/dev/null "$TMP/team")" "$(json_get str id 2>/dev/null "$TMP/team")"
+    done
+  else
+    cat "$TMP/body"; printf '\n'
+  fi
 }
 
 # list_json_filter WORDS ACCESS FOLDER LIMIT: the answer of GET /api/artifacts
@@ -2797,6 +3241,10 @@ cmd_read() {
   [ "$mode" != json ] || ACCEPT="application/json"
   read_get "/api/artifacts/$slug$query"
   ACCEPT="text/plain"
+  # A sheet whose values are more than the server sends answers 413 with the
+  # sheet itself (computed: no, formula cells [compute in the browser]): read
+  # as one past the server's 10 s, which answers 200 the same way.
+  if [ "$STATUS" = 413 ] && [ "$(header_value x-sheet-computed)" = no ]; then STATUS=200; fi
   [ "$STATUS" = 200 ] || read_fail "$slug"
   cp "$TMP/body" "$TMP/page"
   [ -z "$assets" ] || save_assets "$slug" "$assets" "$mode"
@@ -3154,6 +3602,182 @@ cmd_canvas() {
   # Its map on stderr, with each card's id, so that a canvas edit needs no read
   # first; stdout stays the address alone.
   print_map >&2
+}
+
+# new KIND: an artifact of a kind with a room (sheet, so far).
+cmd_new() {
+  case "${1:-}" in
+    sheet) shift; cmd_sheet_new "$@" ;;
+    *) die 2 "usage: foldrender new sheet [--title T] [--from FILE.xlsx|FILE.csv] (foldrender help sheet)" ;;
+  esac
+}
+
+# new sheet [--title T] [--from FILE.xlsx|FILE.csv [--tab NAME]]: a sheet,
+# empty or made of the file (a new sheet each time: a file is never poured
+# into one that is open). Prints its address; stderr says its id, its seq (the
+# base of the first `edit --ops`), and for a file its tabs and cells and what
+# of the file was left out. An import is at most 10 MB and 25,000 cells, and
+# counts against the account's 200 files a day (with exports).
+cmd_sheet_new() {
+  local as_json="" title="" vis="" from="" tab="" type q="" id seq
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --title) need $# "$1"; title="$2"; shift 2 ;;
+      --from) need $# "$1"; from="$2"; shift 2 ;;
+      --tab) need $# "$1"; tab="$2"; shift 2 ;;
+      --private) vis="private"; shift ;;
+      --link-access) vis="link"; shift ;;
+      --public) vis="public"; shift ;;
+      --json) as_json=1; shift ;;
+      -*) die 2 "unknown option: $1 (foldrender help sheet)" ;;
+      *) die 2 "foldrender new sheet takes no FILE: give it as --from FILE.xlsx or --from FILE.csv" ;;
+    esac
+  done
+  [ -z "$tab" ] || [ -n "$from" ] || die 2 "--tab names the csv's tab: it goes with --from FILE.csv"
+  require_token
+  ACCEPT="application/json"
+  if [ -n "$from" ]; then
+    [ -f "$from" ] || die 2 "no such file: $from"
+    case "$from" in
+      *.csv|*.CSV) type="text/csv" ;;
+      *.xlsx|*.XLSX) type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"; [ -z "$tab" ] || die 2 "--tab is for a csv: an xlsx names its own tabs" ;;
+      *) die 2 "--from takes an .xlsx or a .csv file" ;;
+    esac
+    [ "$(wc -c < "$from")" -le 10485760 ] || die 2 "$from is over 10 MB, which is a sheet import's most: split it, or import the tabs you need as csv"
+    [ -n "$title" ] || { title="$(basename "$from")"; title="${title%.*}"; }
+    q="title=$(urlencode "$title")"
+    [ -z "$vis" ] || q="$q&visibility=$vis"
+    [ -z "$tab" ] || q="$q&tab=$(urlencode "$tab")"
+    api_auth POST "/api/sheet?$q" -H "Content-Type: $type" --data-binary "@$from"
+  else
+    {
+      printf '{'
+      jkey kind; printf '"sheet"'
+      [ -z "$title" ] || { jkey title; json_arg "$title"; }
+      [ -z "$vis" ] || { jkey visibility; printf '"%s"' "$vis"; }
+      printf '}'
+    } > "$TMP/sheet.json"
+    api_auth POST /api/artifacts -H "Content-Type: application/json" --data-binary "@$TMP/sheet.json"
+  fi
+  ACCEPT="text/plain"
+  case "$STATUS" in
+    2??) ;;
+    400|413) die 2 "$(error_text)" ;;
+    403|429) die 4 "$(json_get str message || error_text)" ;;
+    404|409|503) die 1 "$(json_get str message || error_text)" ;;
+    *) fail_http ;;
+  esac
+  if [ -n "$as_json" ]; then
+    cat "$TMP/body"
+    printf '\n'
+    return 0
+  fi
+  printf '%s\n' "$(json_get str url)"
+  id="$(json_get str id)"
+  seq="$(json_get raw seq)"
+  if [ -n "$from" ]; then
+    note "sheet $id: $(json_get raw tabs) tabs, $(json_get raw cells) cells, seq $seq"
+    json_get pairs notes 2>/dev/null | cut -f2- | while IFS= read -r line; do [ -z "$line" ] || note "left out: $line"; done
+  else
+    note "sheet $id, seq $seq"
+  fi
+}
+
+# edit ID --ops FILE|- --base SEQ: one batch of changes to an artifact with a
+# room (a sheet), made against the seq the read printed; all of it goes in or
+# none of it, as one change by this agent session. A base the artifact moved
+# past is refused (exit 10, with the seq to read). --undo SEQ takes that change
+# back. Prints the new seq.
+cmd_edit_ops() {
+  local target="" ops="" base="" undo="" as_json="" c seq
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ops) need $# "$1"; ops="$2"; shift 2 ;;
+      --base) need $# "$1"; case "$2" in ''|*[!0-9]*) die 2 "--base takes the seq foldrender read prints (seq: N)" ;; esac; base="$2"; shift 2 ;;
+      --undo) need $# "$1"; case "$2" in ''|*[!0-9]*) die 2 "--undo takes a change's seq" ;; esac; undo="$2"; shift 2 ;;
+      --json) as_json=1; shift ;;
+      --no-session) NO_SESSION=1; shift ;;
+      -*) die 2 "unknown option: $1 (foldrender help sheet)" ;;
+      *) [ -z "$target" ] || die 2 "edit takes one artifact"; target="$1"; shift ;;
+    esac
+  done
+  [ -n "$target" ] || die 2 "usage: foldrender edit ID --ops FILE --base SEQ | --undo SEQ"
+  [ -z "$ops" ] || [ -z "$undo" ] || die 2 "--ops and --undo do not go together"
+  if [ -n "$ops" ]; then
+    [ -n "$base" ] || die 2 "--ops needs --base SEQ: the seq foldrender read printed, so that a change made since is never overwritten unseen"
+    if [ "$ops" = - ]; then cat > "$TMP/ops"; else [ -f "$ops" ] || die 2 "no such file: $ops"; cp "$ops" "$TMP/ops"; fi
+    c="$(tr -d ' \t\r\n' < "$TMP/ops" | head -c 1)"
+    [ "$c" = '[' ] || die 2 "--ops takes a JSON array of changes: [{\"k\":\"a\",\"coll\":\"cell\",\"n\":{...}}, ...] (foldrender help sheet)"
+    { printf '{"base":%s,"ops":' "$base"; cat "$TMP/ops"; printf '}'; } > "$TMP/edit.json"
+  else
+    [ -n "$undo" ] || die 2 "nothing to change: give --ops FILE --base SEQ, or --undo SEQ"
+    printf '{"undo":%s}' "$undo" > "$TMP/edit.json"
+  fi
+  require_token
+  page_id "$target"
+  check_slug "$PAGE_ID"
+  made_by_header "$target"
+  local oh=()
+  [ -z "$FR_MADE_BY" ] || oh=(-H "FoldRender-Made-By: $FR_MADE_BY")
+  ACCEPT="application/json"
+  api_auth POST "/api/artifacts/$PAGE_ID/ops" -H "Content-Type: application/json" ${oh[@]+"${oh[@]}"} --data-binary "@$TMP/edit.json"
+  ACCEPT="text/plain"
+  case "$STATUS" in
+    404) die 7 "no sheet named $PAGE_ID that you may edit" ;;
+    409) die 10 "$(error_text) (seq $(json_get raw seq))" ;;
+    400|413) die 10 "the change did not apply: $(error_text); nothing was changed" ;;
+    429) die 4 "$(error_text)" ;;
+    503) die 1 "$(error_text)" ;;
+  esac
+  expect_2xx
+  if [ -n "$as_json" ]; then
+    cat "$TMP/body"
+    printf '\n'
+    return 0
+  fi
+  seq="$(json_get raw seq)"
+  printf 'seq %s\n' "$seq"
+  note "applied; the next --ops carries --base $seq"
+}
+
+# export ID FILE.xlsx|FILE.csv [--tab NAME]: a sheet saved as a file (the
+# whole sheet as xlsx, with its dropdowns; one tab as csv, what its cells
+# show). Never overwrites. Counts against the account's 200 files a day.
+cmd_sheet_export() {
+  local target="$1" file="$2" tab="" q t
+  shift 2
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tab) need $# "$1"; tab="$2"; shift 2 ;;
+      *) die 2 "usage: foldrender export SHEET FILE.xlsx | FILE.csv [--tab NAME]" ;;
+    esac
+  done
+  [ ! -e "$file" ] || die 1 "$file already exists; choose another name"
+  case "$file" in
+    *.xlsx|*.XLSX) [ -z "$tab" ] || die 2 "--tab is for a csv: an xlsx holds every tab"; q="format=xlsx" ;;
+    *.csv|*.CSV) q="format=csv"; [ -z "$tab" ] || q="$q&tab=$(urlencode "$tab")" ;;
+    *) die 2 "a sheet is saved as FILE.xlsx or FILE.csv" ;;
+  esac
+  require_token
+  page_id "$target"
+  check_slug "$PAGE_ID"
+  ACCEPT="application/json"
+  api_auth GET "/api/artifacts/$PAGE_ID/sheet?$q"
+  ACCEPT="text/plain"
+  case "$STATUS" in
+    200) ;;
+    400)
+      t="$(json_get pairs tabs 2>/dev/null | cut -f2- | paste -sd, -)"
+      [ -z "$t" ] || die 2 "a csv is one tab: give --tab NAME (its tabs: $t)"
+      die 2 "$(error_text)" ;;
+    404) die 7 "no sheet named $PAGE_ID that you may read (or no such tab)" ;;
+    413) die 2 "$(error_text)" ;;
+    429) die 4 "$(error_text)" ;;
+    503) die 1 "$(error_text)" ;;
+    *) fail_http ;;
+  esac
+  cp "$TMP/body" "$file" || die 1 "cannot write $file"
+  printf '%s\n' "$file"
 }
 
 # canvas edit CANVAS [options]: changes a canvas in one request, all of it or
@@ -5976,29 +6600,213 @@ sha256_of() {
   else shasum -a 256 "$1" | awk '{print $1}'; fi
 }
 
+# foldrender data: the account's database connections for data boards, a
+# board query's dry run, and a board's cached answer (help data). A
+# connection string holds its password, so it is read from stdin only, never
+# from an argument (which any user of the machine can read with ps), and it
+# goes to the API from a file in this run's private directory.
+cmd_data() {
+  local sub="${1:-}"
+  [ $# -eq 0 ] || shift
+  case "$sub" in
+    connect) data_connect "$@" ;;
+    ls|list) data_ls "$@" ;;
+    rm|remove) data_rm "$@" ;;
+    query) data_query "$@" ;;
+    result) data_result "$@" ;;
+    ''|help|-h|--help) cmd_help data ;;
+    *) die 2 "unknown data command: $sub (foldrender help data)" ;;
+  esac
+}
+
+# The data routes' refusals the command can say plainly.
+data_fail() {
+  local msg
+  msg="$(error_text)"
+  case "$STATUS" in
+    404)
+      case "$msg" in *"are off"*) die 1 "data connectors are off on this deployment" ;; esac
+      die 7 "${1:-not found} ($msg)" ;;
+    429) die 4 "$msg" ;;
+    503) die 1 "$msg" ;;
+    400|502) die 1 "$msg" ;;
+  esac
+  expect_2xx
+}
+
+data_connect() {
+  local name="" as_json=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) need $# "$1"; name="$2"; shift 2 ;;
+      --json) as_json=1; shift ;;
+      -*) die 2 "unknown option: $1" ;;
+      *) die 2 "the connection string is read from stdin, never from the command line (it holds the password): printf '%s' \"\$DATABASE_URL\" | foldrender data connect" ;;
+    esac
+  done
+  [ ! -t 0 ] || die 2 "give the connection on stdin: printf '%s' \"\$DATABASE_URL\" | foldrender data connect [--name NAME]"
+  ( umask 077 && head -c 8193 > "$TMP/conn" ) || die 1 "cannot write $TMP/conn"
+  [ "$(wc -c < "$TMP/conn" | tr -d ' ')" -le 8192 ] || die 2 "a connection is at most 8 KB"
+  # A URL on one line (its trailing newline dropped), or JSON fields as they are.
+  case "$(head -c 1 "$TMP/conn")" in
+    '{') cp "$TMP/conn" "$TMP/req" ;;
+    '') die 2 "nothing on stdin: printf '%s' \"\$DATABASE_URL\" | foldrender data connect" ;;
+    *)
+      tr -d '\r\n' < "$TMP/conn" > "$TMP/conn1"
+      { printf '{"url":'; json_str "$TMP/conn1"; [ -z "$name" ] || { printf ',"name":'; json_arg "$name"; }; printf '}'; } > "$TMP/req"
+      ;;
+  esac
+  rm -f "$TMP/conn" "$TMP/conn1"
+  ACCEPT="application/json"
+  api_auth POST /api/data/connect -H "Content-Type: application/json" --data-binary "@$TMP/req"
+  rm -f "$TMP/req"
+  data_fail
+  if [ -n "$as_json" ]; then cat "$TMP/body"; printf '\n'; return 0; fi
+  local id kind user host db hint
+  id="$(json_field id)"; kind="$(json_field kind)"; user="$(json_field user)"; host="$(json_field host)"; db="$(json_field database)"; hint="$(json_field hint)"
+  printf '%s\n' "$id"
+  note "connected $kind $user@$host${db:+/$db} as $id (its password is kept sealed and never shown again)"
+  [ -z "$hint" ] || note "$hint"
+  note "use it in a board's query (\"conn\": \"$id\"); see them all: foldrender data ls"
+}
+
+data_ls() {
+  local as_json=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) as_json=1; shift ;;
+      *) die 2 "usage: foldrender data ls [--json]" ;;
+    esac
+  done
+  if [ -n "$as_json" ]; then
+    ACCEPT="application/json"
+    api_auth GET /api/data/connect
+    data_fail
+    cat "$TMP/body"; printf '\n'
+    return 0
+  fi
+  api_auth GET /api/data/connect
+  data_fail
+  if [ ! -s "$TMP/body" ]; then
+    printf 'No connections yet. Connect one: printf %%s "$DATABASE_URL" | foldrender data connect\n'
+    return 0
+  fi
+  awk -F'\t' '
+    { n++; for (i = 1; i <= 5; i++) { c[n, i] = $i; if (length($i) > w[i]) w[i] = length($i) } }
+    END {
+      split("ID ENGINE WHERE NAME WRITES", h, " ")
+      for (i = 1; i <= 5; i++) if (length(h[i]) > w[i]) w[i] = length(h[i])
+      printf "%-" w[1] "s  %-" w[2] "s  %-" w[3] "s  %-" w[4] "s  %s\n", h[1], h[2], h[3], h[4], h[5]
+      for (r = 1; r <= n; r++) printf "%-" w[1] "s  %-" w[2] "s  %-" w[3] "s  %-" w[4] "s  %s\n", c[r, 1], c[r, 2], c[r, 3], c[r, 4], c[r, 5]
+    }' "$TMP/body"
+}
+
+data_rm() {
+  local id failed=0
+  [ $# -ge 1 ] || die 2 "usage: foldrender data rm ID... (foldrender data ls lists them)"
+  for id in "$@"; do
+    case "$id" in ''|-*|*[!a-z0-9_-]*) die 2 "not a connection id: $id (foldrender data ls)" ;; esac
+  done
+  for id in "$@"; do
+    api_auth DELETE "/api/data/connect/$id"
+    if [ "$STATUS" = 404 ]; then
+      note "not removed: no connection $id among yours"
+      failed=1
+      continue
+    fi
+    data_fail
+    note "removed $id, its sealed password and $(sed -n 's/.*"cached_removed" *: *\([0-9]*\).*/\1/p' "$TMP/body") cached answers; a board that still names it says so at its next run"
+  done
+  return "$failed"
+}
+
+# The board and query a command names, checked: BOARD_ID and QUERY_ID.
+data_target() {
+  [ $# -ge 2 ] || die 2 "$1"
+  page_id "$2"
+  check_slug "$PAGE_ID"
+  BOARD_ID="$PAGE_ID"
+  case "$3" in ''|-*|*[!A-Za-z0-9_-]*) die 2 "not a query id: $3 (a record id in the board's query collection)" ;; esac
+  QUERY_ID="$3"
+}
+
+data_query() {
+  local dry="" as_json="" args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry=1; shift ;;
+      --json) as_json=1; shift ;;
+      -*) die 2 "unknown option: $1" ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  [ ${#args[@]} -eq 2 ] || die 2 "usage: foldrender data query BOARD QUERY --dry-run [--json]"
+  [ -n "$dry" ] || die 2 "foldrender data query runs a query once, as --dry-run (its board's owner only, counted, nothing kept); the board's own refresh runs it otherwise, and its answer is read with: foldrender data result BOARD QUERY"
+  data_target "usage" "${args[0]}" "${args[1]}"
+  [ -z "$as_json" ] || ACCEPT="application/json"
+  api_auth POST "/api/data/$BOARD_ID/run/$QUERY_ID"
+  data_fail "no query $QUERY_ID on a data board $BOARD_ID of yours"
+  cat "$TMP/body"
+  [ -z "$as_json" ] || printf '\n'
+  [ -n "$as_json" ] || data_truncated
+}
+
+data_result() {
+  local as_json="" args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) as_json=1; shift ;;
+      -*) die 2 "unknown option: $1" ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  [ ${#args[@]} -eq 2 ] || die 2 "usage: foldrender data result BOARD QUERY [--json]"
+  data_target "usage" "${args[0]}" "${args[1]}"
+  [ -z "$as_json" ] || ACCEPT="application/json"
+  api_auth GET "/api/data/$BOARD_ID/result/$QUERY_ID${PAGE_K:+?k=$PAGE_K}"
+  data_fail "no answer of query $QUERY_ID on data board $BOARD_ID that this account may read (a reader sees certified queries only)"
+  if [ -n "$as_json" ]; then cat "$TMP/body"; printf '\n'; return 0; fi
+  if [ "$(header_value x-fr-pending)" = 1 ]; then
+    note "pending: the board has not run this query since it was made or changed; its room runs it within seconds of a change, then at its refresh"
+    return 0
+  fi
+  cat "$TMP/body"
+  data_truncated
+  local at
+  at="$(header_value x-fr-ran-at)"
+  [ -z "$at" ] || note "ran at $at"
+}
+
+data_truncated() {
+  case "$(header_value x-fr-truncated)" in
+    rows) note "truncated: only the first 10,000 rows are kept" ;;
+    bytes) note "truncated: only the first 5 MB of rows are kept" ;;
+  esac
+}
+
 cmd_help() {
   case "${1:-}" in
     '') cat <<'EOF'
 foldrender publishes HTML pages as links and reads pages back as text.
-
   publish FILE...      publish (or update) pages; prints each address
   edit PAGE            change part of a page: --old TEXT --new TEXT
-  read PAGE            the page as Markdown, with its annotations (notes, marks,
+  new sheet            a sheet (--from FILE.xlsx|.csv); edit, export SHEET FILE (help sheet)
+  read PAGE            the page as Markdown with its annotations (notes, marks,
                        ink) when signed in; stops at ~6k tokens (--section N)
   ls [WORDS]           your newest pages, id and address (--all, --duplicates)
-  share PAGE...        +login -login --public --link --private --reset-link
+  share PAGE...        +login -login --public --link --private, then who can what:
+                       --view/--comment/--edit LOGIN|team:NAME --pin REV; team (help team)
+  mv PAGE NEWNAME      move a page (its old address redirects); merge A --into B
   log PAGE             the page's history (`versions`); restore REV; undo; diff; rm --rev
-  canvas FILE|PAGE...  a canvas with these as cards (up to 24), --note, --link
-  canvas edit CANVAS   add or remove cards, notes and connectors in one step
+  canvas FILE|PAGE...  a canvas of these as cards (up to 24); canvas edit CANVAS changes it
   answers PAGE         answers to the page's questions (data-fr-choice); --wait
-  desk / thread / pack  your desk, your messages, context packs (help pack)
+  desk / thread / pack / data  desk, messages, context packs, data boards' databases
   bridge --page PAGE   connect an agent (or --session NAME) to the page's sidebar
   rm PAGE... / open PAGE   delete pages / print a page's address and open it
   upgrade [--year] / billing  Pro checkout / the billing portal (card, cancel)
-  login / logout / whoami / auth / export [FILE] / account delete / version
-PAGE is a page's address, its id, or an old a.foldrender.dev link.
---json prints the API's answer. More: foldrender help COMMAND (or COMMAND
---help), foldrender help choices (questions on a page), foldrender help exit.
+  login / logout / whoami / auth / team / export [FILE] / account delete / version
+PAGE is a page's address, its id, or an old a.foldrender.dev link; --json prints
+the API's answer. More: foldrender help COMMAND (or --help), help choices, help exit.
 EOF
     ;;
     publish) cat <<'EOF'
@@ -6015,7 +6823,10 @@ foldrender publish FILE...|- [options]
   Publishing the same file again updates the same page. A retry never makes a
   second page: each publish carries an Idempotency-Key, sent again on a retry
   (a dropped connection is retried twice by itself).
-  --private            only you (the default for a new page)
+  --private            only you (the default for a new page); on a page that
+                       was shared, it takes off everyone it was shared with
+                       (the people and teams granted it, and the list of a
+                       shared page) and says how many on stderr
   --link               anyone with the link; the link carries a key (?k=)
   --public             anyone with its address (no key); listed nowhere
   --share a,b          only these GitHub logins
@@ -6057,6 +6868,8 @@ foldrender edit PAGE --edits FILE|-    (JSON: [{"old": "...", "new": "..."}, ...
   Prints the address; stderr says the new revision and the lines changed.
   Like publish, it says which agent session made the revision (foldrender
   help publish); --no-session leaves it out.
+foldrender edit SHEET --ops FILE|- --base SEQ | --undo SEQ
+  A sheet's changes, against the seq foldrender read printed (help sheet).
 EOF
     ;;
     read) cat <<'EOF'
@@ -6788,9 +7601,13 @@ EOF
     share) cat <<'EOF'
 foldrender share PAGE... [+LOGIN ...] [-LOGIN ...] [--private|--shared|--link|--public]
        [--reset-link] [--collab|--no-collab] [--copy|--no-copy]
+       [--view LOGINS] [--comment LOGINS] [--edit LOGINS] [--team NAMES]
+       [--pin REV|latest]
   Changes who can open the pages, without publishing them again; prints each
   address, and on stderr who can open it, as the site's Share panel says it.
-  --private            Only you
+  --private            Only you: takes off everyone it was shared with (the
+                       people and teams granted it, and the list of a shared
+                       page) and says how many
   +LOGIN / -LOGIN      add or remove GitHub logins, as the Share panel does: a
                        private page becomes Only people added; a --link or
                        --public page stays so, the people kept on its list; the
@@ -6802,9 +7619,141 @@ foldrender share PAGE... [+LOGIN ...] [-LOGIN ...] [--private|--shared|--link|--
   --collab             readers who sign in can write on it (ink, notes, and
                        answering its choices); --no-collab turns it off
   --copy / --no-copy   whether readers may copy it to their own space
+  --view LOGINS        each may open it (a page granted them directly)
+  --comment LOGINS     each may open it and write on it (notes, comments and
+                       answers) — still not the page itself, nor its sharing
+  --edit LOGINS        each may open it, write on it, and change it where the
+                       page says collaborators may (a canvas's room)
+  --team NAMES         each team (team:NAME beside a level works too) stands
+                       for its members, at the level of the line's flag
+  -LOGIN / -team:NAME  take what they were given back (a page's people and
+                       levels; a team's grant goes, the team stays)
+  --pin REV|latest     the page's link shows that version and never a newer
+                       one, whoever holds it, until --pin latest
   --json               the API's answer
+  --view/--comment/--edit write rows the account has a day of, with merges and
+  teams (any plan): past it they exit 4 with what is left and when it starts
+  again (00:00 UTC), and no one is added. Taking someone back always works,
+  in the same command too: share PAGE --view alice -bob past the day takes bob
+  away, adds no one, exits 4, and stderr says both.
 Examples: foldrender share plan +alice --collab
           foldrender share plan --link
+          foldrender share plan --comment alice,bob
+          foldrender share plan --edit team:eng --pin 3
+          foldrender share plan
+EOF
+    ;;
+    team) cat <<'EOF'
+foldrender team create NAME [MEMBER...] | team list | team show NAME|ID
+       | team add NAME MEMBER... | team remove NAME MEMBER... | team delete NAME|ID
+  Your teams: groups of GitHub logins you grant a page to at once (made by
+  you, on FoldRender; no GitHub organization is read, and no access is asked
+  of GitHub). A team holds up to 200 members; an account makes up to 50.
+  create               makes the team, its members the logins named
+  list                 your teams: name, how many are in, its id
+  show NAME            its members
+  add / remove NAME    add or remove members
+  delete NAME          deletes it; the grants that named it go with it
+  --json               the API's answer
+  Merges, team and sharing changes write rows the account has a day of (about
+  16,000 members or grants added; any plan): past it, create and add exit 4
+  with what is left and when it starts again (00:00 UTC). Taking members out
+  and deleting a team always work.
+Examples: foldrender team create eng alice,bob
+          foldrender share plan --edit team:eng
+          foldrender team remove eng carol
+EOF
+    ;;
+    mv|move) cat <<'EOF'
+foldrender mv PAGE NEWNAME [--folder F] [--json]
+       foldrender mv --release-old ADDRESS
+  Moves a page to another address of yours: its name, its folder, or both
+  (NEWNAME and --folder together; --folder "" for no folder). Prints its new
+  address; stderr says what happened.
+  Where it was stays open: the old address redirects to the new one (301) for
+  whoever the page opens for, carrying ?k= and ?v= as they came. An old address
+  grants nothing of its own -- a private page still asks its reader to sign in,
+  and someone the page is not shared with sees the 404 of an address with
+  nothing at it, never the new name.
+  No other page takes an old address's name (409 path_taken says whose it is),
+  until you let it go:
+  --release-old ADDRESS   stops that address opening anything and frees its
+                          name for a new page (foldrender publish --name)
+  Each account keeps 1,000 old addresses; past that the oldest go, and the
+  answer says which.
+Examples: foldrender mv plan q4-plan --folder q4
+          foldrender mv --release-old https://foldrender.dev/artifacts/you/plan
+EOF
+    ;;
+    merge) cat <<'EOF'
+foldrender merge PAGE --into PAGE [-m MSG] [--json]
+  One page goes into another of yours. The page that went in is gone: its
+  address, its older addresses and its link by id open the page it went into
+  (for whoever that page opens -- an old address grants nothing of its own, and
+  a key of the merged page does not open the other page when it needs one; if
+  you want a link to hand out, foldrender share INTO --link). stderr names the
+  people and teams it was shared with that INTO does not let in, with the
+  foldrender share INTO --view/--comment/--edit that gives them back. The merged
+  page's last body is kept in the other page's history (foldrender log INTO, its
+  versions); its own history, annotations and grants go with it. The other page
+  itself is unchanged (a revision is written that says so).
+  Prints the other page's address; stderr says the revision and the version.
+  -m MSG          the merge's message in that history (default: "merge
+                  <address> (<id>): its last body is version <id>")
+  A merge rewrites a row for each old address and grant of the page that goes
+  in, from the account's day of rows for merges, team and sharing changes
+  (about 24 merges of a page with 1,000 old addresses, any plan): past it, exit
+  4 with what is left and when it starts again (00:00 UTC); nothing is merged.
+Examples: foldrender merge notes-a --into notes-b
+EOF
+    ;;
+    sheet|new) cat <<'EOF'
+foldrender new sheet [--title T] [--private|--link-access|--public] [--json]
+foldrender new sheet --from FILE.xlsx | --from FILE.csv [--tab NAME] [--title T]
+  A sheet: tabs of cells, computed like a spreadsheet (formulas, references
+  across tabs, dropdowns). Prints its address; stderr says its id and seq.
+  --from makes a new sheet of the file (never pours a file into one that is
+  open); at most 10 MB and 25,000 cells (exit 2 with the reason past either;
+  a larger sheet is imported in a browser).
+  Pictures, charts, pivot tables and links to other files are left out (said
+  on stderr). A csv is one tab, --tab its name; a field with = is a formula.
+foldrender read SHEET [--json]
+  Each tab as a table of what its cells show, never a formula, and the seq
+  the next change names. --json has what was typed in each cell (formulas),
+  every value as [shown, type] (n number, s text, b true/false, e error) and
+  the seq. Values are computed when you read, from the sheet as it is now. A
+  sheet too heavy to compute on the server (over 10 s, or values more than
+  2 MB past what was typed, or more memory than the server holds, each of
+  which the API answers 413) says "computed: no" and its formula cells read
+  [compute in the browser]: open it in a browser.
+foldrender edit SHEET --ops FILE|- --base SEQ    (or --undo SEQ)
+  One batch of changes, all of it or none (exit 10 with the reason), made
+  against the seq you read: if the sheet changed since, it is refused (exit
+  10, with the seq to read again) and nothing is overwritten. Prints the new
+  seq. FILE is a JSON array, at most 500 changes:
+    {"k":"a","coll":"tab","n":{"id":"t2","name":"Summary","order":1}}
+    {"k":"a","coll":"cell","n":{"id":"t2_B3","input":"=SUM(Data!A:A)"}}
+    {"k":"s","coll":"cell","id":"t1_A1","p":{"input":"42"}}     set
+    {"k":"d","coll":"cell","id":"t1_A2"}                         remove
+  A cell's id is its tab's id, _, then its address (t1_B12); input is what
+  is typed ("=..." a formula, "'00123" text that looks like a number), at
+  most 32 KB. A tab: id (letters and digits), name (Excel's rules: up to 31
+  characters, none of : \ / ? * [ ]), order, frozen_rows, frozen_cols,
+  hidden. Also style {id, b, i, u, sz, color, fill, num_fmt, h, v, wrap}
+  (cell "s": its id), merge {id, tab, range "A1:C1"}, rule (a dropdown:
+  {id, tab, range "C2:C100", type "list", f1 "\"Open,Done\""}; types whole,
+  decimal, date, time, textLength, custom with op, f1, f2), view {id, tab,
+  sort, filter}. A collaborator edits cells and views; tabs, styles, merges
+  and rules are the owner's. A sheet holds at most 100,000 cells.
+foldrender export SHEET FILE.xlsx | FILE.csv [--tab NAME]
+  The whole sheet as xlsx (formulas, values, styles, merges, dropdowns), or
+  one tab as csv (what its cells show), for a sheet of at most 25,000 cells
+  whose file is at most 8 MB (the sheet and what it shows together) and whose
+  values are at most 2 MB past what was typed (exit 2 past any of them, with
+  the reason: export it in a browser). Imports and exports
+  together: 200 a day an account (exit 4 past it).
+  Not computed yet (the engine says #N/IMPL!): TEXTJOIN, CONCAT and the like
+  over an array made by IF or FILTER (FILTER on its own works).
 EOF
     ;;
     canvas) cat <<'EOF'
@@ -6882,6 +7831,8 @@ foldrender export [FILE.zip]
   before it, so a set on disk is always whole. Each zip is fetched from a
   2-minute download link on the account's own host, with no token; an account
   downloads at most 100 parts a day.
+foldrender export SHEET FILE.xlsx | FILE.csv [--tab NAME]
+  One sheet as a file (help sheet).
 EOF
     ;;
     login|logout|whoami) cat <<'EOF'
@@ -6936,6 +7887,63 @@ foldrender publish FILE -m MSG, foldrender edit PAGE ... -m MSG
                                the publish or edit's message in the log
 EOF
     ;;
+    data) cat <<'EOF'
+foldrender data connect [--name NAME] [--json]   < connection on stdin
+foldrender data ls [--json]
+foldrender data rm ID...
+foldrender data query BOARD QUERY --dry-run [--json]
+foldrender data result BOARD QUERY [--json]
+  A data board shows the answers of queries its owner runs against their own
+  PostgreSQL (Supabase, Neon too) or MySQL, read only. The board's queries are
+  records in its room (collection "query": id, title, conn, sql, params,
+  certified, refresh_min), written as any room's are; only the owner sets
+  their SQL, connection, refresh and certified.
+
+  connect   saves a connection. The connection is read from stdin only, never
+            from an argument (it holds the password): a URL,
+              printf '%s' "$DATABASE_URL" | foldrender data connect --name prod
+            (postgres://USER:PASSWORD@HOST[:PORT]/DB, mysql://...; ?sslmode=
+            disable turns TLS off), or JSON fields {engine, host, port, user,
+            password, database, name, tls}. tls is true or false (on/off, 1/0,
+            or an sslmode name such as require or disable); anything else is
+            refused, and when a URL's sslmode and the field disagree the safer
+            one (TLS) wins. FoldRender connects once, reads
+            whether the account can write (and says to use a read-only one if
+            it can), and keeps the password sealed; it is never shown again.
+            Prints the connection's id. Refused: hosts that are not on the
+            public internet, our own domains, ports 22, 25, 465, 587, Redis,
+            memcached and Docker's (6379, 11211, 2375, 2376) and other
+            non-database ports.
+  ls        the account's connections: id, engine, user@host:port/db, name,
+            whether its account can write.
+  rm        removes connections, their passwords and every answer cached from them.
+  query     --dry-run: runs one of a board's queries once (the board's owner
+            only; counted against the day), prints the rows, keeps nothing.
+  result    a board's cached answer to one query (the board's readers see
+            certified queries only; the owner any). Never runs the query; a
+            query not run yet since it changed prints nothing and says pending.
+  Output is tab-separated, the column names first; a cut answer says so on
+  stderr (at most 10,000 rows or 5 MB). A query is one reading statement:
+  it starts with SELECT, WITH, SHOW, EXPLAIN, TABLE or VALUES (DESCRIBE too,
+  on MySQL); anything else, a MySQL /*! */ comment, INTO OUTFILE, dblink,
+  GET_LOCK or a session advisory lock is refused before it is counted or
+  sent. A database with dblink installed is refused outright, however the
+  query spells it: dblink can open a second session and write past the
+  read-only transaction, and the extension grants it to every account, so
+  FoldRender asks the database itself (its catalog) at connect and refuses.
+  TLS: the certificate is always checked against the name. A private
+  certificate authority (Supabase's, Amazon RDS's) cannot pass: such a host
+  needs sslmode=disable — the password and data then cross the network
+  unencrypted — and a database that refuses unencrypted connections (RDS
+  PostgreSQL 15+) cannot be connected to at all. A connection that fails
+  this way says so, with the sslmode=disable way out and its price. Each runs inside a read-only transaction, rolled back, with a 30 s
+  statement time; what finally holds is the account, so connect a read-only
+  one. A board refreshes a query when it
+  is added or changed, and then every refresh_min minutes (15 at least).
+  Exit 4: the day's queries are used up (2,000 an account); 7: no such
+  board, query or connection of yours.
+EOF
+    ;;
     exit) cat <<'EOF'
 Exit codes: 0 ok, 1 failed, 2 bad usage, 3 not signed in or token rejected,
 4 plan limit reached (foldrender upgrade for more; or a canvas save, export
@@ -6985,13 +7993,15 @@ main() {
   local cmd="${1:-help}"
   [ $# -eq 0 ] || shift
   case "$cmd" in
-    login|logout|auth|account|export|whoami|publish|edit|share|list|ls|read|cat|versions|restore|undo|canvas|answers|desk|pack|bridge|rm|delete|open|upgrade|billing|version)
+    login|logout|auth|account|export|whoami|publish|edit|share|mv|move|merge|list|ls|read|cat|versions|restore|undo|canvas|answers|desk|pack|bridge|rm|delete|open|upgrade|billing|data|version|new)
       if help_asked "$cmd" "$@"; then
         case "$cmd" in
           list) cmd_help ls ;;
           cat) cmd_help read ;;
+          move) cmd_help mv ;;
           auth) cmd_help login ;;
           version) cmd_help ;;
+          new) cmd_help sheet ;;
           desk) case "${1:-}" in mem) cmd_help desk-mem ;; workspace) cmd_help desk-workspace ;; *) cmd_help desk ;; esac ;;
           *) cmd_help "$cmd" ;;
         esac
@@ -7018,6 +8028,9 @@ main() {
     publish) cmd_publish "$@" ;;
     edit) cmd_edit "$@" ;;
     share) cmd_share "$@" ;;
+    mv|move) cmd_mv "$@" ;;
+    merge) cmd_merge "$@" ;;
+    team) cmd_team "$@" ;;
     list|ls) cmd_list "$@" ;;
     read|cat) cmd_read "$@" ;;
     log|versions) cmd_log "$@" ;;
@@ -7025,6 +8038,7 @@ main() {
     restore) cmd_restore "$@" ;;
     undo) cmd_undo "$@" ;;
     canvas) cmd_canvas "$@" ;;
+    new) cmd_new "$@" ;;
     answers) cmd_answers "$@" ;;
     desk) cmd_desk "$@" ;;
     thread) cmd_thread "$@" ;;
@@ -7035,6 +8049,7 @@ main() {
     open) cmd_open "$@" ;;
     upgrade) cmd_upgrade "$@" ;;
     billing) cmd_billing "$@" ;;
+    data) cmd_data "$@" ;;
     version|--version) printf 'foldrender %s\n' "$FR_CLI_VERSION" ;;
     help|-h|--help) cmd_help "$@" ;;
     *) die 2 "unknown command: $cmd (try: foldrender help)" ;;
@@ -7059,9 +8074,9 @@ while [ $# -gt 0 ]; do
     --section|--card|--from|--max-tokens|--max-chars|--meta|--access|-n|--add|--rm|--note|--owner|\
     --confirm|--token|--timeout|--after|--notify|--ack|--to|--idempotency-key|--page|--agent|--dir|\
     --desk|--role|--context|--suggest|--option|--deadline|--product|--state|--device|--minutes|--session|\
-    --next|--at|--match|--until|--reply-url|--lang|--done|--mesh-cli|--mcp|--id|\
+    --next|--at|--match|--until|--reply-url|--lang|--done|--mesh-cli|--mcp|--id|--folder|\
     --key|--text-file|--kind|--by|--via|--ref|--parent|--channel|--machine|--agent|--limit|\
-    --goal|--thread|--file|--text|--label)
+    --goal|--thread|--file|--text|--label|--ops|--undo|--tab)
       ARGS+=("$1"); skip=1; shift ;;
     *) [ -n "$first" ] || case "$1" in -*) ;; *) first="$1" ;; esac; ARGS+=("$1"); shift ;;
   esac
