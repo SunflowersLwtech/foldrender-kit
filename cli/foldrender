@@ -1863,6 +1863,11 @@ publish_one() {
   if [ "$STATUS" = 409 ] && grep -q in_progress "$TMP/body"; then
     die 1 "${label}not published yet: another request is still writing this page. Run the same command again in a few seconds; it answers with that page rather than making another."
   fi
+  # A page of yours in the recycle bin holds the name (it keeps it for a
+  # restore): the server's words name it and the two ways to free it.
+  if [ "$STATUS" = 409 ] && grep -q 'held_in_bin_id' "$TMP/body"; then
+    die 12 "${label}not published: $(json_field message)"
+  fi
   if [ "$STATUS" = 409 ] && grep -q 'held_id' "$TMP/body"; then
     held_page
     die 12 "${label}not published: $HELD_URL is already your page $HELD_ID. To update that page: foldrender publish $(hint_file "$file") --slug $HELD_ID. To make a new page, choose another ${name:+--name}${name:---slug}."
@@ -2300,9 +2305,11 @@ cmd_mv() {
 }
 
 # mv_taken: the 409 of a taken address, with the server's words on stderr:
-# whose old address it is and the command that frees it, or that a page holds it.
+# whose old address it is and the command that frees it, which page of yours in
+# the recycle bin holds it and the two ways out, or that a page holds it.
 mv_taken() {
   [ -z "$(json_field release)" ] || die 1 "$(json_field message)"
+  [ -z "$(json_field held_in_bin_id)" ] || die 1 "$(json_field message)"
   die 1 "that address is taken by another of your pages ($(json_field path)); choose another name or --folder"
 }
 
@@ -2968,8 +2975,252 @@ cmd_rm() {
     else
       printf 'deleted page %s\n' "$PAGE_ID"
     fi
+    # The bin was full: the server's words on which of its pages went for good.
+    bin_note="$(json_get str bin_note 2>/dev/null)"
+    [ -z "$bin_note" ] || note "$bin_note"
   done
   [ "$failed" = 0 ] || exit 1
+}
+
+# bin_page_id TARGET: PAGE_ID for a page in the recycle bin. Its address stops
+# resolving the moment it goes in (that is what the bin is), so an address —
+# the one `rm` printed — is looked up in the bin's own list; an id, or a link
+# by id, is used as it is.
+bin_page_id() {
+  local path
+  case "$1" in
+    http://*/artifacts/-/*|https://*/artifacts/-/*|*[?\&]open=*) page_id "$1" ;;
+    http://*/artifacts/*|https://*/artifacts/*)
+      path="/artifacts/${1#*/artifacts/}"
+      path="${path%%[?#]*}"
+      path="${path%/}"
+      api_auth GET "/api/artifacts/-/bin"
+      expect_2xx
+      PAGE_ID="$(python3 - "$TMP/body" "$path" <<'PY'
+import json, sys
+from urllib.parse import urlsplit
+want = sys.argv[2]
+for it in json.load(open(sys.argv[1])).get("artifacts", []):
+    if urlsplit(it.get("url") or "").path.rstrip("/") == want:
+        print(it.get("id", ""))
+        break
+PY
+)"
+      [ -n "$PAGE_ID" ] || die 1 "no page in the recycle bin at $1 (foldrender bin lists what is there)"
+      ;;
+    *) page_id "$1" ;;
+  esac
+}
+
+# unrm PAGE...: brings each named page back from the recycle bin — a page
+# `foldrender rm` deleted stays there 30 days, with its body, versions, people,
+# ink and answers; unrm opens its address again as it was. PAGE is its id, its
+# link by id or the address `rm` printed. A page not in the bin (live, or gone
+# for good) is reported, as the page's other doors give.
+cmd_unrm() {
+  local t failed=0 as_json="" targets=() url title
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) as_json=1; shift ;;
+      -*) die 2 "unknown option: $1" ;;
+      *) targets+=("$1"); shift ;;
+    esac
+  done
+  [ ${#targets[@]} -ge 1 ] || die 2 "usage: foldrender unrm PAGE... [--json]"
+  for t in "${targets[@]}"; do
+    bin_page_id "$t"
+    check_slug "$PAGE_ID"
+    api_auth POST "/api/artifacts/$PAGE_ID/restore"
+    if [ "$STATUS" = 404 ]; then
+      note "not restored: $PAGE_ID is not in the bin"
+      failed=1
+      continue
+    fi
+    # The plan has no room for it (a publish's own 403: a restored page holds
+    # its quota again). The server's words, then the commands that make room.
+    # A delete into a full bin deletes the bin's oldest for good, so the
+    # server says which delete keeps this page: any (nothing said), one of at
+    # most delete_at_most bytes, or none until pages in the bin deleted after
+    # it are deleted for good (bin_would_take_it, purge_at_least).
+    if [ "$STATUS" = 403 ] && grep -qE '"(quota_exceeded|storage_exceeded)"' "$TMP/body"; then
+      local msg up="" takes="" most="" pbytes="" which="PAGE (foldrender ls lists them)"
+      msg="$(json_get str message 2>/dev/null)"
+      takes="$(json_get raw bin_would_take_it 2>/dev/null)"
+      most="$(json_get raw delete_at_most 2>/dev/null)"
+      if json_get raw purge_at_least > "$TMP/purge" 2>/dev/null; then pbytes="$(json_get raw bytes "$TMP/purge" 2>/dev/null)"; fi
+      case "$msg" in *"or upgrade"*) up=", or foldrender upgrade" ;; esac
+      [ -n "$most" ] && which="PAGE of $most bytes or less (foldrender ls --json gives each page's size)"
+      note "${msg:-not restored: $PAGE_ID: your plan has no room for it}"
+      if [ "$takes" = true ] && [ -n "$pbytes" ]; then
+        local after="pages in the bin you no longer need that were deleted after it: those listed above it by foldrender bin"
+        [ "$pbytes" != 0 ] && after="$after, $pbytes bytes or more in all"
+        note "to keep it: foldrender bin purge PAGE ($after), then foldrender rm $which$up, then foldrender unrm $PAGE_ID"
+      elif [ "$takes" = true ]; then
+        # No delete keeps it: an upgrade does, where the plan has one to go to
+        # (the server names it then; a pro plan's answer does not).
+        case "$msg" in *upgrade*) note "to keep it: foldrender upgrade, then foldrender unrm $PAGE_ID" ;; esac
+      else
+        note "to make room: foldrender rm $which$up, then foldrender unrm $PAGE_ID"
+      fi
+      failed=1
+      continue
+    fi
+    expect_2xx
+    if [ -n "$as_json" ]; then
+      cat "$TMP/body"
+      printf '\n'
+      continue
+    fi
+    url="$(json_get str url 2>/dev/null)"
+    title="$(json_get str title 2>/dev/null)"
+    if [ -n "$url" ]; then
+      printf 'restored page %s ("%s"); %s opens it again\n' "$PAGE_ID" "$title" "$url"
+    else
+      printf 'restored page %s\n' "$PAGE_ID"
+    fi
+  done
+  [ "$failed" = 0 ] || exit 1
+}
+
+# bin [ls [--json]] | bin restore PAGE... | bin purge PAGE...: the recycle bin —
+# what "foldrender rm" sent there. `bin` (or `bin ls`) lists each deleted page's
+# id, title, address and how long until it is gone for good; `bin restore` brings
+# one back (same as `unrm`); `bin purge` deletes one for good, now — the same
+# hard delete the 30-day sweep runs, confirmed once per name.
+cmd_bin() {
+  local sub="${1:-ls}"
+  # `bin --json` is `bin ls --json`: an option first means the list.
+  case "$sub" in
+    -*) sub=ls ;;
+    *) [ $# -gt 0 ] && shift ;;
+  esac
+  case "$sub" in
+    ls|list)
+      local as_json=""
+      while [ $# -gt 0 ]; do
+        case "$1" in --json) as_json=1; shift ;; -*) die 2 "unknown option: $1" ;; *) die 2 "usage: foldrender bin [ls] [--json]" ;; esac
+      done
+      api_auth GET "/api/artifacts/-/bin"
+      expect_2xx
+      if [ -n "$as_json" ]; then cat "$TMP/body"; printf '\n'; return 0; fi
+      # One line a page: ID<TAB>TITLE<TAB>ADDRESS<TAB>gone in N days.
+      python3 - "$TMP/body" <<'PY'
+import json, sys
+body = json.load(open(sys.argv[1]))
+for it in body.get("artifacts", []):
+    url = it.get("url") or ""
+    gone = it.get("gone_after") or ""
+    days = ""
+    if gone:
+        from datetime import datetime, timezone
+        left = (datetime.fromisoformat(gone.replace("Z", "+00:00")) - datetime.now(timezone.utc)).total_seconds()
+        days = "gone in " + ("today" if left < 86400 else f"{int(left // 86400)} days")
+    print("\t".join([it.get("id", ""), it.get("title") or "", url, days]))
+PY
+      ;;
+    restore)
+      cmd_unrm "$@"
+      ;;
+    purge|delete|rm)
+      local failed=0 as_json="" targets=()
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --json) as_json=1; shift ;;
+          -*) die 2 "unknown option: $1" ;;
+          *) targets+=("$1"); shift ;;
+        esac
+      done
+      [ ${#targets[@]} -ge 1 ] || die 2 "usage: foldrender bin purge PAGE... [--json]"
+      for t in "${targets[@]}"; do
+        bin_page_id "$t"
+        check_slug "$PAGE_ID"
+        api_auth DELETE "/api/artifacts/-/bin/$PAGE_ID"
+        if [ "$STATUS" = 404 ]; then
+          note "not purged: $PAGE_ID is not in the bin"
+          failed=1
+          continue
+        fi
+        expect_2xx
+        if [ -n "$as_json" ]; then cat "$TMP/body"; printf '\n'; continue; fi
+        printf 'deleted %s for good\n' "$PAGE_ID"
+      done
+      [ "$failed" = 0 ] || exit 1
+      ;;
+    *) die 2 "usage: foldrender bin [ls] [--json] | foldrender bin restore PAGE... | foldrender bin purge PAGE..." ;;
+  esac
+}
+
+# pin PAGE... | unpin PAGE...: mark pages for the top of the library ({pinned}
+# on the server; pinned pages lead the list, newest pin first).
+cmd_pin() {
+  cmd_pin_unpin 1 "$@"
+}
+cmd_unpin() {
+  cmd_pin_unpin 0 "$@"
+}
+cmd_pin_unpin() {
+  local pinned="$1"; shift
+  local failed=0 targets=()
+  while [ $# -gt 0 ]; do
+    case "$1" in -*) die 2 "unknown option: $1" ;; *) targets+=("$1"); shift ;; esac
+  done
+  [ ${#targets[@]} -ge 1 ] || die 2 "usage: foldrender $([ "$pinned" = 1 ] && echo pin || echo unpin) PAGE..."
+  for t in "${targets[@]}"; do
+    page_id "$t"
+    check_slug "$PAGE_ID"
+    api_auth POST "/api/artifacts/$PAGE_ID/pin" -H "Content-Type: application/json" --data-binary "{\"pinned\":$([ "$pinned" = 1 ] && echo true || echo false)}"
+    if [ "$STATUS" = 404 ]; then
+      note "not $([ "$pinned" = 1 ] && echo pinned || echo unpinned): no page $PAGE_ID among yours"
+      failed=1
+      continue
+    fi
+    expect_2xx
+    printf '%s page %s\n' "$([ "$pinned" = 1 ] && echo pinned || echo unpinned)" "$PAGE_ID"
+  done
+  [ "$failed" = 0 ] || exit 1
+}
+
+# templates [ls] [--json] | template ID [--json]: the gallery the site offers —
+# list the templates, or make a copy of one in your space and print its address.
+cmd_templates() {
+  local sub="${1:-ls}"
+  # `templates --json` is `templates ls --json`: an option first means the list.
+  case "$sub" in
+    -*) sub=ls ;;
+    *) [ $# -gt 0 ] && shift ;;
+  esac
+  case "$sub" in
+    ls|list)
+      local as_json=""
+      while [ $# -gt 0 ]; do
+        case "$1" in --json) as_json=1; shift ;; -*) die 2 "unknown option: $1" ;; *) die 2 "usage: foldrender templates [ls] [--json]" ;; esac
+      done
+      api_auth GET "/api/artifacts/-/templates"
+      expect_2xx
+      if [ -n "$as_json" ]; then cat "$TMP/body"; printf '\n'; return 0; fi
+      python3 - "$TMP/body" <<'PY'
+import json, sys
+body = json.load(open(sys.argv[1]))
+for t in body.get("templates", []):
+    print("\t".join([t.get("id", ""), t.get("kind", ""), t.get("title", ""), t.get("blurb", "")]))
+PY
+      ;;
+    *)
+      # `foldrender template <id>` names one to use — `templates` is the list.
+      local tid="$sub" as_json=""
+      while [ $# -gt 0 ]; do
+        case "$1" in --json) as_json=1; shift ;; -*) die 2 "unknown option: $1" ;; *) die 2 "usage: foldrender template <id> [--json]" ;; esac
+      done
+      case "$tid" in ''|*[!a-z0-9-]*) die 2 "not a template id: $tid (foldrender templates lists them)" ;; esac
+      api_auth POST "/api/artifacts/-/template/$tid" -H "Content-Type: application/json" --data-binary '{}'
+      [ "$STATUS" != 404 ] || die 7 "no such template: $tid (foldrender templates lists them)"
+      expect_2xx
+      if [ -n "$as_json" ]; then cat "$TMP/body"; printf '\n'; return 0; fi
+      local url
+      url="$(json_get str url 2>/dev/null)"
+      printf 'made %s from template %s: %s\n' "$(json_get str id 2>/dev/null || printf '?')" "$tid" "${url:-your page}"
+      ;;
+  esac
 }
 
 # open ID|URL: prints the page's address and opens it. An id, or a link by id,
@@ -7935,9 +8186,48 @@ EOF
     ;;
     rm|delete) cat <<'EOF'
 foldrender rm PAGE... [--json]
-  Deletes each page: its address, its kept versions and its annotations. It
-  cannot be undone. Prints one line a page: "deleted page ID ("TITLE"); ADDRESS
-  no longer opens". Exit 1 if any page was not found (the others are deleted).
+  Deletes each page into the recycle bin: its address stops opening, but the
+  page (its body, kept versions, people, ink and answers) stays there 30 days
+  and can be brought back with foldrender unrm. Prints one line a page:
+  "deleted page ID ("TITLE"); ADDRESS no longer opens". Exit 1 if any page was
+  not found (the others are deleted). A version's body, not the page:
+  foldrender rm PAGE --rev REV|--version ID.
+EOF
+    ;;
+    unrm|undelete) cat <<'EOF'
+foldrender unrm PAGE... [--json]
+  Brings each page back from the recycle bin — a page "foldrender rm" deleted
+  stays there 30 days, with its body, versions, people, ink and answers, and
+  keeps its address (no new page can take that name meanwhile), so unrm opens
+  the same address again. PAGE is its id, its link by id, or the address rm
+  printed. Prints one line a page: "restored page ID ("TITLE"); ADDRESS opens
+  it again". A restored page counts against the plan again: with every page
+  (or byte) of the plan live it is not restored, and stderr says why and the
+  commands that make room — rm a page first, and when the bin is full and this
+  page is its oldest, bin purge another page in the bin before that (a delete
+  into a full bin takes its oldest for good). Exit 1 if any page was not in the
+  bin or not restored.
+EOF
+    ;;
+    bin) cat <<'EOF'
+foldrender bin [ls] [--json]           list the pages in the recycle bin
+foldrender bin restore PAGE...         bring pages back (same as unrm)
+foldrender bin purge PAGE... [--json]  delete pages for good, now — the same
+                                       hard delete the 30-day sweep runs
+  A page stays in the bin 30 days. The bin holds as many pages and bytes as
+  the account's plan; a delete past that takes the bin's oldest for good.
+  PAGE is an id, a link by id, or the address rm printed.
+EOF
+    ;;
+    pin|unpin) cat <<'EOF'
+foldrender pin PAGE...    mark pages for the top of the library
+foldrender unpin PAGE...  unmark them
+EOF
+    ;;
+    template|templates) cat <<'EOF'
+foldrender templates [ls] [--json]   list the templates the site offers
+foldrender template <id> [--json]    make a copy of a template in your space,
+                                     and print its address
 EOF
     ;;
     open) cat <<'EOF'
@@ -8200,6 +8490,11 @@ main() {
     bridge) cmd_bridge "$@" ;;
     reply) cmd_reply "$@" ;;
     rm|delete) cmd_rm "$@" ;;
+    unrm|undelete) cmd_unrm "$@" ;;
+    bin) cmd_bin "$@" ;;
+    pin) cmd_pin "$@" ;;
+    unpin) cmd_unpin "$@" ;;
+    template|templates) cmd_templates "$@" ;;
     open) cmd_open "$@" ;;
     upgrade) cmd_upgrade "$@" ;;
     billing) cmd_billing "$@" ;;

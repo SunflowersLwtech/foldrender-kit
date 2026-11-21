@@ -136,10 +136,17 @@ foldrender merge <page> --into <page> [-m MSG]  one page goes into another: the 
 foldrender ls [WORDS]                          the user's 20 newest pages, each with its id and address (--all, --access A, --folder F; --json carries each page's views and last_viewed: how often it was opened, and when last)
 foldrender ls --duplicates                     the user's pages that have the same content, in groups, oldest first; deletes nothing. Ask the user before deleting any: pages can share content on purpose
 foldrender open <slug-or-url>                  open a page in the browser
-foldrender rm <slug-or-url>                    delete a page; prints "deleted page ID ("TITLE"); URL no longer opens"
+foldrender rm <slug-or-url>                    delete a page into the recycle bin (30 days); prints "deleted page ID ("TITLE"); URL no longer opens"
+foldrender bin [ls]                            list the pages in the recycle bin (id, title, address, days left)
+foldrender unrm <slug-or-url>                  bring a page back from the recycle bin, with its versions, people, ink and answers
+foldrender bin purge <slug-or-url>             delete a page for good, now
+foldrender pin <slug-or-url>                   mark a page for the top of the library
+foldrender unpin <slug-or-url>                 unmark it
+foldrender templates                           list the templates the site offers
+foldrender template <id>                       make a copy of a template in your space
 ```
 
-Delete a page only when the user asks.
+Delete a page only when the user asks. A deleted page is not gone: it sits in the recycle bin 30 days, and `unrm` (its id, or the address `rm` printed) restores it whole; `bin purge` removes it for real before the 30 days are up. The bin holds as many pages and bytes as the account's plan, so when it is full the oldest pages in it go for good sooner: do not tell the user a page is safe in the bin for 30 days after many deletes — check with `foldrender bin`, and pass on what `rm` says on stderr when a full bin's oldest page went for good. A restored page counts against the plan again: `unrm` with the plan's pages all live is refused and prints the commands that make room; follow them in order and no further (a delete into a full bin takes its oldest page for good, so when the bin is nearly full they name how small a page to delete, or which pages in the bin to purge first; a larger delete than they name can take the page being restored). If `unrm` is refused again, it prints the next step the same way. A page in the bin keeps its name: a publish or `mv` to it is refused with that page's id and both ways out (`unrm` it, or `bin purge` it to free the name); ask the user which.
 
 ## 6. Read a page
 
