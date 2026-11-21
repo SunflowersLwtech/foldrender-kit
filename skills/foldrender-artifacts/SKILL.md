@@ -208,7 +208,7 @@ People may be editing the canvas in a browser while you do: your edit reaches th
 
 ## 7b. Sheets
 
-A sheet is a spreadsheet: tabs of cells, with formulas, references across tabs, styles, merges, frozen rows and dropdowns. The server and the browser compute it with the same engine, so what you read is what the user sees. Read it like a page:
+A sheet is a spreadsheet: tabs of cells, with formulas, references across tabs, styles, merges, frozen rows and dropdowns. The server and the browser compute it with the same engine, so what you read is what the user sees. The user edits it at its link, live, with anyone it is shared with at edit, and your batch shows on their screen as it lands, its cells outlined, with an Undo (which leaves any cell someone has changed since). To hand it to them, give them the link. Read it like a page:
 
 ```
 foldrender read <sheet>          each tab a table of what its cells show (never a formula), and seq: N
@@ -224,7 +224,7 @@ foldrender edit <sheet> --ops changes.json --base 4
  {"k":"d","coll":"cell","id":"t1_A9"}]
 ```
 
-A cell's id is its tab's id, `_`, then its address (`t1_C2`); `input` is what is typed (`"=..."` a formula, `"'00123"` text that only looks like a number). If the sheet changed since that seq, the batch is refused (exit 10) and nothing is overwritten: read it again and redo it. The command prints the new seq; carry it in the next `--base`. Tabs, styles, merges and dropdowns are other record kinds (`foldrender help sheet` has every shape); only the sheet's owner adds those, a collaborator edits cells. At most 500 changes a batch and 100,000 cells a sheet.
+A cell's id is its tab's id, `_`, then its address (`t1_C2`); `input` is what is typed (`"=..."` a formula, `"'00123"` text that only looks like a number). If the sheet changed since that seq, the batch is refused (exit 10) and nothing is overwritten: read it again and redo it. The command prints the new seq; carry it in the next `--base`. Tabs, styles, merges and dropdowns are other record kinds (`foldrender help sheet` has every shape); only the sheet's owner adds those, a collaborator edits cells. A dropdown only limits what a person types in the editor: a batch can write any value into its cells, so keep to its list yourself. At most 500 changes a batch and 100,000 cells a sheet.
 
 ```
 foldrender new sheet --title "Q4 budget"            an empty sheet; stderr says its id and seq 0
