@@ -155,7 +155,7 @@ Do not open the link in a browser, fetch it with a web tool, or ask the user to 
 
 stdout is a block of facts between `---` lines (title, url, id, updated, size, then `annotations:` and `note:` lines when there are any; `--meta full` adds owner, access, sharing, expiry and type), then the page as Markdown. An image embedded in the page shows as `![alt](asset:N)`. An inline diagram shows as `[SVG asset:N: title]`, followed by the text labels inside it.
 
-A page that names a kind FoldRender does not open there yet (a sheet, a deck, …) answers the error words only — its facts and its body do not come out of that read; today every kind past page, canvas and desk is that way, so no read behaves differently, and nothing to wire up in the command.
+A page that names a kind FoldRender does not open there yet (a deck, …) answers the error words only — its facts and its body do not come out of that read; today every kind past page, canvas, desk, sheet and doc is that way, so no read behaves differently, and nothing to wire up in the command.
 
 A long page stops near 6,000 tokens and ends with how much is left, the command that goes on (`--from N`) and its sections by number. Read one with `--section N` (or its heading), the headings alone with `--outline`, everything with `--all`.
 
@@ -234,6 +234,35 @@ foldrender export <sheet> out.csv --tab Summary     one tab, what its cells show
 ```
 
 On the server an import or an export is at most 10 MB and 25,000 cells (exit 2 says which; a larger sheet, up to 100,000 cells, is imported and exported in a browser); pictures, charts and pivot tables are left out, and stderr says so. Imports and exports together are 200 a day for an account (exit 4). One gap the engine has: TEXTJOIN, CONCAT and the like over an array made by IF or FILTER show `#N/IMPL!` (FILTER on its own works); write those another way and tell the user.
+
+## 7c. Docs
+
+A doc is rich text that people edit together in a browser — headings, lists, to-dos, tables, code, pictures, links, a data board's chart, comments — each seeing the others' cursors. Read it like a page; its text comes back as Markdown, with the `seq:` to change it from:
+
+```
+foldrender read <doc>                 its text as Markdown (cut like a page's: --section N, --from N, --all), and seq: N
+foldrender doc put <doc> doc.md --base 4    the doc's text made what doc.md says
+```
+
+`doc put` changes only the blocks that read differently, so the rest — and the comments on it — stay as they were; people editing see your change land, marked as yours, with an Undo. If the doc changed since that seq it is refused (exit 10) and nothing is overwritten: read it again and redo it. The command prints the new seq; `foldrender edit <doc> --undo SEQ` takes a change back. Write the text you read back with your change in it: a star, an underscore or a bracket the read wrote with a backslash is that character, keep the backslash. Each put is one of the day's Markdown files (100 an account).
+
+Signed in, the doc's owner and its editors get its comments at the end of a read, each with its id, its writer, the words it is on and its answers (readers never see them). Answer one, or mark it done, with a change of its own:
+
+```
+foldrender edit <doc> --base 5 --ops - <<'EOF'
+[{"k":"a","coll":"note","n":{"id":"a1","by":"<your login>","re":"<comment id>","text":"Fixed in the second paragraph."}},
+ {"k":"s","coll":"note","id":"<comment id>","p":{"done":true}}]
+EOF
+```
+
+```
+foldrender new doc --title "Q3 plan"            an empty doc; stderr says its id and seq 0
+foldrender new doc --from notes.md              a doc of a Markdown file (at most 256 KB), titled from its first heading
+foldrender new doc --from-page <page>           a doc of one of your pages (the page stays; the doc reads as it did)
+foldrender export <doc> out.docx                a Word file (headings, lists, tables, links as Word's); or out.md, out.html
+```
+
+Word files are 200 a day for an account (exit 4). Open the doc's link for the user to edit it: the editor is there, and there is nothing to install.
 
 ## 8. Questions the user answers on the page
 

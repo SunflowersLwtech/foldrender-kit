@@ -1528,9 +1528,9 @@ export_abort() {
 # parts. After 3 such rounds it stops and removes what it saved. It never ends
 # with a set that misses a page the account had when its last part was saved.
 cmd_export() {
-  # export SHEET FILE: one sheet as a file; else the account's zip.
+  # export SHEET|DOC FILE: one sheet or doc as a file; else the account's zip.
   if [ $# -ge 2 ] && case "$1$2" in -*) false ;; *) true ;; esac; then cmd_sheet_export "$@"; return; fi
-  [ $# -le 1 ] || die 2 "usage: foldrender export [FILE.zip] | export SHEET FILE.xlsx|FILE.csv"
+  [ $# -le 1 ] || die 2 "usage: foldrender export [FILE.zip] | export SHEET FILE.xlsx|FILE.csv | export DOC FILE.docx|FILE.md|FILE.html"
   local target="${1:-}" login="" i k q name mplan cuts same rounds=0 start=1
   local saved=() old_after=() old_to=()
   EXPORT_FILES=()
@@ -3604,12 +3604,128 @@ cmd_canvas() {
   print_map >&2
 }
 
-# new KIND: an artifact of a kind with a room (sheet, so far).
+# new KIND: an artifact of a kind with a room (a sheet, a doc).
 cmd_new() {
   case "${1:-}" in
     sheet) shift; cmd_sheet_new "$@" ;;
-    *) die 2 "usage: foldrender new sheet [--title T] [--from FILE.xlsx|FILE.csv] (foldrender help sheet)" ;;
+    doc) shift; cmd_doc_new "$@" ;;
+    *) die 2 "usage: foldrender new sheet [--from FILE.xlsx|FILE.csv] | new doc [--from FILE.md | --from-page PAGE] (foldrender help sheet, help doc)" ;;
   esac
+}
+
+# new doc [--title T] [--from FILE.md | --from-page PAGE]: a doc (rich text,
+# edited live in a browser), empty, made of a Markdown file (its title from
+# the file's front matter or first heading unless --title names one), or of
+# one of your pages (the page stays as it is; the doc remembers it). Prints
+# its address; stderr says its id and its seq (the base of the first put).
+# A file is at most 256 KB and counts as one of the day's Markdown files.
+cmd_doc_new() {
+  local as_json="" title="" vis="" from="" page="" id
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --title) need $# "$1"; title="$2"; shift 2 ;;
+      --from) need $# "$1"; from="$2"; shift 2 ;;
+      --from-page) need $# "$1"; page="$2"; shift 2 ;;
+      --private) vis="private"; shift ;;
+      --link-access) vis="link"; shift ;;
+      --public) vis="public"; shift ;;
+      --json) as_json=1; shift ;;
+      -*) die 2 "unknown option: $1 (foldrender help doc)" ;;
+      *) die 2 "foldrender new doc takes no FILE: give it as --from FILE.md (or --from-page PAGE)" ;;
+    esac
+  done
+  [ -z "$from" ] || [ -z "$page" ] || die 2 "--from and --from-page do not go together: a doc starts from one"
+  if [ -n "$from" ]; then
+    [ -f "$from" ] || die 2 "no such file: $from"
+    [ "$(wc -c < "$from")" -le 262144 ] || die 2 "$from is over 256 KB, the most a doc is made of from Markdown: split it into two docs"
+  fi
+  require_token
+  if [ -n "$page" ]; then page_id "$page"; check_slug "$PAGE_ID"; fi
+  JSEP=""
+  {
+    printf '{'
+    jkey kind; printf '"doc"'
+    [ -z "$title" ] || { jkey title; json_arg "$title"; }
+    [ -z "$vis" ] || { jkey visibility; printf '"%s"' "$vis"; }
+    [ -z "$from" ] || { jkey markdown; json_file "$from"; }
+    [ -z "$page" ] || { jkey from; json_arg "$PAGE_ID"; }
+    printf '}'
+  } > "$TMP/doc.json"
+  ACCEPT="application/json"
+  api_auth POST /api/artifacts -H "Content-Type: application/json" --data-binary "@$TMP/doc.json"
+  ACCEPT="text/plain"
+  case "$STATUS" in
+    2??) ;;
+    400|413|422) die 2 "$(json_get str message || error_text)" ;;
+    404) die 7 "$(json_get str message || error_text)" ;;
+    403|429) die 4 "$(json_get str message || error_text)" ;;
+    409|503) die 1 "$(json_get str message || error_text)" ;;
+    *) fail_http ;;
+  esac
+  if [ -n "$as_json" ]; then
+    cat "$TMP/body"
+    printf '\n'
+    return 0
+  fi
+  printf '%s\n' "$(json_get str url)"
+  id="$(json_get str id)"
+  note "doc $id, seq $(json_get raw seq)${from:+, $(json_get raw chars) characters}${page:+, made from $PAGE_ID (the page stays)}; read it with foldrender read $id"
+}
+
+# doc put DOC FILE.md|- --base SEQ: the doc's text made what the file says,
+# against the seq foldrender read printed (a doc changed since is refused,
+# exit 10, with the seq to read again). Only the blocks that read differently
+# change, so the rest (and comments on it) stay as they are. One change by
+# this agent session, taken back with `edit DOC --undo SEQ`. Prints the seq.
+cmd_doc() {
+  case "${1:-}" in
+    put) shift; cmd_doc_put "$@" ;;
+    *) die 2 "usage: foldrender doc put DOC FILE.md --base SEQ (foldrender help doc)" ;;
+  esac
+}
+cmd_doc_put() {
+  local target="" file="" base="" as_json="" seq
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --base) need $# "$1"; case "$2" in ''|*[!0-9]*) die 2 "--base takes the seq foldrender read prints (seq: N)" ;; esac; base="$2"; shift 2 ;;
+      --json) as_json=1; shift ;;
+      --no-session) NO_SESSION=1; shift ;;
+      -) [ -z "$file" ] || die 2 "doc put takes one file"; file=-; shift ;;
+      -*) die 2 "unknown option: $1 (foldrender help doc)" ;;
+      *) if [ -z "$target" ]; then target="$1"; elif [ -z "$file" ]; then file="$1"; else die 2 "doc put takes one doc and one file"; fi; shift ;;
+    esac
+  done
+  [ -n "$target" ] && [ -n "$file" ] || die 2 "usage: foldrender doc put DOC FILE.md --base SEQ"
+  [ -n "$base" ] || die 2 "doc put needs --base SEQ: the seq foldrender read printed, so that a change made since is never overwritten unseen"
+  if [ "$file" = - ]; then cat > "$TMP/put.md"; else [ -f "$file" ] || die 2 "no such file: $file"; cp "$file" "$TMP/put.md"; fi
+  [ "$(wc -c < "$TMP/put.md")" -le 262144 ] || die 2 "the text is over 256 KB, the most a doc's text is put from at once"
+  require_token
+  page_id "$target"
+  check_slug "$PAGE_ID"
+  made_by_header "$target"
+  local oh=()
+  [ -z "$FR_MADE_BY" ] || oh=(-H "FoldRender-Made-By: $FR_MADE_BY")
+  JSEP=""
+  { printf '{'; jkey markdown; json_file "$TMP/put.md"; jkey base; printf '%s}' "$base"; } > "$TMP/put.json"
+  ACCEPT="application/json"
+  api_auth POST "/api/artifacts/$PAGE_ID/doc" -H "Content-Type: application/json" ${oh[@]+"${oh[@]}"} --data-binary "@$TMP/put.json"
+  ACCEPT="text/plain"
+  case "$STATUS" in
+    404) die 7 "no doc named $PAGE_ID that you may edit" ;;
+    409) die 10 "$(error_text) (seq $(json_get raw seq))" ;;
+    400|413|422) die 10 "the text did not go in: $(error_text); nothing was changed" ;;
+    429) die 4 "$(error_text)" ;;
+    503) die 1 "$(error_text)" ;;
+  esac
+  expect_2xx
+  if [ -n "$as_json" ]; then
+    cat "$TMP/body"
+    printf '\n'
+    return 0
+  fi
+  seq="$(json_get raw seq)"
+  printf 'seq %s\n' "$seq"
+  if [ "$(json_get raw unchanged 2>/dev/null)" = true ]; then note "nothing changed: the doc already reads as the file"; else note "applied; the next put carries --base $seq (undo: foldrender edit $PAGE_ID --undo $seq)"; fi
 }
 
 # new sheet [--title T] [--from FILE.xlsx|FILE.csv [--tab NAME]]: a sheet,
@@ -3743,26 +3859,32 @@ cmd_edit_ops() {
 # export ID FILE.xlsx|FILE.csv [--tab NAME]: a sheet saved as a file (the
 # whole sheet as xlsx, with its dropdowns; one tab as csv, what its cells
 # show). Never overwrites. Counts against the account's 200 files a day.
+# export ID FILE.docx|FILE.md|FILE.html: a doc saved as a file (a Word file
+# counts against the account's 200 a day; Markdown and HTML do not).
 cmd_sheet_export() {
-  local target="$1" file="$2" tab="" q t
+  local target="$1" file="$2" tab="" q t kind=sheet
   shift 2
   while [ $# -gt 0 ]; do
     case "$1" in
       --tab) need $# "$1"; tab="$2"; shift 2 ;;
-      *) die 2 "usage: foldrender export SHEET FILE.xlsx | FILE.csv [--tab NAME]" ;;
+      *) die 2 "usage: foldrender export SHEET FILE.xlsx | FILE.csv [--tab NAME] | export DOC FILE.docx | FILE.md | FILE.html" ;;
     esac
   done
   [ ! -e "$file" ] || die 1 "$file already exists; choose another name"
   case "$file" in
     *.xlsx|*.XLSX) [ -z "$tab" ] || die 2 "--tab is for a csv: an xlsx holds every tab"; q="format=xlsx" ;;
     *.csv|*.CSV) q="format=csv"; [ -z "$tab" ] || q="$q&tab=$(urlencode "$tab")" ;;
-    *) die 2 "a sheet is saved as FILE.xlsx or FILE.csv" ;;
+    *.docx|*.DOCX) kind=doc; q="format=docx" ;;
+    *.md|*.MD|*.markdown) kind=doc; q="format=markdown" ;;
+    *.html|*.HTML|*.htm) kind=doc; q="format=html" ;;
+    *) die 2 "a sheet is saved as FILE.xlsx or FILE.csv, a doc as FILE.docx, FILE.md or FILE.html" ;;
   esac
+  [ "$kind" = sheet ] || [ -z "$tab" ] || die 2 "--tab is a sheet's"
   require_token
   page_id "$target"
   check_slug "$PAGE_ID"
   ACCEPT="application/json"
-  api_auth GET "/api/artifacts/$PAGE_ID/sheet?$q"
+  api_auth GET "/api/artifacts/$PAGE_ID/$kind?$q"
   ACCEPT="text/plain"
   case "$STATUS" in
     200) ;;
@@ -3770,7 +3892,7 @@ cmd_sheet_export() {
       t="$(json_get pairs tabs 2>/dev/null | cut -f2- | paste -sd, -)"
       [ -z "$t" ] || die 2 "a csv is one tab: give --tab NAME (its tabs: $t)"
       die 2 "$(error_text)" ;;
-    404) die 7 "no sheet named $PAGE_ID that you may read (or no such tab)" ;;
+    404) [ "$kind" = doc ] && die 7 "no doc named $PAGE_ID that you may read"; die 7 "no sheet named $PAGE_ID that you may read (or no such tab)" ;;
     413) die 2 "$(error_text)" ;;
     429) die 4 "$(error_text)" ;;
     503) die 1 "$(error_text)" ;;
@@ -6790,7 +6912,7 @@ cmd_help() {
 foldrender publishes HTML pages as links and reads pages back as text.
   publish FILE...      publish (or update) pages; prints each address
   edit PAGE            change part of a page: --old TEXT --new TEXT
-  new sheet            a sheet (--from FILE.xlsx|.csv); edit, export SHEET FILE (help sheet)
+  new sheet|doc        a sheet (--from FILE.xlsx|.csv) or a doc (--from FILE.md): help sheet, help doc
   read PAGE            the page as Markdown with its annotations (notes, marks,
                        ink) when signed in; stops at ~6k tokens (--section N)
   ls [WORDS]           your newest pages, id and address (--all, --duplicates)
@@ -7756,6 +7878,35 @@ foldrender export SHEET FILE.xlsx | FILE.csv [--tab NAME]
   over an array made by IF or FILTER (FILTER on its own works).
 EOF
     ;;
+    doc) cat <<'EOF'
+foldrender new doc [--title T] [--private|--link-access|--public] [--json]
+foldrender new doc --from FILE.md [--title T]      (or --from-page PAGE)
+  A doc: rich text that people edit together in a browser (headings, lists,
+  to-dos, tables, code, pictures, links, comments), each seeing the others'
+  cursors. Prints its address; stderr says its id and seq. --from makes it of
+  a Markdown file (at most 256 KB; one of the day's Markdown files, 100 an
+  account); --from-page of one of your pages (the page stays as it is, and
+  the doc reads as it did). Exit 2 for a file it cannot take, with the reason.
+foldrender read DOC [--section N] [--json]
+  Its text as Markdown, cut as a page's is, with the seq the next put names.
+  Signed in, its owner and its editors also get its comments at the end, each
+  with its id, writer, the words it is on, and its answers; readers see none.
+foldrender doc put DOC FILE.md|- --base SEQ
+  The doc's text made what the file says, against the seq you read: if the
+  doc changed since, it is refused (exit 10, with the seq to read again) and
+  nothing is overwritten. Only the blocks that read differently change, so
+  the rest, and the comments on it, stay; people editing see it as it lands,
+  marked as yours, with Undo. Prints the new seq; one of the day's Markdown
+  files. Take it back with `foldrender edit DOC --undo SEQ`. Answering a
+  comment, or marking it done, is a change of its own (edit --ops):
+    {"k":"a","coll":"note","n":{"id":"a1","by":"YOUR_LOGIN","re":"<comment id>","text":"Fixed."}}
+    {"k":"s","coll":"note","id":"<comment id>","p":{"done":true}}
+foldrender export DOC FILE.docx | FILE.md | FILE.html
+  The doc as a Word file (headings, lists, tables, links kept as Word's; a
+  to-do's box as a checkbox character), as Markdown, or as an HTML page.
+  Never overwrites. Word files: 200 a day an account (exit 4 past it).
+EOF
+    ;;
     canvas) cat <<'EOF'
 foldrender canvas FILE|PAGE...|PLAN.canvas [options]
   A new canvas: each file or page becomes a card (up to 24; a card 2 MB at
@@ -7833,6 +7984,8 @@ foldrender export [FILE.zip]
   downloads at most 100 parts a day.
 foldrender export SHEET FILE.xlsx | FILE.csv [--tab NAME]
   One sheet as a file (help sheet).
+foldrender export DOC FILE.docx | FILE.md | FILE.html
+  One doc as a file (help doc).
 EOF
     ;;
     login|logout|whoami) cat <<'EOF'
@@ -7993,7 +8146,7 @@ main() {
   local cmd="${1:-help}"
   [ $# -eq 0 ] || shift
   case "$cmd" in
-    login|logout|auth|account|export|whoami|publish|edit|share|mv|move|merge|list|ls|read|cat|versions|restore|undo|canvas|answers|desk|pack|bridge|rm|delete|open|upgrade|billing|data|version|new)
+    login|logout|auth|account|export|whoami|publish|edit|share|mv|move|merge|list|ls|read|cat|versions|restore|undo|canvas|answers|desk|pack|bridge|rm|delete|open|upgrade|billing|data|version|new|doc)
       if help_asked "$cmd" "$@"; then
         case "$cmd" in
           list) cmd_help ls ;;
@@ -8001,7 +8154,7 @@ main() {
           move) cmd_help mv ;;
           auth) cmd_help login ;;
           version) cmd_help ;;
-          new) cmd_help sheet ;;
+          new) case "${1:-}" in doc) cmd_help doc ;; *) cmd_help sheet ;; esac ;;
           desk) case "${1:-}" in mem) cmd_help desk-mem ;; workspace) cmd_help desk-workspace ;; *) cmd_help desk ;; esac ;;
           *) cmd_help "$cmd" ;;
         esac
@@ -8039,6 +8192,7 @@ main() {
     undo) cmd_undo "$@" ;;
     canvas) cmd_canvas "$@" ;;
     new) cmd_new "$@" ;;
+    doc) cmd_doc "$@" ;;
     answers) cmd_answers "$@" ;;
     desk) cmd_desk "$@" ;;
     thread) cmd_thread "$@" ;;
