@@ -7,6 +7,20 @@ description: Publish an HTML page (a report, diagram, explainer or dashboard) as
 
 Publish one self-contained HTML file and get a link, or read a published page back as text. The `foldrender` command does the work.
 
+## 0. No shell? The same work over MCP
+
+A client that cannot run commands but speaks MCP (Claude Desktop, an MCP-only gateway) connects to the hosted endpoint instead:
+
+```
+URL:   https://foldrender.dev/artifacts/api/mcp   (streamable HTTP, POST)
+Auth:  Authorization: Bearer <API token>
+```
+
+- The token is an account API token: the one `foldrender login` saves on this machine, or one the user makes under Account & CLI tokens on the account page (`https://foldrender.dev/artifacts/account`). Ask the user for it; never put it in a page.
+- Tools: `publish` (content, format html|markdown, title, name, folder, access private|link|public — new pages are private by default; a name you already own updates in place), `read` (page: address, link or id; returns the Markdown with the facts, `## Notes` and `## Answers`, section/from/max_tokens to go on), `answers` (the page's choices as JSON, after to poll), `ls` (your pages).
+- It is the same API with the same limits and access checks: a tool's refusal comes back as a tool result with isError. Everything else in this skill (choice blocks, the decision card, what a read returns) applies unchanged; only the transport differs.
+- Prefer the CLI when you can run it: it retries safely, keeps the slug map, and does canvases, sheets and the desk, which the MCP tools do not cover yet.
+
 ## 1. Check the setup
 
 ```
@@ -119,7 +133,7 @@ foldrender share <slug-or-url> --pin 2 --pin latest    the page's link shows ver
 foldrender team create eng alice,bob           your teams: list, show, add, remove, delete too; a deleted team's grants go with it
 foldrender mv <page> <new-name> [--folder F]   a page to another address; where it was still opens it (a redirect to the new address, for whoever the page opens for — it hands out nothing the page would not). No other page takes the old name until you let it go: foldrender mv --release-old <address>
 foldrender merge <page> --into <page> [-m MSG]  one page goes into another: the page that went in is gone, its address and its link by id open the page it went into, its last body is kept in that page's history (log). A key (?k=) of the merged page does not open the other page; when its holders need that page's link, stderr says so: foldrender share <page> --link. It names the people and teams the merged page was shared with that the other page does not let in too, with the foldrender share <page> --view/--comment/--edit that gives them back
-foldrender ls [WORDS]                          the user's 20 newest pages, each with its id and address (--all, --access A, --folder F)
+foldrender ls [WORDS]                          the user's 20 newest pages, each with its id and address (--all, --access A, --folder F; --json carries each page's views and last_viewed: how often it was opened, and when last)
 foldrender ls --duplicates                     the user's pages that have the same content, in groups, oldest first; deletes nothing. Ask the user before deleting any: pages can share content on purpose
 foldrender open <slug-or-url>                  open a page in the browser
 foldrender rm <slug-or-url>                    delete a page; prints "deleted page ID ("TITLE"); URL no longer opens"
