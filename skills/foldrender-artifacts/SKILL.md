@@ -162,7 +162,7 @@ Do not open the link in a browser, fetch it with a web tool, or ask the user to 
 
 stdout is a block of facts between `---` lines (title, url, id, updated, size, then `annotations:` and `note:` lines when there are any; `--meta full` adds owner, access, sharing, expiry and type), then the page as Markdown. An image embedded in the page shows as `![alt](asset:N)`. An inline diagram shows as `[SVG asset:N: title]`, followed by the text labels inside it.
 
-A page that names a kind FoldRender does not open there yet (a deck, …) answers the error words only — its facts and its body do not come out of that read; today every kind past page, canvas, desk, sheet and doc is that way, so no read behaves differently, and nothing to wire up in the command.
+A page that names a kind FoldRender does not open there yet answers the error words only — its facts and its body do not come out of that read. A sheet (section 7b), a doc (7c), a deck (7d), a motion (7e) and a design (7f) read as text where the deployment has them on.
 
 A long page stops near 6,000 tokens and ends with how much is left, the command that goes on (`--from N`) and its sections by number. Read one with `--section N` (or its heading), the headings alone with `--outline`, everything with `--all`.
 
@@ -270,6 +270,57 @@ foldrender export <doc> out.docx                a Word file (headings, lists, ta
 ```
 
 Word files are 200 a day for an account (exit 4). Open the doc's link for the user to edit it: the editor is there, and there is nothing to install.
+
+## 7d. Decks
+
+A deck is a slide deck: slides in order, each with its boxes (text, shapes, images) on a 1280 × 720 stage (960 × 720 for 4:3), speaker notes, and a theme (colours and faces) every slide takes. Its address is where the user edits it (drag, resize, type on the slide), presents it and exports it to PowerPoint or PDF. Read it like a page:
+
+```
+foldrender read <deck>          the slides in order: each title, its words, its notes, and seq: N
+foldrender read <deck> --json   every box with its place, size and style, and the theme
+```
+
+Make one, then add its slides in one batch against the `seq:` it printed:
+
+```
+foldrender new deck --title "Q4 review"             one title slide; stderr says its id and seq
+foldrender edit <deck> --ops slides.json --base 1
+[{"k":"a","coll":"slide","n":{"id":"s2","order":2,"layout":"title-body","notes":"Pause on the number."}},
+ {"k":"a","coll":"box","n":{"id":"t2","slide":"s2","type":"text","role":"title","x":96,"y":56,"w":1088,"h":100,"text":"Revenue","size":48,"bold":true}},
+ {"k":"a","coll":"box","n":{"id":"b2","slide":"s2","type":"text","role":"body","x":96,"y":180,"w":1088,"h":480,"text":"- Up 12%\n- Churn down","size":28}}]
+foldrender export <deck> q4.pptx                    a PowerPoint file; its text boxes stay editable
+```
+
+A box's text is plain: a line a paragraph, a line starting `- ` a bullet. Colours name the theme's (`text`, `muted`, `accent`, `on_accent`, `surface`, `bg`) or a `#rrggbb`; set the theme itself with `{"k":"s","coll":"deck","id":"deck","p":{"theme":{...}}}`. A slide's `order` is a number (one between two slides takes the middle). Remove a slide's boxes in the same batch that removes the slide. A box stays on the stage; an image is a `data:` URL of a png, jpeg, gif or webp of at most 60,000 characters. At most 200 slides, 120 boxes a slide, 500 changes a batch; if the deck changed since that seq the batch is refused (exit 10) and nothing is overwritten. `foldrender help deck` has every property. Exports are 200 a day (exit 4); a person's export from the deck's page costs nothing.
+
+## 7e. Motion
+
+A motion is a short animated scene (1 to 300 seconds): layers (text, shapes, images) placed on a stage, each on screen from its `start` to its `end`, and keys that move them in time. Its address is where the user plays it, edits it on a timeline and exports it as an MP4, which is made in their browser (a current Chrome, Edge, Safari or Firefox), never on the server.
+
+```
+foldrender new motion --title "Launch" --seconds 8          a title fading in over a bar; stderr says its id and seq
+foldrender read <motion>                                     its length, each layer top first with its times, words and keys
+foldrender edit <motion> --ops scene.json --base 1
+[{"k":"a","coll":"layer","n":{"id":"l3","type":"text","order":3,"start":1,"end":8,"x":160,"y":520,"w":960,"h":90,"text":"Out now","size":56,"color":"accent"}},
+ {"k":"a","coll":"key","n":{"id":"k9","layer":"l3","t":1,"opacity":0,"y":30}},
+ {"k":"a","coll":"key","n":{"id":"k10","layer":"l3","t":1.6,"opacity":1,"y":0,"ease":"out"}}]
+```
+
+A key is the layer at time `t` (seconds): any of `x`, `y` (moved from where the layer is placed), `scale`, `rotate` (degrees), `opacity` (0 to 1), and `ease`, the way into it (linear, in, out, in-out, step). Between two keys each property is eased; before the first and after the last the nearest holds. The stage is 1280 × 720 (9:16 is 720 × 1280, 1:1 1080 × 1080). Change the scene with `{"k":"s","coll":"scene","id":"scene","p":{"duration":8,"bg":"#101820"}}`. Remove a layer's keys in the batch that removes it. If the motion changed since that seq the batch is refused (exit 10). Tell the user the MP4 is exported on its page; `foldrender help motion` has every property.
+
+## 7f. Designs: the user's look
+
+A design is the user's look: six colours, two faces, a corner and a logo. When you write a page, a deck or a motion for them, use their design rather than inventing one:
+
+```
+foldrender design show                 the account's newest design as CSS custom properties (exit 7: none yet)
+foldrender design show <design> --json its record: the theme, the logo (a data: URL) and the user's notes on using it
+foldrender design use <deck>           a deck or a motion takes the newest design's theme, in one change
+foldrender design use <design> <deck>  ...or a named one
+foldrender new design --title "Brand" --theme brand.json    {"accent":"#3b5993","heading":"Georgia, serif","radius":8,...}
+```
+
+`design show` prints a `:root { --fr-bg: ...; --fr-accent: ...; --fr-font-heading: ...; --fr-radius: ...px; }` block: paste it in the page's `<style>` and use `var(--fr-accent)`, `var(--fr-font-body)`, and so on. Read the design's notes (`--json`) before you use it; they are the user's own words on how. A design is copied into a deck or a motion when it is used: changing it later changes nothing already made until it is used again.
 
 ## 8. Questions the user answers on the page
 

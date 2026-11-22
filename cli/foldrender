@@ -37,7 +37,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.24.0
+FR_CLI_VERSION=0.25.0
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -45,7 +45,7 @@ FR_BRIDGE_SHA256=0474aa21041e7549ed17addd7c5c3994282178184b4235b43a699cf8b27fdaa
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=e9b2fd840b895a1123bfc1bc8dcf08b36fa9ed8148745db6162539b976e9dcfa
+FR_DESK_AGENT_SHA256=f9583eca47cce8b9e11d80fe21bde2c82e8ba17700d7b281c7ae19852162719b
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -1528,9 +1528,12 @@ export_abort() {
 # parts. After 3 such rounds it stops and removes what it saved. It never ends
 # with a set that misses a page the account had when its last part was saved.
 cmd_export() {
-  # export SHEET|DOC FILE: one sheet or doc as a file; else the account's zip.
-  if [ $# -ge 2 ] && case "$1$2" in -*) false ;; *) true ;; esac; then cmd_sheet_export "$@"; return; fi
-  [ $# -le 1 ] || die 2 "usage: foldrender export [FILE.zip] | export SHEET FILE.xlsx|FILE.csv | export DOC FILE.docx|FILE.md|FILE.html"
+  # export DECK FILE.pptx / SHEET|DOC FILE: one artifact as a file; else the account's zip.
+  if [ $# -ge 2 ] && case "$1$2" in -*) false ;; *) true ;; esac; then
+    case "$2" in *.pptx|*.PPTX) cmd_deck_export "$@"; return ;; *.mp4|*.MP4) die 2 "a motion's MP4 is made in a browser, on its page (Export MP4: a current Chrome, Edge, Safari or Firefox); the server makes none. Its scene as text: foldrender read $1" ;; esac
+    cmd_sheet_export "$@"; return
+  fi
+  [ $# -le 1 ] || die 2 "usage: foldrender export [FILE.zip] | export SHEET FILE.xlsx|FILE.csv | export DOC FILE.docx|FILE.md|FILE.html | export DECK FILE.pptx"
   local target="${1:-}" login="" i k q name mplan cuts same rounds=0 start=1
   local saved=() old_after=() old_to=()
   EXPORT_FILES=()
@@ -3018,7 +3021,7 @@ PY
 # link by id or the address `rm` printed. A page not in the bin (live, or gone
 # for good) is reported, as the page's other doors give.
 cmd_unrm() {
-  local t failed=0 as_json="" targets=() url title
+  local t failed=0 as_json="" targets=() url title acc
   while [ $# -gt 0 ]; do
     case "$1" in
       --json) as_json=1; shift ;;
@@ -3030,7 +3033,14 @@ cmd_unrm() {
   for t in "${targets[@]}"; do
     bin_page_id "$t"
     check_slug "$PAGE_ID"
+    # Asked for JSON: a refusal's way out is in it (bin_would_take_it, a
+    # boolean, and purge_at_least, an object), and an error answered as text is
+    # `error: <code>` with only its string and number fields; read that way, a
+    # refusal fell through to the stock quota line.
+    acc=$ACCEPT
+    ACCEPT="application/json"
     api_auth POST "/api/artifacts/$PAGE_ID/restore"
+    ACCEPT="$acc"
     if [ "$STATUS" = 404 ]; then
       note "not restored: $PAGE_ID is not in the bin"
       failed=1
@@ -3855,12 +3865,135 @@ cmd_canvas() {
   print_map >&2
 }
 
-# new KIND: an artifact of a kind with a room (a sheet, a doc).
+# new KIND: an artifact of a kind with a room (a sheet, a doc, a deck, a motion).
 cmd_new() {
   case "${1:-}" in
     sheet) shift; cmd_sheet_new "$@" ;;
     doc) shift; cmd_doc_new "$@" ;;
-    *) die 2 "usage: foldrender new sheet [--from FILE.xlsx|FILE.csv] | new doc [--from FILE.md | --from-page PAGE] (foldrender help sheet, help doc)" ;;
+    deck) shift; cmd_deck_new "$@" ;;
+    motion) shift; cmd_motion_new "$@" ;;
+    design) shift; cmd_design_new "$@" ;;
+    *) die 2 "usage: foldrender new sheet [--from FILE.xlsx|FILE.csv] | new doc [--from FILE.md | --from-page PAGE] | new deck [--aspect 16:9|4:3] | new motion [--aspect 16:9|9:16|1:1] [--seconds N] | new design [--theme FILE.json] (foldrender help sheet, help doc, help deck, help motion, help design)" ;;
+  esac
+}
+
+# new design [--title T] [--theme FILE.json]: an account's look (colours,
+# faces, corner, logo) a deck or a motion takes (design use) and a page reads
+# (design show). Prints its address; stderr says its id.
+cmd_design_new() {
+  local as_json="" title="" vis="" theme="" c id
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --title) need $# "$1"; title="$2"; shift 2 ;;
+      --theme) need $# "$1"; theme="$2"; shift 2 ;;
+      --private) vis="private"; shift ;;
+      --link-access) vis="link"; shift ;;
+      --public) vis="public"; shift ;;
+      --json) as_json=1; shift ;;
+      -*) die 2 "unknown option: $1 (foldrender help design)" ;;
+      *) die 2 "foldrender new design takes no FILE: give its theme as --theme FILE.json (help design)" ;;
+    esac
+  done
+  if [ -n "$theme" ]; then
+    [ -f "$theme" ] || die 2 "no such file: $theme"
+    c="$(tr -d ' \t\r\n' < "$theme" | head -c 1)"
+    [ "$c" = '{' ] || die 2 "--theme takes a JSON object: {\"accent\":\"#3b5993\",\"heading\":\"Georgia, serif\"} (foldrender help design)"
+  fi
+  require_token
+  ACCEPT="application/json"
+  {
+    printf '{'
+    jkey kind; printf '"design"'
+    [ -z "$title" ] || { jkey title; json_arg "$title"; }
+    [ -z "$vis" ] || { jkey visibility; printf '"%s"' "$vis"; }
+    [ -z "$theme" ] || { jkey theme; cat "$theme"; }
+    printf '}'
+  } > "$TMP/design.json"
+  api_auth POST /api/artifacts -H "Content-Type: application/json" --data-binary "@$TMP/design.json"
+  ACCEPT="text/plain"
+  case "$STATUS" in
+    2??) ;;
+    400|413) die 2 "$(error_text)" ;;
+    403|429) die 4 "$(json_get str message || error_text)" ;;
+    404|409|503) die 1 "$(json_get str message || error_text)" ;;
+    *) fail_http ;;
+  esac
+  if [ -n "$as_json" ]; then
+    cat "$TMP/body"
+    printf '\n'
+    return 0
+  fi
+  printf '%s\n' "$(json_get str url)"
+  id="$(json_get str id)"
+  note "design $id: put it on a deck or a motion with foldrender design use $id TARGET; its tokens for a page: foldrender design show $id"
+}
+
+# design show [ID] [--json] | design use [DESIGN] TARGET
+cmd_design() {
+  local sub="${1:-}" as_json="" a=() target design
+  [ $# -eq 0 ] || shift
+  case "$sub" in
+    show)
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --json) as_json=1; shift ;;
+          --css) shift ;;
+          -*) die 2 "unknown option: $1 (foldrender help design)" ;;
+          *) a+=("$1"); shift ;;
+        esac
+      done
+      [ ${#a[@]} -le 1 ] || die 2 "usage: foldrender design show [ID] [--json]"
+      require_token
+      ACCEPT="application/json"
+      if [ ${#a[@]} -eq 1 ]; then
+        page_id "${a[0]}"; check_slug "$PAGE_ID"
+        api_auth GET "/api/artifacts/$PAGE_ID/design?format=$([ -n "$as_json" ] && echo json || echo css)"
+      else
+        api_auth GET "/api/me/design?format=$([ -n "$as_json" ] && echo json || echo css)"
+      fi
+      ACCEPT="text/plain"
+      case "$STATUS" in
+        200) ;;
+        404) die 7 "$(json_get str message || echo "no design ${a[0]:-} that you may read")" ;;
+        400|403) die 2 "$(json_get str message || error_text)" ;;
+        429) die 4 "$(error_text)" ;;
+        503) die 1 "$(error_text)" ;;
+        *) fail_http ;;
+      esac
+      cat "$TMP/body"
+      ;;
+    use)
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          -*) die 2 "unknown option: $1 (foldrender help design)" ;;
+          *) a+=("$1"); shift ;;
+        esac
+      done
+      case ${#a[@]} in
+        1) design=""; target="${a[0]}" ;;
+        2) design="${a[0]}"; target="${a[1]}" ;;
+        *) die 2 "usage: foldrender design use [DESIGN] DECK|MOTION (the account's newest design when DESIGN is left out)" ;;
+      esac
+      require_token
+      if [ -n "$design" ]; then page_id "$design"; check_slug "$PAGE_ID"; design="$PAGE_ID"; fi
+      page_id "$target"; check_slug "$PAGE_ID"
+      { printf '{'; [ -z "$design" ] || { jkey design; json_arg "$design"; }; printf '}'; } > "$TMP/use.json"
+      ACCEPT="application/json"
+      api_auth POST "/api/artifacts/$PAGE_ID/design" -H "Content-Type: application/json" --data-binary "@$TMP/use.json"
+      ACCEPT="text/plain"
+      case "$STATUS" in
+        200) ;;
+        404) die 7 "$(json_get str message || echo "no deck or motion named $PAGE_ID that you own")" ;;
+        400|409) die 10 "$(json_get str error || error_text)" ;;
+        429) die 4 "$(json_get str error || error_text)" ;;
+        503) die 1 "$(json_get str error || error_text)" ;;
+        *) fail_http ;;
+      esac
+      printf 'seq %s\n' "$(json_get raw seq)"
+      note "$(json_get str kind) $PAGE_ID takes design $(json_get str design)"
+      ;;
+    ''|help|-h|--help) cmd_help design ;;
+    *) die 2 "usage: foldrender design show [ID] [--json] | design use [DESIGN] DECK|MOTION (help design)" ;;
   esac
 }
 
@@ -3979,6 +4112,137 @@ cmd_doc_put() {
   if [ "$(json_get raw unchanged 2>/dev/null)" = true ]; then note "nothing changed: the doc already reads as the file"; else note "applied; the next put carries --base $seq (undo: foldrender edit $PAGE_ID --undo $seq)"; fi
 }
 
+# new motion [--title T] [--aspect 16:9|9:16|1:1] [--seconds N]: a short
+# animated scene, its title fading in over a bar. Prints its address; stderr
+# says its id and seq (the base of the first edit --ops).
+cmd_motion_new() {
+  local as_json="" title="" vis="" aspect="" seconds="" id seq
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --title) need $# "$1"; title="$2"; shift 2 ;;
+      --aspect) need $# "$1"; case "$2" in 16:9|9:16|1:1) aspect="$2" ;; *) die 2 "--aspect is 16:9, 9:16 or 1:1" ;; esac; shift 2 ;;
+      --seconds) need $# "$1"; case "$2" in ''|*[!0-9.]*|*.*.*) die 2 "--seconds is a number from 1 to 300" ;; esac
+        awk -v v="$2" 'BEGIN { exit !(v >= 1 && v <= 300) }' || die 2 "--seconds is a number from 1 to 300"; seconds="$2"; shift 2 ;;
+      --private) vis="private"; shift ;;
+      --link-access) vis="link"; shift ;;
+      --public) vis="public"; shift ;;
+      --json) as_json=1; shift ;;
+      -*) die 2 "unknown option: $1 (foldrender help motion)" ;;
+      *) die 2 "foldrender new motion takes no FILE: its layers and keys are written with foldrender edit MOTION --ops FILE (help motion)" ;;
+    esac
+  done
+  require_token
+  ACCEPT="application/json"
+  {
+    printf '{'
+    jkey kind; printf '"motion"'
+    [ -z "$title" ] || { jkey title; json_arg "$title"; }
+    [ -z "$vis" ] || { jkey visibility; printf '"%s"' "$vis"; }
+    [ -z "$aspect" ] || { jkey aspect; printf '"%s"' "$aspect"; }
+    [ -z "$seconds" ] || { jkey duration; printf '%s' "$seconds"; }
+    printf '}'
+  } > "$TMP/motion.json"
+  api_auth POST /api/artifacts -H "Content-Type: application/json" --data-binary "@$TMP/motion.json"
+  ACCEPT="text/plain"
+  case "$STATUS" in
+    2??) ;;
+    400|413) die 2 "$(error_text)" ;;
+    403|429) die 4 "$(json_get str message || error_text)" ;;
+    404|409|503) die 1 "$(json_get str message || error_text)" ;;
+    *) fail_http ;;
+  esac
+  if [ -n "$as_json" ]; then
+    cat "$TMP/body"
+    printf '\n'
+    return 0
+  fi
+  printf '%s\n' "$(json_get str url)"
+  id="$(json_get str id)"
+  seq="$(json_get raw seq)"
+  note "motion $id, seq $seq: a title over a bar; change it with foldrender edit $id --ops FILE --base $seq (help motion); its MP4 is made on its page (Export MP4)"
+}
+
+# new deck [--title T] [--aspect 16:9|4:3] [--theme FILE.json]: a slide deck,
+# one title slide (its title the deck's). Prints its address; stderr says its
+# id and seq (the base of the first edit --ops).
+cmd_deck_new() {
+  local as_json="" title="" vis="" aspect="" theme="" c id seq
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --title) need $# "$1"; title="$2"; shift 2 ;;
+      --aspect) need $# "$1"; case "$2" in 16:9|4:3) aspect="$2" ;; *) die 2 "--aspect is 16:9 or 4:3" ;; esac; shift 2 ;;
+      --theme) need $# "$1"; theme="$2"; shift 2 ;;
+      --private) vis="private"; shift ;;
+      --link-access) vis="link"; shift ;;
+      --public) vis="public"; shift ;;
+      --json) as_json=1; shift ;;
+      -*) die 2 "unknown option: $1 (foldrender help deck)" ;;
+      *) die 2 "foldrender new deck takes no FILE: its slides are written with foldrender edit DECK --ops FILE (help deck)" ;;
+    esac
+  done
+  if [ -n "$theme" ]; then
+    [ -f "$theme" ] || die 2 "no such file: $theme"
+    c="$(tr -d ' \t\r\n' < "$theme" | head -c 1)"
+    [ "$c" = '{' ] || die 2 "--theme takes a JSON object: {\"accent\":\"#3b5993\",\"heading\":\"Georgia, serif\"} (foldrender help deck)"
+  fi
+  require_token
+  ACCEPT="application/json"
+  {
+    printf '{'
+    jkey kind; printf '"deck"'
+    [ -z "$title" ] || { jkey title; json_arg "$title"; }
+    [ -z "$vis" ] || { jkey visibility; printf '"%s"' "$vis"; }
+    [ -z "$aspect" ] || { jkey aspect; printf '"%s"' "$aspect"; }
+    [ -z "$theme" ] || { jkey theme; cat "$theme"; }
+    printf '}'
+  } > "$TMP/deck.json"
+  api_auth POST /api/artifacts -H "Content-Type: application/json" --data-binary "@$TMP/deck.json"
+  ACCEPT="text/plain"
+  case "$STATUS" in
+    2??) ;;
+    400|413) die 2 "$(error_text)" ;;
+    403|429) die 4 "$(json_get str message || error_text)" ;;
+    404|409|503) die 1 "$(json_get str message || error_text)" ;;
+    *) fail_http ;;
+  esac
+  if [ -n "$as_json" ]; then
+    cat "$TMP/body"
+    printf '\n'
+    return 0
+  fi
+  printf '%s\n' "$(json_get str url)"
+  id="$(json_get str id)"
+  seq="$(json_get raw seq)"
+  note "deck $id, seq $seq: one title slide; add slides with foldrender edit $id --ops FILE --base $seq (help deck)"
+}
+
+# export DECK FILE.pptx: a deck as a PowerPoint file (every text box a text
+# box, the notes, hidden slides hidden). Never overwrites. Counts against the
+# account's 200 files a day.
+cmd_deck_export() {
+  [ $# -eq 2 ] || die 2 "usage: foldrender export DECK FILE.pptx"
+  local target="$1" file="$2"
+  [ ! -e "$file" ] || die 1 "$file already exists; choose another name"
+  require_token
+  page_id "$target"
+  check_slug "$PAGE_ID"
+  ACCEPT="application/vnd.openxmlformats-officedocument.presentationml.presentation"
+  api_auth GET "/api/artifacts/$PAGE_ID/deck?format=pptx"
+  ACCEPT="text/plain"
+  case "$STATUS" in
+    200) ;;
+    404) die 7 "no deck named $PAGE_ID that you may read" ;;
+    400|403|413) die 2 "$(json_get str error || error_text)" ;;
+    429) die 4 "$(json_get str error || error_text)" ;;
+    503) die 1 "$(json_get str error || error_text)" ;;
+    *) fail_http ;;
+  esac
+  [ "$(head -c 2 "$TMP/body")" = "PK" ] || die 1 "the server did not send a PowerPoint file"
+  cp "$TMP/body" "$file"
+  printf '%s\n' "$file"
+  note "deck $PAGE_ID as $file (seq $(header_value x-deck-seq))"
+}
+
 # new sheet [--title T] [--from FILE.xlsx|FILE.csv [--tab NAME]]: a sheet,
 # empty or made of the file (a new sheet each time: a file is never poured
 # into one that is open). Prints its address; stderr says its id, its seq (the
@@ -4090,7 +4354,7 @@ cmd_edit_ops() {
   api_auth POST "/api/artifacts/$PAGE_ID/ops" -H "Content-Type: application/json" ${oh[@]+"${oh[@]}"} --data-binary "@$TMP/edit.json"
   ACCEPT="text/plain"
   case "$STATUS" in
-    404) die 7 "no sheet named $PAGE_ID that you may edit" ;;
+    404) die 7 "no sheet, deck or motion named $PAGE_ID that you may edit" ;;
     409) die 10 "$(error_text) (seq $(json_get raw seq))" ;;
     400|413) die 10 "the change did not apply: $(error_text); nothing was changed" ;;
     429) die 4 "$(error_text)" ;;
@@ -7163,7 +7427,7 @@ cmd_help() {
 foldrender publishes HTML pages as links and reads pages back as text.
   publish FILE...      publish (or update) pages; prints each address
   edit PAGE            change part of a page: --old TEXT --new TEXT
-  new sheet|doc        a sheet (--from FILE.xlsx|.csv) or a doc (--from FILE.md): help sheet, help doc
+  new sheet|doc|deck|motion|design  (help KIND); design show prints your look as CSS
   read PAGE            the page as Markdown with its annotations (notes, marks,
                        ink) when signed in; stops at ~6k tokens (--section N)
   ls [WORDS]           your newest pages, id and address (--all, --duplicates)
@@ -7241,8 +7505,9 @@ foldrender edit PAGE --edits FILE|-    (JSON: [{"old": "...", "new": "..."}, ...
   Prints the address; stderr says the new revision and the lines changed.
   Like publish, it says which agent session made the revision (foldrender
   help publish); --no-session leaves it out.
-foldrender edit SHEET --ops FILE|- --base SEQ | --undo SEQ
-  A sheet's changes, against the seq foldrender read printed (help sheet).
+foldrender edit SHEET|DECK|MOTION --ops FILE|- --base SEQ | --undo SEQ
+  A sheet's, a deck's or a motion's changes, against the seq foldrender read
+  printed (help sheet, help deck, help motion).
 EOF
     ;;
     read) cat <<'EOF'
@@ -8158,6 +8423,103 @@ foldrender export DOC FILE.docx | FILE.md | FILE.html
   Never overwrites. Word files: 200 a day an account (exit 4 past it).
 EOF
     ;;
+    design) cat <<'EOF'
+foldrender new design [--title T] [--theme FILE.json] [--private|--link-access|--public] [--json]
+  An account's look: six colours, two faces, a corner and a logo, edited on
+  its page (a preview beside it). --theme FILE.json: {"bg","surface","text",
+  "muted","accent","on_accent": "#rrggbb", "heading","body": a font stack,
+  "radius": 0-64}.
+foldrender design show [ID] [--json]
+  Its tokens as CSS custom properties, for a page you write: --fr-bg,
+  --fr-surface, --fr-text, --fr-muted, --fr-accent, --fr-on-accent,
+  --fr-font-heading, --fr-font-body, --fr-radius. With no ID, the account's
+  newest design. --json has its record (the logo as a data: URL, its notes)
+  and the same CSS. Paste the CSS in a page's <style> and use var(--fr-accent).
+foldrender design use [DESIGN] DECK|MOTION
+  Puts the design's theme on a deck or a motion you own, in one change, and
+  notes which design it came from (with no DESIGN, the account's newest).
+  Prints the deck's or motion's new seq.
+foldrender read DESIGN
+  Its tokens as a table and as CSS, and its notes.
+foldrender edit DESIGN --ops FILE --base SEQ
+  [{"k":"s","coll":"design","id":"design","p":{"theme":{...},"notes":"..."}}]
+EOF
+    ;;
+    motion) cat <<'EOF'
+foldrender new motion [--title T] [--aspect 16:9|9:16|1:1] [--seconds N] [--private|--link-access|--public] [--json]
+  A short animated scene (1 to 300 seconds, 5 to start): its title fading in
+  over a bar that grows. Prints its address, where it plays, is edited (a
+  timeline of layers and their keys) and is exported as an MP4 (in the
+  browser, which needs a video encoder: a current Chrome, Edge, Safari or Firefox).
+foldrender read MOTION [--json]
+  Its length and aspect, then each layer (top first) with when it is on, its
+  words, and what its keys do in time; and the seq the next change names.
+  --json has every layer's place and every key.
+foldrender edit MOTION --ops FILE|- --base SEQ    (or --undo SEQ)
+  One batch, all of it or none (exit 10 with the reason), against the seq
+  you read. FILE is a JSON array, at most 500 changes:
+    {"k":"a","coll":"layer","n":{"id":"l3","type":"text","order":3,"start":1,"end":5,
+      "x":160,"y":500,"w":960,"h":90,"text":"Out now","size":56,"color":"accent"}}
+    {"k":"a","coll":"key","n":{"id":"k9","layer":"l3","t":1,"opacity":0,"y":30}}
+    {"k":"a","coll":"key","n":{"id":"k10","layer":"l3","t":1.6,"opacity":1,"y":0,"ease":"out"}}
+    {"k":"s","coll":"scene","id":"scene","p":{"duration":8,"bg":"#101820"}}
+  The stage is 1280 x 720 units (9:16: 720 x 1280; 1:1: 1080 x 1080). A
+  layer: id, type text|shape|image, order (higher on top), start and end
+  (seconds), x, y, w, h, text (at most 2,000 characters), size, bold, italic,
+  align, color, fill, line (a theme colour: text, muted, accent, on_accent,
+  surface, bg; or #rrggbb), shape (rect, round, ellipse, line), src (a data:
+  URL of a png, jpeg, gif or webp, at most 60,000 characters), alt, name. A
+  key: id, layer, t (seconds), and any of x, y (moved from where the layer is
+  placed), scale (0.01-20), rotate (degrees), opacity (0-1), ease (linear, in,
+  out, in-out, step: the way into this key). Between two keys each property
+  is eased; before the first and after the last the nearest holds. The scene:
+  duration, aspect, fps (24, 30, 60), bg, theme. Remove a layer's keys in the
+  batch that removes it. At most 200 layers, 4,000 keys, 200 a layer. A
+  collaborator (invited at edit) changes layers, keys and the scene.
+  The MP4 is made on the motion's page, in the browser; the server makes none.
+EOF
+    ;;
+    deck) cat <<'EOF'
+foldrender new deck [--title T] [--aspect 16:9|4:3] [--theme FILE.json] [--private|--link-access|--public] [--json]
+  A slide deck: one title slide to start (its title the deck's). Prints its
+  address, where it is edited and presented (a person drags, resizes and types
+  on the slides there; Present, Presenter view, Export PowerPoint or PDF).
+  --theme FILE.json: {"bg","surface","text","muted","accent","on_accent":
+  "#rrggbb", "heading","body": a font stack, "radius": 0-64}.
+foldrender read DECK [--json]
+  The slides in order, a section each: its title, its words top to bottom,
+  an image by its alt, its speaker notes; and the seq the next change names.
+  --json has every box with its place, and the theme.
+foldrender edit DECK --ops FILE|- --base SEQ    (or --undo SEQ)
+  One batch, all of it or none (exit 10 with the reason), against the seq
+  you read. FILE is a JSON array, at most 500 changes:
+    {"k":"a","coll":"slide","n":{"id":"s2","order":2,"layout":"title-body","notes":"..."}}
+    {"k":"a","coll":"box","n":{"id":"b5","slide":"s2","type":"text","role":"title",
+      "x":96,"y":56,"w":1088,"h":100,"text":"Revenue","size":48,"bold":true}}
+    {"k":"s","coll":"box","id":"b5","p":{"text":"Revenue, Q4"}}      set
+    {"k":"d","coll":"box","id":"b5"}                                 remove
+    {"k":"s","coll":"deck","id":"deck","p":{"theme":{...},"aspect":"4:3"}}
+  The stage is 1280 x 720 units (4:3: 960 x 720); a box stays on it. A slide:
+  id, order (a number: between two, the middle), layout (title, title-body,
+  two-col, big-number, quote, image, blank), notes, hidden, bg, transition
+  (none, fade, push). A box: id, slide, type text|shape|image, x, y, w, h, z,
+  role (title, subtitle, body, caption, number, quote), text (plain: a line
+  a paragraph, "- " a bullet; at most 10,000 characters), size (px at the
+  stage's size), bold, italic, align (left, center, right), valign (top,
+  middle, bottom), color, fill, line (a theme colour: text, muted, accent,
+  on_accent, surface, bg; or #rrggbb), shape (rect, round, ellipse, line,
+  arrow), src (a data: URL of a png, jpeg, gif or webp, at most 60,000
+  characters) and alt. Remove a slide's boxes in the batch that removes it
+  (a box on a slide that is not there is not kept). A deck holds at most 200
+  slides, 120 boxes a slide. A collaborator (invited at edit) changes slides,
+  boxes and the theme.
+foldrender export DECK FILE.pptx
+  The deck as a PowerPoint file: every text box a real text box (PowerPoint,
+  Keynote, Google Slides and LibreOffice edit its words), shapes, pictures,
+  the speaker notes, hidden slides hidden. 200 files a day an account (exit 4
+  past it). A PDF is printed from the deck's page (Export, PDF).
+EOF
+    ;;
     canvas) cat <<'EOF'
 foldrender canvas FILE|PAGE...|PLAN.canvas [options]
   A new canvas: each file or page becomes a card (up to 24; a card 2 MB at
@@ -8276,6 +8638,8 @@ foldrender export SHEET FILE.xlsx | FILE.csv [--tab NAME]
   One sheet as a file (help sheet).
 foldrender export DOC FILE.docx | FILE.md | FILE.html
   One doc as a file (help doc).
+foldrender export DECK FILE.pptx
+  One deck as a PowerPoint file (help deck).
 EOF
     ;;
     login|logout|whoami) cat <<'EOF'
@@ -8436,7 +8800,7 @@ main() {
   local cmd="${1:-help}"
   [ $# -eq 0 ] || shift
   case "$cmd" in
-    login|logout|auth|account|export|whoami|publish|edit|share|mv|move|merge|list|ls|read|cat|versions|restore|undo|canvas|answers|desk|pack|bridge|rm|delete|open|upgrade|billing|data|version|new|doc)
+    login|logout|auth|account|export|whoami|publish|edit|share|mv|move|merge|list|ls|read|cat|versions|restore|undo|canvas|answers|desk|pack|bridge|rm|delete|open|upgrade|billing|data|version|new|doc|design)
       if help_asked "$cmd" "$@"; then
         case "$cmd" in
           list) cmd_help ls ;;
@@ -8444,7 +8808,7 @@ main() {
           move) cmd_help mv ;;
           auth) cmd_help login ;;
           version) cmd_help ;;
-          new) case "${1:-}" in doc) cmd_help doc ;; *) cmd_help sheet ;; esac ;;
+          new) case "${1:-}" in doc) cmd_help doc ;; deck) cmd_help deck ;; motion) cmd_help motion ;; design) cmd_help design ;; *) cmd_help sheet ;; esac ;;
           desk) case "${1:-}" in mem) cmd_help desk-mem ;; workspace) cmd_help desk-workspace ;; *) cmd_help desk ;; esac ;;
           *) cmd_help "$cmd" ;;
         esac
@@ -8483,6 +8847,7 @@ main() {
     canvas) cmd_canvas "$@" ;;
     new) cmd_new "$@" ;;
     doc) cmd_doc "$@" ;;
+    design) cmd_design "$@" ;;
     answers) cmd_answers "$@" ;;
     desk) cmd_desk "$@" ;;
     thread) cmd_thread "$@" ;;
