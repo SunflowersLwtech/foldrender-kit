@@ -37,7 +37,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.26.0
+FR_CLI_VERSION=0.27.0
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -45,7 +45,7 @@ FR_BRIDGE_SHA256=0474aa21041e7549ed17addd7c5c3994282178184b4235b43a699cf8b27fdaa
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=0ea29ce42803739661b41a9f9f5b7230a5b69dd667b3b210f5fdc6ad7ce6a7f5
+FR_DESK_AGENT_SHA256=2480df4ef8aec8df49dfa4f622d628e587f92d62ee1ce6a1bd88a69aaaa4f37d
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -3015,6 +3015,53 @@ PY
   esac
 }
 
+# A refused restore's way out, from an answer (or its if_none) in FILE:
+# bounds_which the pages to delete as its bounds say them, purge_words the
+# purge of pages deleted after it, named_ids the ids of the pages it names
+# (delete_these), space-separated, or nothing.
+bounds_which() {
+  local most fewer lpages="" lbytes="" inall=""
+  most="$(json_get raw delete_at_most 2>/dev/null "$1")"
+  fewer="$(json_get raw delete_pages_at_most 2>/dev/null "$1")"
+  if json_get raw delete_at_least > "$TMP/least" 2>/dev/null "$1"; then
+    lpages="$(json_get raw pages "$TMP/least" 2>/dev/null)"
+    lbytes="$(json_get raw bytes "$TMP/least" 2>/dev/null)"
+  fi
+  if [ -n "$lpages" ] && [ "$fewer" != 1 ]; then
+    # Several pages: their count and bytes in all, as the server bounds them.
+    case "$lbytes" in ''|0) ;; *) inall=", $lbytes bytes or more in all" ;; esac
+    printf '%s' "PAGE... ($lpages or more pages$inall${fewer:+; $fewer pages or fewer}${most:+, $most bytes or less in all}: foldrender ls --json gives each page's size)"
+  elif [ -n "$lbytes" ] && [ "$lbytes" != 0 ] && [ -n "$most" ]; then
+    printf '%s' "PAGE of between $lbytes and $most bytes (foldrender ls --json gives each page's size)"
+  elif [ -n "$lbytes" ] && [ "$lbytes" != 0 ]; then
+    printf '%s' "PAGE of $lbytes bytes or more (foldrender ls --json gives each page's size)"
+  elif [ -n "$most" ]; then
+    printf '%s' "PAGE of $most bytes or less (foldrender ls --json gives each page's size)"
+  else
+    printf '%s' "PAGE (foldrender ls lists them)"
+  fi
+}
+purge_words() {
+  local pages="" bytes="" words="pages in the bin you no longer need that were deleted after it: those listed above it by foldrender bin"
+  if json_get raw purge_at_least > "$TMP/purge" 2>/dev/null "$1"; then
+    bytes="$(json_get raw bytes "$TMP/purge" 2>/dev/null)"
+    pages="$(json_get raw pages "$TMP/purge" 2>/dev/null)"
+  fi
+  case "$pages" in ''|0|1) ;; *) words="$words, $pages or more of them" ;; esac
+  case "$bytes" in ''|0) ;; *) words="$words, $bytes bytes or more in all" ;; esac
+  printf '%s' "$words"
+}
+named_ids() {
+  local obj ids=""
+  json_get items delete_these 2>/dev/null "$1" > "$TMP/these" || return 0
+  while IFS= read -r obj; do
+    [ -n "$obj" ] || continue
+    printf '%s\n' "$obj" > "$TMP/one"
+    ids="${ids:+$ids }$(json_get str id 2>/dev/null "$TMP/one")"
+  done < "$TMP/these"
+  printf '%s' "$ids"
+}
+
 # unrm PAGE...: brings each named page back from the recycle bin — a page
 # `foldrender rm` deleted stays there 30 days, with its body, versions, people,
 # ink and answers; unrm opens its address again as it was. PAGE is its id, its
@@ -3054,47 +3101,57 @@ cmd_unrm() {
     # delete_at_least's pages and bytes or more, and delete_at_most bytes and
     # delete_pages_at_most pages or fewer in all; or none until pages in the
     # bin deleted after it are deleted for good (bin_would_take_it,
-    # purge_at_least).
+    # purge_at_least). For an account of many pages it names the pages
+    # (delete_these: those deleted, the restore after them brings it back),
+    # or says it found no set and the bounds of one (unchecked: there may be
+    # none), with what to do if none of the user's pages add up to them
+    # (if_none: the purge and the deletes after it, their pages named where it
+    # found a set, and then said first).
     if [ "$STATUS" = 403 ] && grep -qE '"(quota_exceeded|storage_exceeded)"' "$TMP/body"; then
-      local msg up="" takes="" most="" pbytes="" which="PAGE (foldrender ls lists them)" lpages="" lbytes="" fewer=""
+      local msg up="" takes="" pbytes="" which these unchecked=""
       msg="$(json_get str message 2>/dev/null)"
       takes="$(json_get raw bin_would_take_it 2>/dev/null)"
-      most="$(json_get raw delete_at_most 2>/dev/null)"
-      fewer="$(json_get raw delete_pages_at_most 2>/dev/null)"
-      local ppages=""
-      if json_get raw purge_at_least > "$TMP/purge" 2>/dev/null; then
-        pbytes="$(json_get raw bytes "$TMP/purge" 2>/dev/null)"
-        ppages="$(json_get raw pages "$TMP/purge" 2>/dev/null)"
-      fi
-      if json_get raw delete_at_least > "$TMP/least" 2>/dev/null; then
-        lpages="$(json_get raw pages "$TMP/least" 2>/dev/null)"
-        lbytes="$(json_get raw bytes "$TMP/least" 2>/dev/null)"
-      fi
+      unchecked="$(json_get raw unchecked 2>/dev/null)"
+      pbytes="$(json_get raw purge_at_least 2>/dev/null)"
       case "$msg" in *"or upgrade"*) up=", or foldrender upgrade" ;; esac
-      if [ -n "$lpages" ] && [ "$fewer" != 1 ]; then
-        # Several pages: their count and bytes in all, as the server bounds them.
-        local inall=""
-        case "$lbytes" in ''|0) ;; *) inall=", $lbytes bytes or more in all" ;; esac
-        which="PAGE... ($lpages or more pages$inall${fewer:+; $fewer pages or fewer}${most:+, $most bytes or less in all}: foldrender ls --json gives each page's size)"
-      elif [ -n "$lbytes" ] && [ "$lbytes" != 0 ] && [ -n "$most" ]; then
-        which="PAGE of between $lbytes and $most bytes (foldrender ls --json gives each page's size)"
-      elif [ -n "$lbytes" ] && [ "$lbytes" != 0 ]; then
-        which="PAGE of $lbytes bytes or more (foldrender ls --json gives each page's size)"
-      elif [ -n "$most" ]; then
-        which="PAGE of $most bytes or less (foldrender ls --json gives each page's size)"
-      fi
+      these="$(named_ids "$TMP/body")"
+      which="$(bounds_which "$TMP/body")"
+      [ -z "$these" ] || which="$these"
       note "${msg:-not restored: $PAGE_ID: your plan has no room for it}"
+      # Said by its bounds alone (unchecked): no set of the user's pages was
+      # found in them, and there may be none, so they are printed as what
+      # would keep it, not as a way to follow; its fallback (if_none) first
+      # where it names its pages (it is sure), else after them.
+      local keep="to keep it" room="to make room" fwhich="" sure=""
+      if [ "$unchecked" = true ]; then
+        keep="if some of your pages add up to this (none was found, and there may be none)"
+        if json_get raw if_none > "$TMP/ifnone" 2>/dev/null; then
+          fwhich="$(named_ids "$TMP/ifnone")"
+          if [ -n "$fwhich" ]; then
+            note "to bring it back: foldrender bin purge PAGE ($(purge_words "$TMP/ifnone")), then foldrender rm $fwhich, then foldrender unrm $PAGE_ID"
+            keep="or, $keep"
+            sure=1
+          else
+            fwhich="$(bounds_which "$TMP/ifnone")"
+          fi
+        fi
+        room="$keep"
+      fi
       if [ "$takes" = true ] && [ -n "$pbytes" ]; then
-        local after="pages in the bin you no longer need that were deleted after it: those listed above it by foldrender bin"
-        case "$ppages" in ''|0|1) ;; *) after="$after, $ppages or more of them" ;; esac
-        [ "$pbytes" != 0 ] && after="$after, $pbytes bytes or more in all"
-        note "to keep it: foldrender bin purge PAGE ($after), then foldrender rm $which$up, then foldrender unrm $PAGE_ID"
+        note "$keep: foldrender bin purge PAGE ($(purge_words "$TMP/body")), then foldrender rm $which$up, then foldrender unrm $PAGE_ID"
       elif [ "$takes" = true ]; then
         # No delete keeps it: an upgrade does, where the plan has one to go to
         # (the server names it then; a pro plan's answer does not).
         case "$msg" in *upgrade*) note "to keep it: foldrender upgrade, then foldrender unrm $PAGE_ID" ;; esac
       else
-        note "to make room: foldrender rm $which$up, then foldrender unrm $PAGE_ID"
+        note "$room: foldrender rm $which$up, then foldrender unrm $PAGE_ID"
+      fi
+      if [ "$unchecked" = true ] && [ -z "$sure" ]; then
+        if [ -n "$fwhich" ]; then
+          note "if none of your pages add up to that: foldrender bin purge PAGE ($(purge_words "$TMP/ifnone")), then foldrender rm $fwhich, then foldrender unrm $PAGE_ID"
+        else
+          case "$msg" in *upgrade*) note "if none of your pages add up to that: foldrender upgrade, then foldrender unrm $PAGE_ID" ;; esac
+        fi
       fi
       failed=1
       continue
@@ -4992,7 +5049,7 @@ cmd_desk() {
             esac
           done
           case "$role" in feed|agent) ;; *) die 2 "--role is feed (sends snapshots, reads nothing) or agent (asks, tasks, reads the answers)" ;; esac
-          [ -n "$name" ] || die 2 "--name names who holds it, e.g. --name secretary"
+          [ -n "$name" ] || die 2 "--name names who holds it, e.g. --name assistant"
           printf '{"role":"%s","name":%s}' "$role" "$(json_arg "$name")" > "$TMP/req"
           require_token
           desk_send POST /tokens -H "$(auth_header)" -H "Content-Type: application/json" --data-binary "@$TMP/req"
@@ -6468,6 +6525,17 @@ node_json_lines() {
   ' "$1"
 }
 
+# Where the command's own programs are fetched from (the bridge and the desk
+# agent, each by its sha256, then checked against it): for foldrender.dev's
+# API, the Worker's copy on a.foldrender.dev, which Cloudflare sends free (the
+# site's copy is Vercel's, billed by the byte); for any other API, its host's.
+install_base() {
+  case "$API" in
+    https://foldrender.dev/artifacts) printf '%s' "https://a.foldrender.dev" ;;
+    *) printf '%s' "${API%/artifacts}" ;;
+  esac
+}
+
 # The foldrender command itself, by its absolute path (what a service runs).
 cli_path() {
   local p="$0" d
@@ -6479,8 +6547,9 @@ cli_path() {
 # foldrender desk agent run|install|status|uninstall: the program that tells
 # the desk what runs on this computer (herdr's agents and the machine's load),
 # kept running by install. It is a Node program (foldrender-desk-agent.mjs)
-# fetched from the site once, checked against FR_DESK_AGENT_SHA256 and kept in
-# the cache folder, as the bridge is. Its token is the machine's (frdm_), in a
+# fetched once (install_base: a.foldrender.dev for foldrender.dev's API),
+# checked against FR_DESK_AGENT_SHA256 and kept in the cache folder, as the
+# bridge is. Its token is the machine's (frdm_), in a
 # 600 file; install makes one with your sign-in when there is none.
 cmd_desk_agent() {
   local op="${1:-}" node_major file cache url got cli want_token="" name="" replace="" a
@@ -6502,8 +6571,8 @@ cmd_desk_agent() {
     file="$cache/desk-agent-$FR_DESK_AGENT_SHA256.mjs"
     if [ ! -f "$file" ] || [ "$(sha256_of "$file")" != "$FR_DESK_AGENT_SHA256" ]; then
       mkdir -p "$cache" || die 1 "cannot make $cache"
-      url="${API%/artifacts}/install/desk-agent/$FR_DESK_AGENT_SHA256.mjs"
-      curl -fsS --connect-timeout 15 --max-time 120 -o "$TMP/desk-agent.mjs" "$url" 2>"$TMP/err" || die 6 "cannot fetch the desk agent from $url ($(curl_error))"
+      url="$(install_base)/install/desk-agent/$FR_DESK_AGENT_SHA256.mjs"
+      curl -fsS -L --max-redirs 3 --connect-timeout 15 --max-time 120 -o "$TMP/desk-agent.mjs" "$url" 2>"$TMP/err" || die 6 "cannot fetch the desk agent from $url ($(curl_error))"
       got="$(sha256_of "$TMP/desk-agent.mjs")"
       [ "$got" = "$FR_DESK_AGENT_SHA256" ] || die 1 "the desk agent at $url is not the one this foldrender ($FR_CLI_VERSION) runs; update foldrender: curl -fsSL ${API%/artifacts}/install.sh | sh"
       mv "$TMP/desk-agent.mjs" "$file" || die 1 "cannot write $file"
@@ -6559,9 +6628,9 @@ desk_agent_token_ok() {
 
 # foldrender bridge --page PAGE [--agent NAME] [--dir DIR]: connects a coding
 # agent on this computer to the page's agent sidebar, until stopped. The bridge
-# is a Node program (foldrender-bridge.mjs) fetched from the site once, checked
-# against FR_BRIDGE_SHA256 and kept in the cache folder; the sign-in goes to it
-# in the environment, never on its command line.
+# is a Node program (foldrender-bridge.mjs) fetched once (install_base),
+# checked against FR_BRIDGE_SHA256 and kept in the cache folder; the sign-in
+# goes to it in the environment, never on its command line.
 # foldrender thread ...: the owner's messages on their desk (the second
 # version's room), each the root of a tree on the page: what they said, then
 # the assistant's replies, the sessions sent to work on it and what those
@@ -7188,8 +7257,8 @@ cmd_bridge() {
       mkdir -p "$cache" || die 1 "cannot make $cache"
       # By its sha256: every released bridge stays on the site under its own
       # name, so an older foldrender keeps the bridge it was made with.
-      url="${API%/artifacts}/install/bridge/$FR_BRIDGE_SHA256.mjs"
-      curl -fsS --connect-timeout 15 --max-time 120 -o "$TMP/bridge.mjs" "$url" 2>"$TMP/err" || die 6 "cannot fetch the bridge from $url ($(curl_error))"
+      url="$(install_base)/install/bridge/$FR_BRIDGE_SHA256.mjs"
+      curl -fsS -L --max-redirs 3 --connect-timeout 15 --max-time 120 -o "$TMP/bridge.mjs" "$url" 2>"$TMP/err" || die 6 "cannot fetch the bridge from $url ($(curl_error))"
       got="$(sha256_of "$TMP/bridge.mjs")"
       [ "$got" = "$FR_BRIDGE_SHA256" ] || die 1 "the bridge at $url is not the one this foldrender ($FR_CLI_VERSION) runs; update foldrender: curl -fsSL ${API%/artifacts}/install.sh | sh"
       mv "$TMP/bridge.mjs" "$file" || die 1 "cannot write $file"
@@ -7804,7 +7873,7 @@ its words begin by saying not to act on it again.
                        Refused (422, each reason named): no suggestion, no
                        --from, a background under 60 characters, a worker
                        session's name in it (the owner does not know who
-                       hm-ship or pr-captain is), a bare #113 with no words
+                       app-ship or pr-lead is), a bare #113 with no words
                        saying what it is, a rewrite with no --changed, a
                        question past 80 characters or on two lines, more than
                        2 options, anything that looks like a secret.
@@ -7856,7 +7925,7 @@ its words begin by saying not to act on it again.
                        corrected. Only the token that marked it corrects it
   batches [--limit N]  the batches sent, newest first
 Examples: foldrender desk card gw-caps --question "Raise the two monthly caps?" \
-            --suggest "Gateway to \$30, polyagent to \$20" --option "Only polyagent"
+            --suggest "Gateway to \$30, the coding agents to \$20" --option "Only the coding agents"
           foldrender desk outbox; foldrender desk outbox ack 7
           foldrender desk mark 12 done --key gw-caps --result "both raised from next month"
           foldrender desk mark 12 doing --key gw-caps --result "raising them now" --correct
@@ -8030,9 +8099,9 @@ foldrender desk mem COMMAND [--json]
   calls it, and nothing here calls a model when it is off.
 Examples: foldrender desk mem install --agent claude
           foldrender desk mem inject --repo foldrender
-          printf '%s' "$LAST_REPLY" | foldrender desk mem say - --kind stop --agent grok --machine devdesk
+          printf '%s' "$LAST_REPLY" | foldrender desk mem say - --kind stop --agent grok --machine build-box
           foldrender desk mem search "release window"
-          foldrender desk mem note "the retry loop was the bug" --kind discovery --source claude:fr-desk
+          foldrender desk mem note "the retry loop was the bug" --kind discovery --source claude:app-desk
           foldrender desk mem import claude-mem.jsonl
           foldrender desk mem todo set ship-1101 "merge #307" --status doing --field next="wait for CI"
           foldrender desk mem todo close ship-1101 "merge #307"

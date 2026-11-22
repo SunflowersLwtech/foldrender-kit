@@ -148,7 +148,7 @@ foldrender templates                           list the templates the site offer
 foldrender template <id>                       make a copy of a template in your space
 ```
 
-Delete a page only when the user asks. A deleted page is not gone: it sits in the recycle bin 30 days, and `unrm` (its id, or the address `rm` printed) restores it whole; `bin purge` removes it for real before the 30 days are up. The bin holds as many pages and bytes as the account's plan, so when it is full the oldest pages in it go for good sooner: do not tell the user a page is safe in the bin for 30 days after many deletes — check with `foldrender bin`, and pass on what `rm` says on stderr when a full bin's oldest page went for good. A restored page counts against the plan again: `unrm` with the plan's pages all live is refused and prints the commands that make room; follow them in order and no further (a delete into a full bin takes its oldest page for good, so they say the whole way at once: how many pages to delete and how many bytes in all, at least and at most, or which pages in the bin to purge first, or that only an upgrade brings it back; deleting more than they name can take the page being restored). Followed, the next `unrm` brings the page back. For an account of very many pages the server may say the way out by its bounds alone (`unchecked` in `--json`): any pages within them keep the page; if none of the user's add up to that, only an upgrade brings it back. Pass that on as it is said. A page in the bin keeps its name: a publish or `mv` to it is refused with that page's id and both ways out (`unrm` it, or `bin purge` it to free the name); ask the user which.
+Delete a page only when the user asks. A deleted page is not gone: it sits in the recycle bin 30 days, and `unrm` (its id, or the address `rm` printed) restores it whole; `bin purge` removes it for real before the 30 days are up. The bin holds as many pages and bytes as the account's plan, so when it is full the oldest pages in it go for good sooner: do not tell the user a page is safe in the bin for 30 days after many deletes — check with `foldrender bin`, and pass on what `rm` says on stderr when a full bin's oldest page went for good. A restored page counts against the plan again: `unrm` with the plan's pages all live is refused and prints the commands that make room; follow them in order and no further (a delete into a full bin takes its oldest page for good, so they say the whole way at once: how many pages to delete and how many bytes in all, at least and at most, or which pages in the bin to purge first, or that only an upgrade brings it back; deleting more than they name can take the page being restored). Followed, the next `unrm` brings the page back. For an account of very many pages the server names the pages to delete where it finds a set of them (`delete_these` in `--json`; `unrm` prints them as `foldrender rm ID…`): delete exactly those, after the purge it asks, then `unrm`. Otherwise it says it found no set of the user's pages sure to bring the page back, and that there may be none (`unchecked`): pages within its bounds would keep it, if the user has some. It says what to do instead (`if_none`): a purge, then the pages it names (printed first, `to bring it back:`; that way is sure) or bounds (printed after the bounds, `if none of your pages add up to that:`), or that only an upgrade brings it back. Pass that on as it is said: do not tell the user the bounds will work, and since a purge deletes bin pages for good, ask before following a way with one. A page in the bin keeps its name: a publish or `mv` to it is refused with that page's id and both ways out (`unrm` it, or `bin purge` it to free the name); ask the user which.
 
 A sheet, a doc, a deck — the kinds people edit live at their link — are shared, deleted and brought back like a page: `foldrender share <sheet> --public | --link | --private | --reset-link` (its link on stdout, with the key for a link one; private or a reset ends the links handed out before, and someone taken off stops editing at once), `share +login` and `--edit login`, `rm`, `unrm`, `bin purge`. They have no address to `mv` to and no version to `--pin`: both are refused.
 
@@ -433,9 +433,9 @@ A desk is one private page of the user's that shows, at a glance, what waits on 
 foldrender desk ask aws-pay --title "Bind a card to the AWS account for the new models?" \
   --context "The new models need a marketplace agreement, and that needs a card on file." \
   --suggest "Yes: set a budget alert first" --option "Not now" --product AWS --heavy
-foldrender desk ask passkey --title "Press the passkey on your second Mac" --hands --device mone --minutes 1
+foldrender desk ask passkey --title "Press the passkey on your second Mac" --hands --device office-mac --minutes 1
 foldrender desk ask holdings --title "Which shares do you hold?" --input --suggest "List the tickers, or write none"
-foldrender desk task t-desk --title "Desk, phase 1" --product FoldRender --session fr-desk
+foldrender desk task t-desk --title "Desk, phase 1" --product FoldRender --session app-desk
 foldrender desk task t-deploy --title "Deploy the site" --heartbeat 30    # no word for 30 min: the desk fails it and pushes
 foldrender desk fail t-desk --why "the deploy key was rejected"           # a task that went wrong, pushed once
 foldrender desk alerts --status open
@@ -475,15 +475,15 @@ Every account has a desk at `https://foldrender.dev/desk` (made the first time t
 ```bash
 foldrender desk card gw-caps --question "Raise the two monthly caps on the model gateway?" \
   --from "Model gateway, the \$6 cap ran out mid-month" \
-  --suggest "Gateway to \$30, polyagent to \$20: about \$15 more a month at most" \
-  --option "Only polyagent" \
-  --context "The gateway's \$6 monthly cap was used up on 11-02 and the agents' calls started failing. Raising it costs about \$15 more a month; leaving it means those agents stop until the month turns." --heavy --by qy-ship2
+  --suggest "Gateway to \$30, the coding agents to \$20: about \$15 more a month at most" \
+  --option "Only the coding agents" \
+  --context "The gateway's \$6 monthly cap was used up on 11-02 and the agents' calls started failing. Raising it costs about \$15 more a month; leaving it means those agents stop until the month turns." --heavy --by ops-lane
 foldrender desk cards                       # the open cards and how far each answer is
 foldrender desk card gw-caps --close        # not needed any more; refused while the user has an unsent answer on it (--force takes it off, the draft stays theirs)
 foldrender desk answers                     # what the user sent, for you alone (your token's own cursor)
 foldrender desk outbox                      # what the user sent, with the words to hand on
 foldrender desk outbox ack 7                # handed on (until then it is handed again)
-foldrender desk mark 12 done --key gw-caps --result "both raised from next month" --machine devdesk --link https://herdr.example/s/12
+foldrender desk mark 12 done --key gw-caps --result "both raised from next month" --machine build-box --link https://herdr.example/s/12
                                                      # read | doing | done; --machine / --link show on the owner's page
 foldrender desk mark 12 read --all          # every answer of the batch alike
 foldrender desk mark 12 doing --key gw-caps --result "raising them now" --correct   # change one you marked

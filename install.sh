@@ -10,7 +10,10 @@
 
 set -eu
 
-BASE="${FOLDRENDER_BASE:-https://foldrender.dev}"
+# Where the command and the skill are fetched from: the Worker's own copy of
+# them on a.foldrender.dev (Cloudflare's, free; foldrender.dev/install/* sends
+# you there too, with a redirect).
+BASE="${FOLDRENDER_BASE:-https://a.foldrender.dev}"
 BASE="${BASE%/}"
 BIN_DIR="$HOME/.local/bin"
 SKILL_NAME="foldrender-artifacts"
