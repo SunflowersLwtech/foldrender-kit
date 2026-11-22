@@ -37,7 +37,7 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.25.0
+FR_CLI_VERSION=0.26.0
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
@@ -45,7 +45,7 @@ FR_BRIDGE_SHA256=0474aa21041e7549ed17addd7c5c3994282178184b4235b43a699cf8b27fdaa
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=f9583eca47cce8b9e11d80fe21bde2c82e8ba17700d7b281c7ae19852162719b
+FR_DESK_AGENT_SHA256=0ea29ce42803739661b41a9f9f5b7230a5b69dd667b3b210f5fdc6ad7ce6a7f5
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -3049,20 +3049,44 @@ cmd_unrm() {
     # The plan has no room for it (a publish's own 403: a restored page holds
     # its quota again). The server's words, then the commands that make room.
     # A delete into a full bin deletes the bin's oldest for good, so the
-    # server says which delete keeps this page: any (nothing said), one of at
-    # most delete_at_most bytes, or none until pages in the bin deleted after
-    # it are deleted for good (bin_would_take_it, purge_at_least).
+    # server says, whole, which deletes keep this page and free enough for
+    # it: any one page (nothing said), or any set of pages of
+    # delete_at_least's pages and bytes or more, and delete_at_most bytes and
+    # delete_pages_at_most pages or fewer in all; or none until pages in the
+    # bin deleted after it are deleted for good (bin_would_take_it,
+    # purge_at_least).
     if [ "$STATUS" = 403 ] && grep -qE '"(quota_exceeded|storage_exceeded)"' "$TMP/body"; then
-      local msg up="" takes="" most="" pbytes="" which="PAGE (foldrender ls lists them)"
+      local msg up="" takes="" most="" pbytes="" which="PAGE (foldrender ls lists them)" lpages="" lbytes="" fewer=""
       msg="$(json_get str message 2>/dev/null)"
       takes="$(json_get raw bin_would_take_it 2>/dev/null)"
       most="$(json_get raw delete_at_most 2>/dev/null)"
-      if json_get raw purge_at_least > "$TMP/purge" 2>/dev/null; then pbytes="$(json_get raw bytes "$TMP/purge" 2>/dev/null)"; fi
+      fewer="$(json_get raw delete_pages_at_most 2>/dev/null)"
+      local ppages=""
+      if json_get raw purge_at_least > "$TMP/purge" 2>/dev/null; then
+        pbytes="$(json_get raw bytes "$TMP/purge" 2>/dev/null)"
+        ppages="$(json_get raw pages "$TMP/purge" 2>/dev/null)"
+      fi
+      if json_get raw delete_at_least > "$TMP/least" 2>/dev/null; then
+        lpages="$(json_get raw pages "$TMP/least" 2>/dev/null)"
+        lbytes="$(json_get raw bytes "$TMP/least" 2>/dev/null)"
+      fi
       case "$msg" in *"or upgrade"*) up=", or foldrender upgrade" ;; esac
-      [ -n "$most" ] && which="PAGE of $most bytes or less (foldrender ls --json gives each page's size)"
+      if [ -n "$lpages" ] && [ "$fewer" != 1 ]; then
+        # Several pages: their count and bytes in all, as the server bounds them.
+        local inall=""
+        case "$lbytes" in ''|0) ;; *) inall=", $lbytes bytes or more in all" ;; esac
+        which="PAGE... ($lpages or more pages$inall${fewer:+; $fewer pages or fewer}${most:+, $most bytes or less in all}: foldrender ls --json gives each page's size)"
+      elif [ -n "$lbytes" ] && [ "$lbytes" != 0 ] && [ -n "$most" ]; then
+        which="PAGE of between $lbytes and $most bytes (foldrender ls --json gives each page's size)"
+      elif [ -n "$lbytes" ] && [ "$lbytes" != 0 ]; then
+        which="PAGE of $lbytes bytes or more (foldrender ls --json gives each page's size)"
+      elif [ -n "$most" ]; then
+        which="PAGE of $most bytes or less (foldrender ls --json gives each page's size)"
+      fi
       note "${msg:-not restored: $PAGE_ID: your plan has no room for it}"
       if [ "$takes" = true ] && [ -n "$pbytes" ]; then
         local after="pages in the bin you no longer need that were deleted after it: those listed above it by foldrender bin"
+        case "$ppages" in ''|0|1) ;; *) after="$after, $ppages or more of them" ;; esac
         [ "$pbytes" != 0 ] && after="$after, $pbytes bytes or more in all"
         note "to keep it: foldrender bin purge PAGE ($after), then foldrender rm $which$up, then foldrender unrm $PAGE_ID"
       elif [ "$takes" = true ]; then
@@ -3326,6 +3350,11 @@ cmd_billing() {
 # read_get PATH: a GET on the read API, with the token when there is one, and
 # the page's link token when its address carried one (PAGE_K). Public pages
 # need neither, so a missing token is not an error here.
+# With no token, the read follows a redirect and says so (FoldRender-Follows):
+# foldrender.dev sends a large read, or one past the day it sends to readers
+# who are not signed in, to the same read on a.foldrender.dev, which is
+# FoldRender's too; there is no Authorization to drop on the way. With a
+# token it follows none, and is never sent one.
 read_get() {
   local path="$1"
   if [ -n "${PAGE_K:-}" ]; then
@@ -3337,7 +3366,7 @@ read_get() {
   if [ -n "$TOKEN" ]; then
     api GET "$path" -H "$(auth_header)"
   else
-    api GET "$path"
+    api GET "$path" -L --max-redirs 3 -H "FoldRender-Follows: 1"
   fi
 }
 
