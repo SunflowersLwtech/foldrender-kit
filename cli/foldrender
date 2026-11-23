@@ -459,6 +459,27 @@ resolve_address() {
   [ -n "$PAGE_ID" ] || die 1 "the server did not say which page $2 is"
 }
 
+# made_from TARGET: sets MADE_FROM to the id of the page or artifact TARGET
+# names (an id, an address or a link, as page_id takes it), for --made-from:
+# what a new one was made from. Empty TARGET, empty MADE_FROM. The server takes
+# it only when this account may read that one now (made_from_refused).
+made_from() {
+  MADE_FROM=""
+  [ -n "$1" ] || return 0
+  page_id "$1"
+  check_slug "$PAGE_ID"
+  MADE_FROM="$PAGE_ID"
+}
+
+# made_from_refused [LABEL]: a 400 whose code is made_from (no artifact this
+# account can read now: not there, in the recycle bin, or not shared with it)
+# ends the command, exit 2, with the server's words. Nothing was made. The
+# code comes as JSON, or as a text answer's "code: made_from" line.
+made_from_refused() {
+  [ "$STATUS" = 400 ] && grep -qE '"code" *: *"made_from"|^code: made_from$' "$TMP/body" || return 0
+  die 2 "${1:-}not made: $(error_text)"
+}
+
 # Percent-encodes every byte except unreserved characters.
 urlencode() {
   local s="$1" out="" i=0 c
@@ -1707,10 +1728,11 @@ cmd_account() {
 # publish FILE... [options]: each file to its page, one address a line on
 # stdout, in order; on stderr one line a page saying what the publish changed.
 cmd_publish() {
-  local files=() title="" slug="" vis="" share="" name="" folder="" folder_set="" as_json="" key="" allow_dup="" message="" f n=0
+  local files=() title="" slug="" vis="" share="" name="" folder="" folder_set="" as_json="" key="" allow_dup="" message="" made="" f n=0
   while [ $# -gt 0 ]; do
     case "$1" in
       -m|--message) need $# "$1"; message="$2"; shift 2 ;;
+      --made-from) need $# "$1"; made="$2"; shift 2 ;;
       --title) need $# "$1"; title="$2"; shift 2 ;;
       --slug|--id) need $# "$1"; slug="$2"; shift 2 ;;
       --idempotency-key) need $# "$1"; key="$2"; shift 2 ;;
@@ -1728,7 +1750,7 @@ cmd_publish() {
       *) files+=("$1"); shift ;;
     esac
   done
-  [ ${#files[@]} -gt 0 ] || die 2 "usage: foldrender publish FILE...|- [--title T] [--name N] [--folder F] [--slug ID] [--private|--link|--public|--share a,b] [--idempotency-key K] [--allow-duplicate] [--no-session] [--json]"
+  [ ${#files[@]} -gt 0 ] || die 2 "usage: foldrender publish FILE...|- [--title T] [--name N] [--folder F] [--slug ID] [--private|--link|--public|--share a,b] [--made-from PAGE] [--idempotency-key K] [--allow-duplicate] [--no-session] [--json]"
   case "$key" in
     '') ;;
     *[!A-Za-z0-9._:-]*) die 2 "--idempotency-key takes 8 to 128 letters, digits and . _ : -" ;;
@@ -1748,6 +1770,7 @@ cmd_publish() {
     vis=shared
   fi
   require_token
+  made_from "$made"
   # (What the command that runs this one names: the file, else the page.)
   case "${files[0]}" in -) made_by_header "${slug:-$name}" ;; *) made_by_header "${files[0]##*/}" ;; esac
   for f in "${files[@]}"; do
@@ -1840,6 +1863,7 @@ publish_one() {
   [ -z "$folder_set" ] || query="${query:+$query&}folder=$folder"
   [ -z "$allow_dup" ] || query="${query:+$query&}allow_duplicate=1"
   [ -z "$message" ] || query="${query:+$query&}m=$(urlencode "$message")"
+  [ -z "$MADE_FROM" ] || query="${query:+$query&}made_from=$MADE_FROM"
 
   [ -z "$as_json" ] || ACCEPT="application/json"
   if [ -n "$p_slug" ]; then
@@ -1889,6 +1913,7 @@ publish_one() {
   if [ "$STATUS" = 422 ] && grep -q idempotency_key_reused "$TMP/body"; then
     die 2 "${label}not published: the Idempotency-Key $PUB_KEY was used within the last day for a publish of other content. Use a new key for a new page, or leave --idempotency-key out."
   fi
+  made_from_refused "$label"
   expect_2xx
   if [ -n "$as_json" ]; then
     ACCEPT="text/plain"
@@ -3804,7 +3829,7 @@ cmd_canvas() {
     cmd_canvas_edit "$@"
     return
   fi
-  local items=() refs=() notes=() links=() plan="" it i n as_json="" ctitle="" cowner=""
+  local items=() refs=() notes=() links=() plan="" it i n as_json="" ctitle="" cowner="" made=""
   local vis="" share="" name="" folder="" id rev cards boxes
   ATT_KEYS=() ATT_PATHS=() ATT_BYTES=0 JSEP=""
   while [ $# -gt 0 ]; do
@@ -3819,6 +3844,7 @@ cmd_canvas() {
       --public) vis="public"; shift ;;
       --share) need $# "$1"; share="${2// /}"; shift 2 ;;
       --owner) need $# "$1"; check_logins "$2"; case "$2" in *,*) die 2 "--owner takes one GitHub login" ;; esac; cowner="$2"; shift 2 ;;
+      --made-from) need $# "$1"; made="$2"; shift 2 ;;
       --json) as_json=1; shift ;;
       -*) die 2 "unknown option: $1" ;;
       *.canvas|*.json) [ -z "$plan" ] || die 2 "a canvas takes one plan file"; plan="$1"; shift ;;
@@ -3866,6 +3892,7 @@ cmd_canvas() {
     } >> "$TMP/edges"
   done
   require_token
+  made_from "$made"
   for it in "${items[@]}"; do
     if [ -f "$it" ]; then
       refs+=("$it")
@@ -3883,6 +3910,7 @@ cmd_canvas() {
     [ -z "$vis" ] || { jkey visibility; printf '"%s"' "$vis"; }
     [ -z "$share" ] || { jkey share; json_array "$share"; }
     [ -z "$cowner" ] || { jkey owner; printf '"%s"' "$cowner"; }
+    [ -z "$MADE_FROM" ] || { jkey made_from; printf '"%s"' "$MADE_FROM"; }
     if [ -n "$plan" ]; then
       jkey plan
       cat "$plan"
@@ -3916,6 +3944,7 @@ cmd_canvas() {
   ACCEPT="application/json"
   api_auth POST /api/canvas -H "Content-Type: application/json" --data-binary "@$TMP/canvas.json"
   ACCEPT="text/plain"
+  made_from_refused
   case "$STATUS" in
     2??) ;;
     404)
@@ -3967,10 +3996,11 @@ cmd_new() {
 # faces, corner, logo) a deck or a motion takes (design use) and a page reads
 # (design show). Prints its address; stderr says its id.
 cmd_design_new() {
-  local as_json="" title="" vis="" theme="" c id
+  local as_json="" title="" vis="" theme="" made="" c id
   while [ $# -gt 0 ]; do
     case "$1" in
       --title) need $# "$1"; title="$2"; shift 2 ;;
+      --made-from) need $# "$1"; made="$2"; shift 2 ;;
       --theme) need $# "$1"; theme="$2"; shift 2 ;;
       --private) vis="private"; shift ;;
       --link-access) vis="link"; shift ;;
@@ -3986,17 +4016,20 @@ cmd_design_new() {
     [ "$c" = '{' ] || die 2 "--theme takes a JSON object: {\"accent\":\"#3b5993\",\"heading\":\"Georgia, serif\"} (foldrender help design)"
   fi
   require_token
+  made_from "$made"
   ACCEPT="application/json"
   {
     printf '{'
     jkey kind; printf '"design"'
     [ -z "$title" ] || { jkey title; json_arg "$title"; }
+    [ -z "$MADE_FROM" ] || { jkey made_from; printf '"%s"' "$MADE_FROM"; }
     [ -z "$vis" ] || { jkey visibility; printf '"%s"' "$vis"; }
     [ -z "$theme" ] || { jkey theme; cat "$theme"; }
     printf '}'
   } > "$TMP/design.json"
   api_auth POST /api/artifacts -H "Content-Type: application/json" --data-binary "@$TMP/design.json"
   ACCEPT="text/plain"
+  made_from_refused
   case "$STATUS" in
     2??) ;;
     400|413) die 2 "$(error_text)" ;;
@@ -4090,10 +4123,11 @@ cmd_design() {
 # its address; stderr says its id and its seq (the base of the first put).
 # A file is at most 256 KB and counts as one of the day's Markdown files.
 cmd_doc_new() {
-  local as_json="" title="" vis="" from="" page="" id
+  local as_json="" title="" vis="" from="" page="" made="" id
   while [ $# -gt 0 ]; do
     case "$1" in
       --title) need $# "$1"; title="$2"; shift 2 ;;
+      --made-from) need $# "$1"; made="$2"; shift 2 ;;
       --from) need $# "$1"; from="$2"; shift 2 ;;
       --from-page) need $# "$1"; page="$2"; shift 2 ;;
       --private) vis="private"; shift ;;
@@ -4110,12 +4144,14 @@ cmd_doc_new() {
     [ "$(wc -c < "$from")" -le 262144 ] || die 2 "$from is over 256 KB, the most a doc is made of from Markdown: split it into two docs"
   fi
   require_token
+  made_from "$made"
   if [ -n "$page" ]; then page_id "$page"; check_slug "$PAGE_ID"; fi
   JSEP=""
   {
     printf '{'
     jkey kind; printf '"doc"'
     [ -z "$title" ] || { jkey title; json_arg "$title"; }
+    [ -z "$MADE_FROM" ] || { jkey made_from; printf '"%s"' "$MADE_FROM"; }
     [ -z "$vis" ] || { jkey visibility; printf '"%s"' "$vis"; }
     [ -z "$from" ] || { jkey markdown; json_file "$from"; }
     [ -z "$page" ] || { jkey from; json_arg "$PAGE_ID"; }
@@ -4124,6 +4160,7 @@ cmd_doc_new() {
   ACCEPT="application/json"
   api_auth POST /api/artifacts -H "Content-Type: application/json" --data-binary "@$TMP/doc.json"
   ACCEPT="text/plain"
+  made_from_refused
   case "$STATUS" in
     2??) ;;
     400|413|422) die 2 "$(json_get str message || error_text)" ;;
@@ -4202,10 +4239,11 @@ cmd_doc_put() {
 # animated scene, its title fading in over a bar. Prints its address; stderr
 # says its id and seq (the base of the first edit --ops).
 cmd_motion_new() {
-  local as_json="" title="" vis="" aspect="" seconds="" id seq
+  local as_json="" title="" vis="" aspect="" seconds="" made="" id seq
   while [ $# -gt 0 ]; do
     case "$1" in
       --title) need $# "$1"; title="$2"; shift 2 ;;
+      --made-from) need $# "$1"; made="$2"; shift 2 ;;
       --aspect) need $# "$1"; case "$2" in 16:9|9:16|1:1) aspect="$2" ;; *) die 2 "--aspect is 16:9, 9:16 or 1:1" ;; esac; shift 2 ;;
       --seconds) need $# "$1"; case "$2" in ''|*[!0-9.]*|*.*.*) die 2 "--seconds is a number from 1 to 300" ;; esac
         awk -v v="$2" 'BEGIN { exit !(v >= 1 && v <= 300) }' || die 2 "--seconds is a number from 1 to 300"; seconds="$2"; shift 2 ;;
@@ -4218,11 +4256,13 @@ cmd_motion_new() {
     esac
   done
   require_token
+  made_from "$made"
   ACCEPT="application/json"
   {
     printf '{'
     jkey kind; printf '"motion"'
     [ -z "$title" ] || { jkey title; json_arg "$title"; }
+    [ -z "$MADE_FROM" ] || { jkey made_from; printf '"%s"' "$MADE_FROM"; }
     [ -z "$vis" ] || { jkey visibility; printf '"%s"' "$vis"; }
     [ -z "$aspect" ] || { jkey aspect; printf '"%s"' "$aspect"; }
     [ -z "$seconds" ] || { jkey duration; printf '%s' "$seconds"; }
@@ -4230,6 +4270,7 @@ cmd_motion_new() {
   } > "$TMP/motion.json"
   api_auth POST /api/artifacts -H "Content-Type: application/json" --data-binary "@$TMP/motion.json"
   ACCEPT="text/plain"
+  made_from_refused
   case "$STATUS" in
     2??) ;;
     400|413) die 2 "$(error_text)" ;;
@@ -4252,10 +4293,11 @@ cmd_motion_new() {
 # one title slide (its title the deck's). Prints its address; stderr says its
 # id and seq (the base of the first edit --ops).
 cmd_deck_new() {
-  local as_json="" title="" vis="" aspect="" theme="" c id seq
+  local as_json="" title="" vis="" aspect="" theme="" made="" c id seq
   while [ $# -gt 0 ]; do
     case "$1" in
       --title) need $# "$1"; title="$2"; shift 2 ;;
+      --made-from) need $# "$1"; made="$2"; shift 2 ;;
       --aspect) need $# "$1"; case "$2" in 16:9|4:3) aspect="$2" ;; *) die 2 "--aspect is 16:9 or 4:3" ;; esac; shift 2 ;;
       --theme) need $# "$1"; theme="$2"; shift 2 ;;
       --private) vis="private"; shift ;;
@@ -4272,11 +4314,13 @@ cmd_deck_new() {
     [ "$c" = '{' ] || die 2 "--theme takes a JSON object: {\"accent\":\"#3b5993\",\"heading\":\"Georgia, serif\"} (foldrender help deck)"
   fi
   require_token
+  made_from "$made"
   ACCEPT="application/json"
   {
     printf '{'
     jkey kind; printf '"deck"'
     [ -z "$title" ] || { jkey title; json_arg "$title"; }
+    [ -z "$MADE_FROM" ] || { jkey made_from; printf '"%s"' "$MADE_FROM"; }
     [ -z "$vis" ] || { jkey visibility; printf '"%s"' "$vis"; }
     [ -z "$aspect" ] || { jkey aspect; printf '"%s"' "$aspect"; }
     [ -z "$theme" ] || { jkey theme; cat "$theme"; }
@@ -4284,6 +4328,7 @@ cmd_deck_new() {
   } > "$TMP/deck.json"
   api_auth POST /api/artifacts -H "Content-Type: application/json" --data-binary "@$TMP/deck.json"
   ACCEPT="text/plain"
+  made_from_refused
   case "$STATUS" in
     2??) ;;
     400|413) die 2 "$(error_text)" ;;
@@ -4336,10 +4381,11 @@ cmd_deck_export() {
 # of the file was left out. An import is at most 10 MB and 25,000 cells, and
 # counts against the account's 200 files a day (with exports).
 cmd_sheet_new() {
-  local as_json="" title="" vis="" from="" tab="" type q="" id seq
+  local as_json="" title="" vis="" from="" tab="" made="" type q="" id seq
   while [ $# -gt 0 ]; do
     case "$1" in
       --title) need $# "$1"; title="$2"; shift 2 ;;
+      --made-from) need $# "$1"; made="$2"; shift 2 ;;
       --from) need $# "$1"; from="$2"; shift 2 ;;
       --tab) need $# "$1"; tab="$2"; shift 2 ;;
       --private) vis="private"; shift ;;
@@ -4352,6 +4398,7 @@ cmd_sheet_new() {
   done
   [ -z "$tab" ] || [ -n "$from" ] || die 2 "--tab names the csv's tab: it goes with --from FILE.csv"
   require_token
+  made_from "$made"
   ACCEPT="application/json"
   if [ -n "$from" ]; then
     [ -f "$from" ] || die 2 "no such file: $from"
@@ -4365,18 +4412,21 @@ cmd_sheet_new() {
     q="title=$(urlencode "$title")"
     [ -z "$vis" ] || q="$q&visibility=$vis"
     [ -z "$tab" ] || q="$q&tab=$(urlencode "$tab")"
+    [ -z "$MADE_FROM" ] || q="$q&made_from=$MADE_FROM"
     api_auth POST "/api/sheet?$q" -H "Content-Type: $type" --data-binary "@$from"
   else
     {
       printf '{'
       jkey kind; printf '"sheet"'
       [ -z "$title" ] || { jkey title; json_arg "$title"; }
+      [ -z "$MADE_FROM" ] || { jkey made_from; printf '"%s"' "$MADE_FROM"; }
       [ -z "$vis" ] || { jkey visibility; printf '"%s"' "$vis"; }
       printf '}'
     } > "$TMP/sheet.json"
     api_auth POST /api/artifacts -H "Content-Type: application/json" --data-binary "@$TMP/sheet.json"
   fi
   ACCEPT="text/plain"
+  made_from_refused
   case "$STATUS" in
     2??) ;;
     400|413) die 2 "$(error_text)" ;;
@@ -7574,6 +7624,10 @@ foldrender publish FILE...|- [options]
                        address of another of your pages, nothing is made and
                        the error says that page's id (exit 12)
   --allow-duplicate    make a new page even if you have one with this content
+  --made-from PAGE     the page or artifact this one was made from (one you
+                       can read now: yours, shared with you, or public); its
+                       page then says "Made from" it, and read gives made_from,
+                       to whoever can read that one too (exit 2 if you cannot)
   --idempotency-key K  name this publish (8-120 of A-Z a-z 0-9 . _ : -): the
                        same key within a day answers with the page it made
   --no-session         do not say which agent session published it (below)
@@ -7591,6 +7645,7 @@ foldrender publish FILE...|- [options]
 Examples: foldrender publish report.html --link
           foldrender publish notes.md
           foldrender publish a.html b.html c.html --folder q3
+          foldrender publish summary.html --made-from field-notes
 EOF
     ;;
     edit) cat <<'EOF'
@@ -7610,7 +7665,8 @@ EOF
     ;;
     read) cat <<'EOF'
 foldrender read PAGE [options]
-  A few facts (title, address, id, updated, size), then the page as Markdown.
+  A few facts (title, address, id, updated, size; made_from, its title and
+  address when it was made from one you can read now), then the page as Markdown.
   A long page stops near 6k tokens (FOLDRENDER_READ_MAX_TOKENS) and ends with
   how much is left, the command that goes on, and its sections by number.
   A canvas reads as its map first (its cards with their ids, its notes, boxes
@@ -8444,7 +8500,7 @@ Examples: foldrender merge notes-a --into notes-b
 EOF
     ;;
     sheet|new) cat <<'EOF'
-foldrender new sheet [--title T] [--private|--link-access|--public] [--json]
+foldrender new sheet [--title T] [--private|--link-access|--public] [--made-from PAGE] [--json]
 foldrender new sheet --from FILE.xlsx | --from FILE.csv [--tab NAME] [--title T]
   A sheet: tabs of cells, computed like a spreadsheet (formulas, references
   across tabs, dropdowns). Prints its address; stderr says its id and seq.
@@ -8453,6 +8509,8 @@ foldrender new sheet --from FILE.xlsx | --from FILE.csv [--tab NAME] [--title T]
   a larger sheet is imported in a browser).
   Pictures, charts, pivot tables and links to other files are left out (said
   on stderr). A csv is one tab, --tab its name; a field with = is a formula.
+  --made-from PAGE: the page it was made from (one you can read now); its
+  page says "Made from" it, as every new kind's does (help publish).
 foldrender read SHEET [--json]
   Each tab as a table of what its cells show, never a formula, and the seq
   the next change names. --json has what was typed in each cell (formulas),
@@ -8493,14 +8551,15 @@ foldrender export SHEET FILE.xlsx | FILE.csv [--tab NAME]
 EOF
     ;;
     doc) cat <<'EOF'
-foldrender new doc [--title T] [--private|--link-access|--public] [--json]
+foldrender new doc [--title T] [--private|--link-access|--public] [--made-from PAGE] [--json]
 foldrender new doc --from FILE.md [--title T]      (or --from-page PAGE)
   A doc: rich text that people edit together in a browser (headings, lists,
   to-dos, tables, code, pictures, links, comments), each seeing the others'
   cursors. Prints its address; stderr says its id and seq. --from makes it of
   a Markdown file (at most 256 KB; one of the day's Markdown files, 100 an
   account); --from-page of one of your pages (the page stays as it is, and
-  the doc reads as it did). Exit 2 for a file it cannot take, with the reason.
+  the doc reads as it did; it is made from that page). --made-from PAGE names
+  another it was made from. Exit 2 for a file it cannot take, with the reason.
 foldrender read DOC [--section N] [--json]
   Its text as Markdown, cut as a page's is, with the seq the next put names.
   Signed in, its owner and its editors also get its comments at the end, each
@@ -8522,7 +8581,7 @@ foldrender export DOC FILE.docx | FILE.md | FILE.html
 EOF
     ;;
     design) cat <<'EOF'
-foldrender new design [--title T] [--theme FILE.json] [--private|--link-access|--public] [--json]
+foldrender new design [--title T] [--theme FILE.json] [--private|--link-access|--public] [--made-from PAGE] [--json]
   An account's look: six colours, two faces, a corner and a logo, edited on
   its page (a preview beside it). --theme FILE.json: {"bg","surface","text",
   "muted","accent","on_accent": "#rrggbb", "heading","body": a font stack,
@@ -8544,7 +8603,7 @@ foldrender edit DESIGN --ops FILE --base SEQ
 EOF
     ;;
     motion) cat <<'EOF'
-foldrender new motion [--title T] [--aspect 16:9|9:16|1:1] [--seconds N] [--private|--link-access|--public] [--json]
+foldrender new motion [--title T] [--aspect 16:9|9:16|1:1] [--seconds N] [--private|--link-access|--public] [--made-from PAGE] [--json]
   A short animated scene (1 to 300 seconds, 5 to start): its title fading in
   over a bar that grows. Prints its address, where it plays, is edited (a
   timeline of layers and their keys) and is exported as an MP4 (in the
@@ -8578,7 +8637,7 @@ foldrender edit MOTION --ops FILE|- --base SEQ    (or --undo SEQ)
 EOF
     ;;
     deck) cat <<'EOF'
-foldrender new deck [--title T] [--aspect 16:9|4:3] [--theme FILE.json] [--private|--link-access|--public] [--json]
+foldrender new deck [--title T] [--aspect 16:9|4:3] [--theme FILE.json] [--private|--link-access|--public] [--made-from PAGE] [--json]
   A slide deck: one title slide to start (its title the deck's). Prints its
   address, where it is edited and presented (a person drags, resizes and types
   on the slides there; Present, Presenter view, Export PowerPoint or PDF).
@@ -8630,6 +8689,7 @@ foldrender canvas FILE|PAGE...|PLAN.canvas [options]
                        replaces that canvas, or writes nothing if unchanged
   --folder F  --title T  --private (default)  --link-access  --public
   --share a,b  --owner LOGIN (admin token)  --json
+  --made-from PAGE     what it was made from (help publish)
   PLAN.canvas          a JSON Canvas file (or .json), sent as it is, with the
                        local files its "file" fields name (next to it)
 foldrender canvas edit CANVAS [--base REV] [--add FILE|PAGE]... [--note TEXT]...
