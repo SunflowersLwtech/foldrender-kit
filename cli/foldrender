@@ -1561,10 +1561,16 @@ cmd_export() {
   require_token
   if [ -z "$target" ]; then
     api_auth GET /api/me
-    expect_2xx
-    login="$(field login)"
+    # The desk memory's host: an account no longer in its private beta cannot
+    # be read there and still exports (403 private_beta); its saved login names the file.
+    if [ "$SERVICE" = mem ] && [ "$STATUS" = 403 ] && [ "$(json_field code)" = private_beta ]; then
+      login="${ACCOUNT:-account}"
+    else
+      expect_2xx
+      login="$(field login)"
+    fi
     [ -n "$login" ] || die 1 "could not read the account login"
-    target="foldrender-artifacts-$login-$(date +%Y-%m-%d).zip"
+    if [ "$SERVICE" = mem ]; then target="foldrender-mem-$login-$(date +%Y-%m-%d).zip"; else target="foldrender-artifacts-$login-$(date +%Y-%m-%d).zip"; fi
   fi
   [ ! -e "$target" ] || die 1 "$target already exists; choose another name"
   # The plan: the parts the pages are downloaded in (GET /api/me/export?plan=1).
@@ -1592,7 +1598,11 @@ cmd_export() {
         [ ! -e "$name" ] || export_abort 1 "$name already exists; choose another name"
         i=$((i + 1))
       done
-      note "your pages add up to $(size_text "$(field bytes)"), more than one download holds ($(size_text "$(field limit)")): saving them in $PLAN_N parts"
+      if [ "$SERVICE" = mem ]; then
+        note "what this account holds adds up to $(size_text "$(field bytes)"), more than one download holds ($(size_text "$(field limit)")): saving it in $PLAN_N parts"
+      else
+        note "your pages add up to $(size_text "$(field bytes)"), more than one download holds ($(size_text "$(field limit)")): saving them in $PLAN_N parts"
+      fi
       start=""
     fi
     mplan=""
@@ -1609,7 +1619,7 @@ cmd_export() {
         case " ${EXPORT_FILES[*]-} " in *" $name "*) ;; *) EXPORT_FILES+=("$name") ;; esac
         saved[$i]="$(header_value x-fr-export-part)"
         [ -n "${saved[$i]}" ] || saved[$i]="${P_FP[$i]}"
-        note "part $k of $PLAN_N: ${P_PAGES[$i]} pages, $(size_text "${P_BYTES[$i]}")"
+        if [ "$SERVICE" = mem ]; then note "part $k of $PLAN_N: $(size_text "${P_BYTES[$i]}")"; else note "part $k of $PLAN_N: ${P_PAGES[$i]} pages, $(size_text "${P_BYTES[$i]}")"; fi
         mplan="$(header_value x-fr-export-plan)"
         # The listing is no longer the plan's: see below which parts it moved.
         [ -z "$mplan" ] || [ "$mplan" = "$PLAN_FP" ] || break
@@ -8798,6 +8808,14 @@ foldrender export DOC FILE.docx | FILE.md | FILE.html
   One doc as a file (help doc).
 foldrender export DECK FILE.pptx
   One deck as a PowerPoint file (help deck).
+foldrender --service mem export [FILE.zip]
+  On the desk memory's host: what the account holds there (default:
+  foldrender-mem-LOGIN-DATE.zip), the same way, in parts past 16 MB: its
+  account.json, and for each workspace it is in its own memory there and no
+  one else's (workspaces/SLUG/*.jsonl), with its notes as a file to import
+  (workspaces/SLUG/notes-to-import.jsonl: foldrender --service mem desk mem
+  import FILE, with that workspace's agent token). An account off the private
+  beta still exports.
 EOF
     ;;
     login|logout|whoami) cat <<'EOF'
@@ -8978,7 +8996,9 @@ main() {
   if [ "$SERVICE" = mem ]; then
     case "$cmd" in
       login|logout|auth|account|whoami|desk|version|--version|help|-h|--help) ;;
-      *) die 2 "$cmd is foldrender.dev's; the desk memory's host (--service mem) has login, logout, auth, whoami, account, desk mem and desk workspace" ;;
+      # Its own export: what the account holds there (no page, sheet, doc or deck).
+      export) [ $# -le 1 ] || die 2 "the desk memory's host exports the account alone: foldrender --service mem export [FILE.zip]" ;;
+      *) die 2 "$cmd is foldrender.dev's; the desk memory's host (--service mem) has login, logout, auth, whoami, account, export, desk mem and desk workspace" ;;
     esac
   fi
   # A desk token of the wrong kind stops here, before any request.
