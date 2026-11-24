@@ -191,7 +191,7 @@ If the read fails:
 
 ## 7. Canvases
 
-A canvas is a board: several pages as cards, with notes, boxes and connectors. Its link reads like a page's, with `foldrender read`, but prints a map first: each card's short id, title and size, the notes, what each box holds, and the connectors as `A [id] → B [id]: label`; then each card's text in reading order. A long canvas stops near 6,000 tokens and lists its cards. Its annotations come in the map, for its owner and collaborators, as on a page.
+A canvas is a board: several pages as cards, with notes, boxes, connectors, and the whiteboard's kinds — shapes (rect, ellipse, diamond, arrow, text on the board), frames (titled containers that carry what is inside them) and timelines (lanes of people, bars of days). Its link reads like a page's, with `foldrender read`, but prints a map first: each card's short id, title and size, the notes, the shapes, what each box and frame holds, the timelines lane by lane (`Payments live · Jan 6–Feb 14`), and the connectors as `A [id] → B [id]: label`; then each card's text in reading order. A long canvas stops near 6,000 tokens and lists its cards. Its annotations come in the map, for its owner and collaborators, as on a page.
 
 ```
 foldrender read <canvas link>                 the map, then the cards
@@ -208,6 +208,17 @@ foldrender canvas plan.canvas                 a JSON Canvas file; coordinates ar
 ```
 
 In a plan, give a card its width, not its height: a card is as tall as its page. The canvas measures the page the first time its owner opens it (`ph` in `--json`, the page's height in its own pixels) and moves down what is under the card to make room.
+
+A plan (and `canvas edit --patch`'s `add_nodes`) also takes the whiteboard's kinds, fields and limits in `foldrender help canvas`:
+
+```json
+{"id": "risk", "type": "shape", "shape": "diamond", "text": "Decide by Friday", "width": 220, "height": 140}
+{"id": "wk", "type": "frame", "label": "This week", "x-members": ["c1", "risk"]}
+{"id": "q1", "type": "timeline", "label": "Q1", "anchor": "2027-01-01", "days": 90,
+ "lanes": [{"name": "Wei", "bars": [{"t": "Payments live", "f": 5, "d": 39}]}]}
+```
+
+Bars are `f` days after `anchor` for `d` days (halves allowed); a timeline holds at most 12 lanes and 64 bars, its window 14 to 1461 days. `update_nodes` changes any of their fields by name (`shape`, `text`, `fill`, `label`, `anchor`, `days`, `lanes`).
 
 stdout is the canvas's address; stderr has a line saying what it holds, then its map with each card's id (what `canvas edit` takes). `--name NAME` makes the same command update that canvas instead of making another. To change a canvas, in one step that applies all of it or nothing:
 

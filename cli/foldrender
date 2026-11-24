@@ -7593,7 +7593,7 @@ foldrender publishes HTML pages as links and reads pages back as text.
                        --view/--comment/--edit LOGIN|team:NAME --pin REV; team (help team)
   mv PAGE NEWNAME      move a page (its old address redirects); merge A --into B
   log PAGE             the page's history (`versions`); restore REV; undo; diff; rm --rev
-  canvas FILE|PAGE...  a canvas of these as cards (up to 24); canvas edit CANVAS changes it
+  canvas FILE|PAGE...  cards (up to 24), shapes, frames, timelines; canvas edit CANVAS
   answers PAGE         answers to the page's questions (data-fr-choice); --wait
   desk / thread / pack / data  desk, messages, context packs, data boards' databases
   bridge --page PAGE   connect an agent (or --session NAME) to the page's sidebar
@@ -8701,7 +8701,27 @@ foldrender canvas FILE|PAGE...|PLAN.canvas [options]
   --share a,b  --owner LOGIN (admin token)  --json
   --made-from PAGE     what it was made from (help publish)
   PLAN.canvas          a JSON Canvas file (or .json), sent as it is, with the
-                       local files its "file" fields name (next to it)
+                       local files its "file" fields name (next to it).
+                       Beside the cards, notes and boxes of JSON Canvas, a plan
+                       may hold shapes, frames and timelines (the whiteboard's
+                       kinds; see: foldrender help canvas)
+foldrender canvas PLAN.canvas — the whiteboard kinds a plan may name
+  {"type":"shape","shape":"rect|ellipse|diamond|arrow|text","text":"…",
+   "x":…,"y":…,"width":…,"height":…,"color":"4","fill":true}
+    A drawing: one of the four shapes, or text on the board ("text", no
+    border). "fill" fills it with its colour's tint; "color" one of the note
+    colours 1-6 or a #rrggbb.
+  {"type":"frame","label":"…","x-members":["id",…]}
+    A titled container: it carries what lies inside it when dragged, and a
+    read says what it holds (x-members names plan nodes; the frame is drawn
+    around them, or give it x, y, width, height).
+  {"type":"timeline","label":"Q1","anchor":"2027-01-01","days":90,
+   "lanes":[{"name":"Wei","bars":[{"t":"Payments live","f":5,"d":39}]}]}
+    A timeline template: each lane a person, each bar a run of days (f days
+    after the anchor, d long; a read prints them as "Jan 6–Feb 14"). Up to 12
+    lanes, 16 bars a lane, 64 bars a timeline; days 14 to 1461.
+  In `canvas edit --patch`, add_nodes takes the same three kinds (a timeline
+  needs its anchor), and update_nodes changes their fields by name.
 foldrender canvas edit CANVAS [--base REV] [--add FILE|PAGE]... [--note TEXT]...
        [--link A:B[:LABEL]]... [--rm ID]... | --patch FILE|-
   Changes the canvas in one step, all of it or nothing (exit 10). A and B: an
