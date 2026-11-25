@@ -1738,7 +1738,7 @@ cmd_account() {
 # publish FILE... [options]: each file to its page, one address a line on
 # stdout, in order; on stderr one line a page saying what the publish changed.
 cmd_publish() {
-  local files=() title="" slug="" vis="" share="" name="" folder="" folder_set="" as_json="" key="" allow_dup="" message="" made="" f n=0
+  local files=() title="" slug="" vis="" share="" name="" folder="" folder_set="" as_json="" key="" allow_dup="" message="" made="" draft="" promote="" together="" force="" f n=0
   while [ $# -gt 0 ]; do
     case "$1" in
       -m|--message) need $# "$1"; message="$2"; shift 2 ;;
@@ -1753,6 +1753,10 @@ cmd_publish() {
       --private) vis=private; shift ;;
       --link) vis=link; shift ;;
       --public) vis=public; shift ;;
+      --draft) draft=1; shift ;;
+      --promote) promote=1; shift ;;
+      --force) force=1; shift ;;
+      --together) together=1; shift ;;
       --json) as_json=1; shift ;;
       --no-session) NO_SESSION=1; shift ;;
       -) files+=("-"); shift ;;
@@ -1760,7 +1764,15 @@ cmd_publish() {
       *) files+=("$1"); shift ;;
     esac
   done
-  [ ${#files[@]} -gt 0 ] || die 2 "usage: foldrender publish FILE...|- [--title T] [--name N] [--folder F] [--slug ID] [--private|--link|--public|--share a,b] [--made-from PAGE] [--idempotency-key K] [--allow-duplicate] [--no-session] [--json]"
+  [ -z "$draft" ] || [ -z "$promote" ] || die 2 "--draft and --promote are different publishes; pick one"
+  [ -z "$together" ] || [ ${#files[@]} -gt 1 ] || die 2 "--together publishes several pages at once; give it more than one file"
+  [ -z "$promote" ] || [ ${#files[@]} -le 1 ] || die 2 "--promote takes the one page its draft is on (--slug, or a file it was published from)"
+  [ -z "$force" ] || [ -n "$promote" ] || die 2 "--force goes with --promote (write the draft over a page that moved on since it was made)"
+  [ -z "$draft$promote$together" ] || [ -z "$share$vis$name$folder_set" ] || die 2 "--draft, --promote and --together carry no sharing or address flags (--private, --link, --public, --share, --name, --folder); the page keeps what it has"
+  # --made-from is sent by a publish alone (publish_one's made_from): none of
+  # the three carries it, so here it is refused, not dropped on the way.
+  [ -z "$draft$promote$together" ] || [ -z "$made" ] || die 2 "--draft, --promote and --together take no --made-from; they change pages you already have, and the page keeps what it was made from"
+  [ ${#files[@]} -gt 0 ] || [ -n "$promote" ] || die 2 "usage: foldrender publish FILE...|- [--title T] [--name N] [--folder F] [--slug ID] [--private|--link|--public|--share a,b] [--made-from PAGE] [--idempotency-key K] [--allow-duplicate] [--no-session] [--json]"
   case "$key" in
     '') ;;
     *[!A-Za-z0-9._:-]*) die 2 "--idempotency-key takes 8 to 128 letters, digits and . _ : -" ;;
@@ -1783,6 +1795,29 @@ cmd_publish() {
   made_from "$made"
   # (What the command that runs this one names: the file, else the page.)
   case "${files[0]}" in -) made_by_header "${slug:-$name}" ;; *) made_by_header "${files[0]##*/}" ;; esac
+  if [ -n "$promote" ]; then
+    # The page the draft is on: --slug, or the file it was published from.
+    local p_slug="$slug" rp=""
+    if [ -z "$p_slug" ] && [ "${files[0]:-}" != "-" ]; then
+      rp="$(abs_path "${files[0]}")" || die 1 "cannot resolve the path of ${files[0]}"
+      p_slug="$(meta_slug "${files[0]}")"
+      [ -n "$p_slug" ] || p_slug="$(map_lookup "$rp")"
+    fi
+    [ -n "$p_slug" ] || die 2 "--promote names the page by --slug, or by a file published under it before"
+    check_slug "$p_slug"
+    api_auth POST "/api/artifacts/$p_slug/promote${force:+?force=1}"
+    [ "$STATUS" != 404 ] || die 7 "no draft held on $p_slug (see: foldrender log $p_slug)"
+    # The page moved on since the draft was made: nothing written, the draft
+    # kept; the server's sentence says what to do (look, then --force).
+    if [ "$STATUS" = 409 ] && [ "$(error_text)" = stale ]; then die 1 "not promoted: $(json_field message)"; fi
+    expect_2xx
+    note "promoted the draft on $p_slug"
+    return 0
+  fi
+  if [ -n "$together" ]; then
+    publish_together "${files[@]}"
+    return 0
+  fi
   for f in "${files[@]}"; do
     n=$((n + 1))
     # One key a page: --idempotency-key K names the publish, and each file of
@@ -1798,9 +1833,65 @@ cmd_publish() {
   done
 }
 
+# publish_together FILE...: all of them in one request — every page written,
+# or none (the batch refuses whole, the pages it touched restored). The slug
+# each file's update goes to is read as publish_one reads it: a meta tag,
+# else the map of a path published before; a file neither names is refused —
+# a together publish updates pages, it does not first make them.
+publish_together() {
+  local f rp slug title first=1
+  printf '{"pages":[' > "$TMP/together.json"
+  for f in "$@"; do
+    [ -f "$f" ] || die 2 "no such file: $f"
+    [ -r "$f" ] || die 2 "cannot read: $f"
+    rp="$(abs_path "$f")" || die 1 "cannot resolve the path of $f"
+    slug="$(meta_slug "$f")"
+    [ -n "$slug" ] || slug="$(map_lookup "$rp")"
+    [ -n "$slug" ] || die 2 "$f names no page to update: publish it once on its own first (foldrender publish $f)"
+    check_slug "$slug"
+    title="$(title_from "$f")"
+    [ "$first" = 1 ] || printf ',' >> "$TMP/together.json"
+    first=0
+    printf '{"slug":%s,"html":%s%s}' "$(json_arg "$slug")" "$(json_str "$f")" \
+      "$([ -n "$title" ] && printf ',"title":%s' "$(json_arg "$title")")" >> "$TMP/together.json"
+  done
+  printf ']}' >> "$TMP/together.json"
+  # As JSON: a refusal's lists (undone, not_undone) do not survive the text
+  # form an error takes for a text/plain caller (key: value lines).
+  local was_accept="$ACCEPT"
+  ACCEPT="application/json"
+  api_auth POST /api/artifacts/~/together -H "Content-Type: application/json" --data-binary "@$TMP/together.json"
+  ACCEPT="$was_accept"
+  if [ "$STATUS" = 200 ]; then
+    for f in "$@"; do
+      rp="$(abs_path "$f")" || continue
+      slug="$(meta_slug "$f")"; [ -n "$slug" ] || slug="$(map_lookup "$rp")"
+      [ -n "$slug" ] && map_set "$rp" "$slug"
+    done
+    note "published ${#@} page(s) together"
+    return 0
+  fi
+  # A batch that failed on a page's write answers with that write's own status
+  # (a 404, a 409, a 413 as well as a 5xx): read as the batch's refusal first.
+  if grep -q '"together_failed"' "$TMP/body"; then
+    local failed why left
+    failed="$(json_field failed)"
+    why="$(tr -d '\n' < "$TMP/body" | sed -n 's/.*"detail":{[^}]*"error":"\([^"]*\)".*/\1/p')"
+    # An undo that could not put a page back says which: those pages may hold
+    # the batch's body, and the user has to look.
+    left="$(tr -d '\n' < "$TMP/body" | sed -n 's/.*"not_undone":\[\([^]]*\)\].*/\1/p' | tr -d '"')"
+    [ -z "$left" ] || die 1 "the batch failed on $failed${why:+ ($why)}, and these pages could not be put back: $left — check them (foldrender log PAGE)"
+    die 1 "the batch failed on $failed${why:+ ($why)} — every page it touched was put back"
+  fi
+  if [ "$STATUS" = 404 ] || [ "$STATUS" = 400 ] || [ "$STATUS" = 413 ]; then
+    die 1 "not published: $(error_text)"
+  fi
+  expect_2xx
+}
+
 # publish_one FILE LABEL: one page, with the options cmd_publish read.
 publish_one() {
-  local file="$1" label="$2" p_slug="$slug" p_vis="$vis" p_title="$title" mode="" rp="" src="" bytes query
+  local file="$1" label="$2" p_slug="$slug" p_vis="$vis" p_title="$title" mode="" rp="" src="" bytes query draft="$draft"
   if [ "$file" = "-" ]; then
     src="$TMP/stdin.html"
     cat > "$src"
@@ -1847,7 +1938,7 @@ publish_one() {
   # page for a PUT to a slug nobody has, and gives it the server's default. So
   # with no flag, ask first whether the page is one of yours (its version list
   # answers 404 otherwise).
-  if [ -n "$p_slug" ] && [ -z "$p_vis" ]; then
+  if [ -n "$p_slug" ] && [ -z "$p_vis" ] && [ -z "$draft" ]; then
     api_auth GET "/api/artifacts/$p_slug/versions"
     case "$STATUS" in
       200) ;;
@@ -1862,7 +1953,7 @@ publish_one() {
       *) fail_http ;;
     esac
   fi
-  if [ -z "$p_slug" ] && [ -z "$p_vis" ]; then
+  if [ -z "$p_slug" ] && [ -z "$p_vis" ] && [ -z "$draft" ]; then
     p_vis=private
   fi
   query=""
@@ -1876,6 +1967,21 @@ publish_one() {
   [ -z "$MADE_FROM" ] || query="${query:+$query&}made_from=$MADE_FROM"
 
   [ -z "$as_json" ] || ACCEPT="application/json"
+  if [ -n "$draft" ]; then
+    # A draft is a change kept aside: the publish body as JSON (the page's
+    # fields and draft:true), to the page it would have updated. Only an
+    # existing page holds one; a file nobody published under a slug yet has
+    # nothing to wait from, so it publishes instead.
+    [ -n "$p_slug" ] || die 2 "--draft changes a page you already have: publish this file once, or name the page --slug"
+    printf '{"draft":true,"html":%s%s%s}' "$(json_str "$src")" \
+      "$([ -n "$p_title" ] && printf ',"title":%s' "$(json_arg "$p_title")")" \
+      "$([ -n "$message" ] && printf ',"message":%s' "$(json_arg "$message")")" > "$TMP/draft.json"
+    UPLOAD_TYPE=application/json
+    upload PUT "/api/artifacts/$p_slug" "$TMP/draft.json" ""
+    expect_2xx
+    note "${label}draft held on $p_slug (foldrender publish --promote --slug $p_slug when it is ready; foldrender draft $p_slug to see it)"
+    return 0
+  fi
   if [ -n "$p_slug" ]; then
     upload PUT "/api/artifacts/$p_slug" "$src" "$query"
   else
@@ -2288,6 +2394,104 @@ cmd_undo() {
     ''|*[!0-9a-f]*) die 1 "$1 has no earlier version to go back to" ;;
   esac
   restore_version "$1" "$vid"
+}
+
+# tag PAGE [TAG [--version ID]]: the page's tags, or a name on a kept version.
+# With a name alone: it. With --version, on that version (foldrender log PAGE
+# shows each version's id as v<id>). -d removes one. A tag is a ?v= name of
+# its own: the page's link with ?v=TAG opens that version through the same
+# door a pinned version does.
+cmd_tag() {
+  local page="" tag="" version="" del="" as_json=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --version) need $# "$1"; version="$2"; shift 2 ;;
+      -d|--delete) del=1; shift ;;
+      --json) as_json=1; shift ;;
+      -*) die 2 "unknown option: $1" ;;
+      *) if [ -z "$page" ]; then page="$1"; elif [ -z "$tag" ]; then tag="$1"; else die 2 "tag takes a page and at most one name"; fi; shift ;;
+    esac
+  done
+  [ -n "$page" ] || die 2 "usage: foldrender tag PAGE [TAG] [--version ID] [-d] [--json]"
+  require_token
+  page_id "$page"
+  check_slug "$PAGE_ID"
+  if [ -z "$tag" ]; then
+    # The list.
+    api_auth GET "/api/artifacts/$PAGE_ID/tags"
+    [ "$STATUS" != 404 ] || die 7 "no page named $PAGE_ID among yours"
+    expect_2xx
+    if [ -n "$as_json" ] || [ "$(head -c 1 "$TMP/body")" = "{" ]; then cat "$TMP/body"; printf '\n'; return 0; fi
+    cat "$TMP/body"
+    return 0
+  fi
+  case "$tag" in
+    ''|*[!A-Za-z0-9._-]*) die 2 "a tag is 1 to 64 letters, digits, . _ or -: $tag" ;;
+    *[!0-9]*[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;; # ok unless all-hex-16
+    *[0-9]*) : ;;
+  esac
+  [ ${#tag} -le 64 ] || die 2 "a tag is at most 64 characters: $tag"
+  case "$tag" in
+    *[!0-9]*) : ;;
+    *) die 2 "a tag may not be only digits (a revision number): $tag" ;;
+  esac
+  if [ -n "$del" ]; then
+    api_auth DELETE "/api/artifacts/$PAGE_ID/tags/$(urlencode "$tag")"
+    [ "$STATUS" != 404 ] || die 7 "no tag $tag on $PAGE_ID"
+    expect_2xx
+    note "tag $tag deleted from $PAGE_ID"
+    return 0
+  fi
+  # Which version: --version, else the newest kept body before the current
+  # revision — what a tag usually names.
+  if [ -z "$version" ]; then
+    api_auth GET "/api/artifacts/$PAGE_ID/log"
+    expect_2xx
+    version="$(awk -F'\t' 'NR > 1 && $0 ~ /v[0-9a-f]{16}/ && $0 !~ /gone:/ { for (i = 1; i <= NF; i++) if ($i ~ /^v[0-9a-f]{16}$/) { print substr($i, 2); exit } }' "$TMP/body")"
+    [ -n "$version" ] || die 1 "$PAGE_ID has no kept version to tag (its current revision is the page; publish it again to keep one)"
+  fi
+  printf '{"version":%s}' "$(json_arg "$version")" > "$TMP/tag.json"
+  api_auth PUT "/api/artifacts/$PAGE_ID/tags/$(urlencode "$tag")" -H "Content-Type: application/json" --data-binary "@$TMP/tag.json"
+  [ "$STATUS" != 404 ] || die 7 "no kept version $version of $PAGE_ID (see: foldrender log $PAGE_ID)"
+  [ "$STATUS" != 410 ] || die 1 "that version's body is gone; pick another (foldrender log $PAGE_ID)"
+  [ "$STATUS" != 409 ] || die 1 "$(error_text)"
+  expect_2xx
+  note "tag $tag on $PAGE_ID now opens version $version (?v=$(urlencode "$tag"))"
+}
+
+# draft PAGE [FILE]: the page's held draft — what publish --draft kept aside.
+# With a FILE it is publish --draft FILE --slug PAGE; with none, the draft's
+# own line (when it was saved, against which revision) and its body.
+cmd_draft() {
+  local page="" file="" del="" as_json=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -d|--delete) del=1; shift ;;
+      --json) as_json=1; shift ;;
+      -*) die 2 "unknown option: $1" ;;
+      *) if [ -z "$page" ]; then page="$1"; elif [ -z "$file" ]; then file="$1"; else die 2 "draft takes a page and at most one file"; fi; shift ;;
+    esac
+  done
+  [ -n "$page" ] || die 2 "usage: foldrender draft PAGE [FILE] [-d] [--json]"
+  require_token
+  page_id "$page"
+  check_slug "$PAGE_ID"
+  if [ -n "$file" ]; then
+    draft=1 slug="$PAGE_ID" publish_one "$file" ""
+    return 0
+  fi
+  if [ -n "$del" ]; then
+    api_auth DELETE "/api/artifacts/$PAGE_ID/draft"
+    [ "$STATUS" != 404 ] || die 7 "no draft held on $PAGE_ID"
+    expect_2xx
+    note "draft deleted from $PAGE_ID"
+    return 0
+  fi
+  api_auth GET "/api/artifacts/$PAGE_ID/draft"
+  [ "$STATUS" != 404 ] || die 7 "no draft held on $PAGE_ID"
+  expect_2xx
+  if [ -n "$as_json" ] || [ "$(head -c 1 "$TMP/body")" = "{" ]; then cat "$TMP/body"; printf '\n'; return 0; fi
+  cat "$TMP/body"
 }
 
 # mv PAGE NEWNAME [--folder F]: a page to another address of yours (its name,
@@ -8888,6 +9092,17 @@ foldrender rm PAGE --rev REV|--version ID   delete one version's body: its link 
                                it was deleted; its log entry stays
 foldrender publish FILE -m MSG, foldrender edit PAGE ... -m MSG
                                the publish or edit's message in the log
+foldrender publish FILE --draft   keep the change aside as a draft: the page stays
+                               as it was until foldrender publish --promote --slug ID
+                               (refused if the page moved on since the draft was
+                               made; --force writes the draft over it)
+foldrender draft PAGE [-d]      the held draft (when it was saved, against which
+                               revision) and its body; -d deletes it
+foldrender tag PAGE [TAG]       the page's tags; with TAG, that name on the newest
+                               kept version (or --version ID): a ?v=TAG link opens
+                               it. -d removes one; a deleted tag answers 410
+foldrender publish FILE... --together   several pages in one request: every one
+                               written, or none
 EOF
     ;;
     data) cat <<'EOF'
@@ -9042,6 +9257,8 @@ main() {
     diff) cmd_diff "$@" ;;
     restore) cmd_restore "$@" ;;
     undo) cmd_undo "$@" ;;
+    tag) cmd_tag "$@" ;;
+    draft) cmd_draft "$@" ;;
     canvas) cmd_canvas "$@" ;;
     new) cmd_new "$@" ;;
     doc) cmd_doc "$@" ;;
