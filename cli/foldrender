@@ -37,15 +37,15 @@
 
 export LC_ALL=C
 
-FR_CLI_VERSION=0.27.0
+FR_CLI_VERSION=0.28.0
 # The bridge `foldrender bridge` runs (foldrender-bridge.mjs; each released one
 # is served at install/bridge/<its sha256>.mjs): the sha256 of the one this
 # version was made with. A bridge that does not match is not run.
-FR_BRIDGE_SHA256=0474aa21041e7549ed17addd7c5c3994282178184b4235b43a699cf8b27fdaa0
+FR_BRIDGE_SHA256=6b2f5fce09c4c31309dcc2825f3e4d9711cff642fe1e49eb018d636c4d81e052
 # The desk agent `foldrender desk agent` runs (foldrender-desk-agent.mjs; each
 # released one is served at install/desk-agent/<its sha256>.mjs), pinned as
 # the bridge is.
-FR_DESK_AGENT_SHA256=2480df4ef8aec8df49dfa4f622d628e587f92d62ee1ce6a1bd88a69aaaa4f37d
+FR_DESK_AGENT_SHA256=d11cc4a808b5a4f6c804d4ca3ab41d2833f105affb3b77ad7c6b764fbc29053f
 API="${FOLDRENDER_API:-https://foldrender.dev/artifacts}"
 API="${API%/}"
 MAX_BYTES=5242880
@@ -6330,6 +6330,38 @@ cmd_desk_mem_todo() {
 #   and use desk mem say / inject by hand. The desk agent token (frdk_) is
 #   kept in a 600 file the hook reads, and what was said goes to the hook on
 #   stdin and on to the Worker in a file: neither is ever on a command line.
+# mem_hook_left CONF: 0 when Claude Code's or Codex's hook file still runs
+# the hook under CONF (or cannot be read, so may), 1 when neither does.
+mem_hook_left() {
+  FR_MEM_CONF="$1" python3 -I -c '
+import json, os, sys
+hook = os.path.join(os.environ["FR_MEM_CONF"], "desk-mem-hook.sh")
+home = os.path.expanduser("~")
+# The hook files are read as JSON and every string in them compared as text:
+# a raw-text needle meets how the writer encoded it instead (json.dump escapes
+# non-ASCII one way or another, so a path with such a character was never
+# found, and --remove deleted the spool while a hook still named it).
+def strings(x):
+    if isinstance(x, str):
+        yield x
+    elif isinstance(x, dict):
+        for v in x.values():
+            yield from strings(v)
+    elif isinstance(x, list):
+        for v in x:
+            yield from strings(v)
+for p in (os.path.join(home, ".claude", "settings.json"), os.path.join(os.environ.get("CODEX_HOME") or os.path.join(home, ".codex"), "hooks.json")):
+    try:
+        with open(p, encoding="utf-8") as f:
+            doc = json.load(f)
+    except FileNotFoundError:
+        continue
+    except Exception:
+        sys.exit(0)
+    if any(hook in s for s in strings(doc)):
+        sys.exit(0)
+sys.exit(1)'
+}
 cmd_desk_mem_install() {
   local agents="" conf token="" remove=0 workspace="" want=frdk_
   while [ $# -gt 0 ]; do
@@ -6356,6 +6388,15 @@ cmd_desk_mem_install() {
   if [ "$remove" = 1 ]; then
     [ -f "$conf/install.py" ] || die 7 "nothing installed under $conf"
     [ -z "$list" ] || FR_MEM_CONF="$conf" python3 "$conf/install.py" --remove $list
+    # With no hook of ours left in either agent's file, nothing would send what
+    # waits in spool/ (the words as said) or age it out, so it goes too. The
+    # token and hook.log stay, as before.
+    if [ -d "$conf/spool" ] && ! mem_hook_left "$conf"; then
+      local n
+      n="$(ls "$conf/spool" | grep -c '^[qc]\.')"
+      rm -rf "$conf/spool" || die 1 "cannot delete $conf/spool"
+      note "deleted $conf/spool: no hook of ours is left to send it ($n event(s) not sent)"
+    fi
     return 0
   fi
   [ -n "$list" ] || return 0
@@ -6405,7 +6446,9 @@ cmd_desk_mem_install() {
 # $1 is what happened (start, prompt, stop), $2 the agent; the agent's hook
 # JSON comes on stdin. The desk's agent token is read from the 600 file next
 # to this one, and what was said goes on in a 600 file: neither is ever on a
-# command line. It always exits 0 so the agent is never held up by it.
+# command line. It always exits 0 so the agent is never held up by it. What
+# the desk could not take yet waits in spool/ beside it and is sent on a later
+# prompt or stop.
 umask 077
 conf="$(cd "$(dirname "$0")" && pwd)"
 FOLDRENDER_DESK_TOKEN="$(head -n 1 "$conf/token" 2>/dev/null)"; export FOLDRENDER_DESK_TOKEN
@@ -6416,6 +6459,100 @@ if [ -z "${FOLDRENDER_API:-}" ] && [ -s "$conf/api" ]; then FOLDRENDER_API="$(he
 # (the desk memory's host takes a workspace's frtk_, foldrender.dev a desk's frdk_).
 if [ -s "$conf/service" ]; then FOLDRENDER_SERVICE="$(head -n 1 "$conf/service")"; export FOLDRENDER_SERVICE; fi
 log="$conf/hook.log"
+# An event is written to spool/ (700, under this folder, not /tmp) and leaves
+# it only once the desk has taken it, so what is said while the desk cannot be
+# reached (no network, the Worker down, the day's quota spent) is sent on a
+# later run instead of lost. Waiting, it is q.WHEN.PID.TOKEN.json (WHEN in
+# seconds, so the oldest sorts first). A run claims one before it sends it,
+# renaming it c.WHEN.PID.<that name>: a rename happens once or not at all, so
+# two hooks at once never both send a file, and one that died leaves a name
+# that says when. TOKEN is a checksum (cksum) of the token file's token, not
+# the token, and only what was kept under the token the hook has now is sent:
+# a token put in its place later (another account, another team's workspace)
+# is never handed what was said under the one before; that ages out below.
+spool="$conf/spool"
+fp="$(printf '%s' "$FOLDRENDER_DESK_TOKEN" | cksum | cut -d ' ' -f 1)"
+
+# say TEXT: a line in hook.log, with the time.
+say() { printf '%s desk mem hook: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >> "$log"; }
+
+# send NAME: the claimed file NAME to the desk. It is deleted, and 0 returned,
+# once the desk took it (2xx), or when the same bytes would be refused again:
+# 400 or 422, the event refused for what it says (the command exits 1 and says
+# "refused ("), and 413, too large (exit 5). Anything else may yet go through
+# with the event as it is, so it goes back in the queue: 1 when the desk
+# answered for this event alone (a 5xx, or its storage full: exit 1), and the
+# next may still go; 2 when what failed is not this event's (no network, 6;
+# the day's quota, 4; the token refused, 3; no desk yet, 7; the hook's own
+# setup, 2; no command), so the others wait for a later run.
+send() {
+  err="$("$cli" desk mem flush "$spool/$1" 2>&1 >/dev/null)"; rc=$?
+  [ -z "$err" ] || printf '%s\n' "$err" >> "$log"
+  f="${1#c.*.*.}"
+  case "$rc" in
+    0) rm -f "$spool/$1"; return 0 ;;
+    5) gone=1 ;;
+    1) if printf '%s\n' "$err" | grep -q '^foldrender: refused ('; then gone=1; else gone=0; fi ;;
+    *) gone=0 ;;
+  esac
+  if [ "$gone" = 1 ]; then
+    rm -f "$spool/$1"; say "dropped $f: the desk refused it and would again (exit $rc)"; return 0
+  fi
+  mv "$spool/$1" "$spool/$f" 2>/dev/null && say "kept $f to send again (exit $rc)"
+  [ "$rc" = 1 ] && return 1
+  return 2
+}
+
+# unstick: a claim older than 10 minutes is a run that stopped before it was
+# done (the command gives up on a request after 5): back in the queue. Were
+# that run still going (a laptop that slept), the event would go twice, and
+# the desk keeps it once: an event's ref is a hash of its session, kind and
+# text, and the same ref in the same session comes back "unchanged".
+unstick() {
+  now="$(date +%s)"
+  for c in "$spool"/c.*; do
+    c="${c##*/}"; at="${c#c.}"; at="${at%%.*}"
+    case "$at" in ''|*[!0-9]*) continue ;; esac
+    [ $((now - at)) -gt 600 ] || continue
+    mv "$spool/$c" "$spool/${c#c.*.*.}" 2>/dev/null && say "${c#c.*.*.} back in the queue: the run that claimed it stopped"
+  done
+}
+
+# trim: the queue held to 1,000 events and 10 MB, none older than 14 days;
+# past that the oldest go, each said in hook.log. An event is at most 4,000
+# characters (16 KB as UTF-8) and most are far less, and a busy day is a few
+# hundred prompts and replies: 1,000 keeps days of work offline, 10 MB keeps a
+# run of long ones from filling the disk, and the desk keeps an event 14 days
+# from when it was said, so an older one would be gone as it arrived.
+trim() {
+  ( cd "$spool" 2>/dev/null || exit 0
+    set -- q.*
+    [ -e "$1" ] || exit 0
+    wc -c -- "$@" ) 2>/dev/null \
+  | LC_ALL=C sort -rb -k 2 \
+  | awk -v now="$(date +%s)" '
+      $2 !~ /^q\.[0-9]+\..*\.json$/ { next }
+      { n++; b += $1; split($2, p, ".") }
+      now - p[2] > 14 * 86400 { print $2, "older than 14 days"; next }
+      n > 1000 || b > 10485760 { print $2, "past the 1,000 events or 10 MB the spool keeps" }' \
+  | while read -r f why; do
+      rm "$spool/$f" 2>/dev/null && say "dropped $f, $why"
+    done
+}
+
+# drain: the queue kept under this token, oldest first, each file claimed
+# before it is sent; one another run claimed first is left to it.
+drain() {
+  unstick
+  trim
+  for f in $(cd "$spool" 2>/dev/null && printf '%s\n' q.*."$fp".json | LC_ALL=C sort); do
+    c="c.$(date +%s).$$.$f"
+    mv "$spool/$f" "$spool/$c" 2>/dev/null || continue
+    send "$c"
+    [ $? != 2 ] || break
+  done
+}
+
 t="$(umask 077 && mktemp "${TMPDIR:-/tmp}/fr-mem.XXXXXX")" || exit 0
 cat > "$t"
 case "$1" in
@@ -6425,17 +6562,23 @@ case "$1" in
     rm -f "$t"
     "$cli" desk mem inject ${repo:+--repo "$repo"} 2>>"$log" || true ;;
   prompt|stop)
-    if python3 -I "$conf/event.py" "$1" "${2:-other}" < "$t" > "$t.json" 2>>"$log"; then
-      # Sent in the background: a slow network never holds the agent up.
-      ( "$cli" desk mem flush "$t.json" >/dev/null 2>>"$log"; rm -f "$t" "$t.json" ) </dev/null >/dev/null 2>&1 &
-    else rm -f "$t" "$t.json"; fi ;;
+    mkdir -p "$spool" 2>/dev/null
+    now="$(date +%s)"
+    c="c.$now.$$.q.$now.$$.$fp.json"
+    if python3 -I "$conf/event.py" "$1" "${2:-other}" < "$t" > "$spool/$c" 2>>"$log"; then
+      rm -f "$t"
+      # Sent in the background: a slow network never holds the agent up. The
+      # queue goes only after this event went through, so a desk out of reach
+      # is tried once a run, not once for each event waiting.
+      ( if send "$c"; then drain; else trim; fi ) </dev/null >/dev/null 2>&1 &
+    else rm -f "$t" "$spool/$c"; fi ;;
   *) rm -f "$t" ;;
 esac
 exit 0
 H
   cat > "$TMP/event" <<'PY'
 # foldrender desk mem: the agent's hook JSON (stdin) to the event the desk keeps.
-import hashlib, json, os, socket, subprocess, sys
+import hashlib, json, os, socket, subprocess, sys, time
 what, agent = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else "other")
 try:
     d = json.load(sys.stdin)
@@ -6493,7 +6636,9 @@ if not text:
 sid = str(d.get("session_id") or "")
 # 24 hex digits (96 bits): a longer run would be taken for a secret and refused.
 ref = what[0] + "-" + hashlib.sha256((sid + "\0" + what + "\0" + text).encode("utf-8")).hexdigest()[:24]
-ev = {"kind": what, "text": text, "agent": agent, "machine": socket.gethostname().split(".")[0][:64], "repo": repo, "ref": ref}
+# When it was said (milliseconds): an event the hook's spool sends a day later
+# keeps its own time, and its place among the session's.
+ev = {"kind": what, "text": text, "agent": agent, "machine": socket.gethostname().split(".")[0][:64], "repo": repo, "ref": ref, "at": int(time.time() * 1000)}
 # The agent's own session, so two at once in one repository are two on the
 # desk: "s-" and 16 hex digits of a hash of its id (a longer run would be
 # taken for a secret and refused). None when the agent names no session.
@@ -8346,8 +8491,19 @@ foldrender desk mem COMMAND [--json]
                          host) is made with your sign-in and kept in
                          ~/.config/foldrender/desk-mem/token (600), never
                          printed; what was said reaches the hook on stdin,
-                         never a command line. Codex runs the hooks once you
-                         trust them in its /hooks. --remove takes them out.
+                         never a command line. An event the desk could not
+                         take (no network, the server down, the day's quota)
+                         waits in spool/ beside the token and goes with a
+                         later prompt or stop, with the time it was said and
+                         only with the token it was kept under; at most
+                         1,000 wait, 10 MB, none older than 14 days, the
+                         oldest dropped past that. hook.log there says what
+                         was kept and dropped (one the desk refuses is not
+                         kept). Codex runs the hooks once you trust them in
+                         its /hooks. --remove takes them out; once neither
+                         agent has one left, it deletes spool/ too, with
+                         any event not sent yet (the token and hook.log
+                         stay).
                          agy, grok, pi and opencode have no hook yet: use say
                          and inject.
   A decision comes only from your answer to a card on your own desk page

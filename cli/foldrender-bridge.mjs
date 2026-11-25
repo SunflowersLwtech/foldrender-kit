@@ -36,7 +36,7 @@ import { basename, delimiter, dirname, extname, isAbsolute, join, resolve, sep }
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const BRIDGE_VERSION = "0.22.4";
+export const BRIDGE_VERSION = "0.28.0";
 export const PROTOCOL = "fr-agent.1";
 // How the owner may begin a conversation from the session that made the page.
 export const START_MODES = new Set(["continue", "fork", "subagent"]);
@@ -1831,6 +1831,10 @@ export function regionDiff(oldText, newText, { context = 3, maxLines = 200, maxC
 // was read at. A panel changed meanwhile (someone typing in it) answers 409:
 // the room is told, and the people on the page choose the panel's text or the
 // agent's; nothing is written over without that.
+// How long an emptied plan file waits before the watcher writes it back
+// (PanelSync.pushSettled): a writer held between its truncate and its write
+// leaves the file empty that long (other text waits 600 ms).
+export const PLAN_EMPTY_QUIET_MS = 5000;
 export class PanelSync {
   constructor(bridge) {
     this.b = bridge;
@@ -1891,7 +1895,9 @@ export class PanelSync {
         // An edit of the agent's not written back yet (the last try failed):
         // tried again now, never written over by the panel. A panel changed
         // meanwhile makes it a conflict, which the people on the page decide.
-        await this.pushNow();
+        // Not a file emptied a moment ago: a write still in flight, which the
+        // watcher writes back once it is done (pushSettled).
+        if (!this.emptyInFlight()) await this.pushNow();
       } else if (r.d.rev !== this.rev && (here === null || hashOf(here) === this.hash) && !this.conflict) {
         this.take(r.d.md, r.d.rev);
       }
@@ -1921,11 +1927,30 @@ export class PanelSync {
   // agent has answered) is not held by this: its write is done. A file dated
   // in the future (a clock ahead of this one's, a copy that kept its date)
   // is held until that time has passed; the turn's push still writes it.
+  // An empty file waits longer (PLAN_EMPTY_QUIET_MS): a writer that
+  // truncates the file and then writes it (a shell's >, Node's writeFile)
+  // leaves it empty for as long as it is held between the two, and past
+  // 600 ms the empty text went on the panel before the finished one. A file
+  // emptied on purpose is written back once the window has passed; nothing
+  // may change it again to re-arm the watcher, so it is looked at again then.
   pushSettled() {
     let st = null;
     try { st = statSync(this.file); } catch { return null; /* gone: nothing to push */ }
-    if (Date.now() - st.mtimeMs < 600) return null;
+    if (st.size === 0) {
+      const left = PLAN_EMPTY_QUIET_MS - (Date.now() - st.mtimeMs);
+      if (left > 0) {
+        clearTimeout(this.timer);
+        this.timer = setTimeout(() => this.pushSettled(), left);
+        return null;
+      }
+    } else if (Date.now() - st.mtimeMs < 600) return null;
     return this.push();
+  }
+  // The file emptied a moment ago: a write still in flight, as above.
+  emptyInFlight() {
+    let st = null;
+    try { st = statSync(this.file); } catch { return false; }
+    return st.size === 0 && Date.now() - st.mtimeMs < PLAN_EMPTY_QUIET_MS;
   }
   // The file back to the panel, if it changed.
   push() {
